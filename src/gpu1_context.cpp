@@ -12720,7 +12720,7 @@ bool dcomp_overlay_mode()
     else if (want == 1)
     {
         const unsigned paths = dispcfg::active_paths();
-        out = (paths == 1u) ? 1 : 0;
+        out = (paths >= 1u) ? 1 : 0;
         char v55[640];
         snprintf(v55, sizeof v55,
                  "[MGPU][V55] DcompOverlay 1 requested, %u active display path(s) -> %s. The "
