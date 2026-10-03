@@ -212,8 +212,8 @@ enum state
 // bitmap font as the idle screen, so it adds no shader or ImGui dependency.
 void draw_fps_hud(ID3D12GraphicsCommandList *cl,
                   D3D12_CPU_DESCRIPTOR_HANDLE rtv,
-                  unsigned width, unsigned height,
-                  double game_fps, double nr_fps);
+                  unsigned width, unsigned height, int mode,
+                  double input_fps, double nr_fps);
 
 void draw(ID3D12GraphicsCommandList *cl,
           D3D12_CPU_DESCRIPTOR_HANDLE rtv,

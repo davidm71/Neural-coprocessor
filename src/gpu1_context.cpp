@@ -355,22 +355,25 @@ static void *g_dcomp_d3d11  = nullptr;
 // tree is built at chain creation but deliberately left unrooted.
 static bool  g_dcomp_rooted = false;
 
-// Experimental FPS HUD. Bridge-thread owned, just like the DComp hotkeys and
-// present path, so no atomic or mutex is needed for the toggle itself.
-static bool g_fps_hud_enabled = true;
+// FPS HUD mode. Bridge-thread owned, just like the DComp hotkeys and present
+// path, so no atomic or mutex is needed for the toggle itself.
+// 0 = off, 1 = basic neural-output FPS, 2 = detailed MGPU input + NR FPS.
+static int g_fps_hud_mode = 1;
 
-bool fps_hud_toggle()
+int fps_hud_toggle()
 {
-    g_fps_hud_enabled = !g_fps_hud_enabled;
-    mgpu::diag::info(g_fps_hud_enabled
-        ? "[MGPU][HUD] FPS HUD ON (CTRL+ALT+H toggles)"
-        : "[MGPU][HUD] FPS HUD OFF (CTRL+ALT+H toggles)");
-    return g_fps_hud_enabled;
+    g_fps_hud_mode = (g_fps_hud_mode == 1) ? 2 : (g_fps_hud_mode == 2) ? 0 : 1;
+    const char *name = (g_fps_hud_mode == 1) ? "BASIC" :
+                       (g_fps_hud_mode == 2) ? "DETAIL" : "OFF";
+    char msg[128];
+    snprintf(msg, sizeof msg, "[MGPU][HUD] FPS HUD %s (CTRL+ALT+H cycles BASIC/DETAIL/OFF)", name);
+    mgpu::diag::info(msg);
+    return g_fps_hud_mode;
 }
 
-bool fps_hud_enabled()
+int fps_hud_mode()
 {
-    return g_fps_hud_enabled;
+    return g_fps_hud_mode;
 }
 
 // The game's HWND, pushed from dllmain's on_init_swapchain once the swapchain
@@ -1549,11 +1552,12 @@ bool present_frame(float r, float g, float b)
         // Diagnostic FPS HUD: producer = game frames entering MGPU; consumer =
         // frames consumed by the neural GPU. Values update at 4 Hz to stay
         // readable and to avoid putting a stream-state lock on every frame.
-        if (fps_hud_enabled())
+        const int hud_mode = fps_hud_mode();
+        if (hud_mode != 0)
         {
-            double hud_game_fps = 0.0, hud_nr_fps = 0.0;
-            hud_fps_sample(hud_game_fps, hud_nr_fps);
-            mgpu::screen::draw_fps_hud(cl, rtv, bw, bh, hud_game_fps, hud_nr_fps);
+            double hud_input_fps = 0.0, hud_nr_fps = 0.0;
+            hud_fps_sample(hud_input_fps, hud_nr_fps);
+            mgpu::screen::draw_fps_hud(cl, rtv, bw, bh, hud_mode, hud_input_fps, hud_nr_fps);
         }
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;

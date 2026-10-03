@@ -769,7 +769,7 @@ namespace
                             {
                                 char hk[220];
                                 snprintf(hk, sizeof hk,
-                                         "[MGPU][HUD] FPS HUD hotkey: CTRL+ALT+H = %s. HUD starts ON.",
+                                         "[MGPU][HUD] FPS HUD hotkey: CTRL+ALT+H = %s. HUD starts BASIC; cycles BASIC/DETAIL/OFF.",
                                          k_h ? "OK" : "FAILED");
                                 if (k_h) mgpu::diag::info(hk);
                                 else     mgpu::diag::warn(hk);
