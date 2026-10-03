@@ -359,6 +359,9 @@ static bool  g_dcomp_rooted = false;
 // path, so no atomic or mutex is needed for the toggle itself.
 // 0 = off, 1 = basic neural-output FPS, 2 = detailed MGPU input + NR FPS.
 static int g_fps_hud_mode = 1;
+// Successful, non-occluded DXGI presents from the MGPU output swapchain.
+// This is the closest HUD-side measure of frames actually handed to DComp.
+static std::atomic<unsigned long long> g_hud_present_count{0};
 
 int fps_hud_toggle()
 {
@@ -1130,7 +1133,7 @@ bool in_recovery();
 void recovery_tick_presented();
 void arm_sentinel_set();
 void arm_sentinel_clear();
-void hud_fps_sample(double &game_fps, double &nr_fps);
+void hud_fps_sample(double &game_fps, double &nr_fps, double &present_fps);
 // arm_fault_recover is NOT declared here: it takes a stream_state &, a type
 // that is not declared this early. It is defined in the anonymous namespace
 // immediately above stream_nr_create, which is its only caller.
@@ -1555,9 +1558,10 @@ bool present_frame(float r, float g, float b)
         const int hud_mode = fps_hud_mode();
         if (hud_mode != 0)
         {
-            double hud_input_fps = 0.0, hud_nr_fps = 0.0;
-            hud_fps_sample(hud_input_fps, hud_nr_fps);
-            mgpu::screen::draw_fps_hud(cl, rtv, bw, bh, hud_mode, hud_input_fps, hud_nr_fps);
+            double hud_input_fps = 0.0, hud_nr_fps = 0.0, hud_present_fps = 0.0;
+            hud_fps_sample(hud_input_fps, hud_nr_fps, hud_present_fps);
+            mgpu::screen::draw_fps_hud(cl, rtv, bw, bh, hud_mode,
+                                       hud_input_fps, hud_nr_fps, hud_present_fps);
         }
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -1709,6 +1713,12 @@ bool present_frame(float r, float g, float b)
     hr = sc->Present(pi_interval, 0);
     if (FAILED(hr))
         return fail("Present", static_cast<unsigned>(hr));
+
+    // HUD PRESENT counter: count only S_OK. DXGI_STATUS_OCCLUDED means DXGI
+    // accepted the call but explicitly says the frame will not be shown, so
+    // treating it as displayed output would inflate the final FPS score.
+    if (hr == S_OK)
+        g_hud_present_count.fetch_add(1ull, std::memory_order_relaxed);
 
     // ---- R111: THE SUCCESS CODES PRESENT RETURNS, WHICH WERE INVISIBLE ----
     //
@@ -8941,11 +8951,11 @@ namespace
     // FPS HUD sampler. present_frame is above stream_state in this file, so it
     // reaches the counters through this small bridge. Query the counters only
     // four times per second; between samples the cached values are returned.
-    void hud_fps_sample_impl(double &game_fps, double &nr_fps)
+    void hud_fps_sample_impl(double &game_fps, double &nr_fps, double &present_fps)
     {
         static LARGE_INTEGER last{};
-        static unsigned long long plast = 0, clast = 0;
-        static double pfps = 0.0, cfps = 0.0;
+        static unsigned long long plast = 0, clast = 0, dlast = 0;
+        static double pfps = 0.0, cfps = 0.0, dfps = 0.0;
 
         LARGE_INTEGER now{}, freq{};
         QueryPerformanceCounter(&now);
@@ -8954,7 +8964,9 @@ namespace
         {
             stream_state &s = str();
             std::lock_guard<std::mutex> lk(s.cs);
-            plast = s.produced; clast = s.consumed; last = now;
+            plast = s.produced; clast = s.consumed;
+            dlast = g_hud_present_count.load(std::memory_order_relaxed);
+            last = now;
         }
         else
         {
@@ -8967,12 +8979,14 @@ namespace
                     std::lock_guard<std::mutex> lk(s.cs);
                     p = s.produced; c = s.consumed;
                 }
+                const unsigned long long d = g_hud_present_count.load(std::memory_order_relaxed);
                 pfps = (double)(p - plast) / dt;
                 cfps = (double)(c - clast) / dt;
-                plast = p; clast = c; last = now;
+                dfps = (double)(d - dlast) / dt;
+                plast = p; clast = c; dlast = d; last = now;
             }
         }
-        game_fps = pfps; nr_fps = cfps;
+        game_fps = pfps; nr_fps = cfps; present_fps = dfps;
     }
 
     // P5.0. Forward-declared above present_frame. Copies out the pointer and
@@ -13454,9 +13468,9 @@ int ui_install_layout()
     return have_private ? 0 : 2;
 }
 
-void hud_fps_sample(double &game_fps, double &nr_fps)
+void hud_fps_sample(double &game_fps, double &nr_fps, double &present_fps)
 {
-    hud_fps_sample_impl(game_fps, nr_fps);
+    hud_fps_sample_impl(game_fps, nr_fps, present_fps);
 }
 
 void present_screen_state(int &st_out, const char *&l1, const char *&l2)

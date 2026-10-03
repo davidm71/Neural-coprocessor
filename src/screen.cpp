@@ -405,7 +405,7 @@ bool translucent_hud_box(ID3D12GraphicsCommandList *cl,
 
 void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                   unsigned width, unsigned height, int mode,
-                  double input_fps, double nr_fps)
+                  double input_fps, double nr_fps, double present_fps)
 {
     if (cl == nullptr || width == 0 || height == 0 || mode == 0) return;
 
@@ -419,11 +419,12 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
 
     char line1[48] = {};
     char line2[48] = {};
+    char line3[48] = {};
     int lines = 1;
     if (mode == 1)
     {
-        // BASIC is the neural-rendered output rate the player cares about.
-        snprintf(line1, sizeof line1, "FPS %.1f", nr_fps);
+        // BASIC shows the final successful MGPU output-present rate.
+        snprintf(line1, sizeof line1, "FPS %.1f", present_fps);
     }
     else
     {
@@ -431,12 +432,15 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
         // the producer counter is an independent measurement of game Present.
         snprintf(line1, sizeof line1, "MGPU IN %.1f FPS", input_fps);
         snprintf(line2, sizeof line2, "NR      %.1f FPS", nr_fps);
-        lines = 2;
+        snprintf(line3, sizeof line3, "PRESENT %.1f FPS", present_fps);
+        lines = 3;
     }
 
     int tw = text_width(line1, px, gap);
-    if (lines == 2 && text_width(line2, px, gap) > tw)
+    if (lines >= 2 && text_width(line2, px, gap) > tw)
         tw = text_width(line2, px, gap);
+    if (lines >= 3 && text_width(line3, px, gap) > tw)
+        tw = text_width(line3, px, gap);
     const int box_w = tw + pad * 2;
     const int box_h = line_h * lines + pad * (lines + 1);
     const int x = pad;
@@ -447,8 +451,10 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
     if (!translucent_hud_box(cl, rtv, x, y, box_w, box_h, W, H))
         fill(cl, rtv, bg, x, y, box_w, box_h, W, H);
     draw_text(cl, rtv, line1, x + pad, y + pad, px, gap, fg, W, H);
-    if (lines == 2)
+    if (lines >= 2)
         draw_text(cl, rtv, line2, x + pad, y + pad * 2 + line_h, px, gap, fg, W, H);
+    if (lines >= 3)
+        draw_text(cl, rtv, line3, x + pad, y + pad * 3 + line_h * 2, px, gap, fg, W, H);
 }
 
 } // namespace screen
