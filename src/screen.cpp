@@ -7,6 +7,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <d3dcompiler.h>
 
 namespace mgpu
 {
@@ -232,6 +233,176 @@ void draw(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
 }
 
 
+// ---- LIVE HUD TRANSLUCENT BACKGROUND ----
+//
+// ClearRenderTargetView can only replace pixels, so the original HUD box had
+// to be opaque.  The live HUD is different from the idle/error screen: there
+// is already a neural frame underneath it, and preserving that frame is useful.
+// This tiny pipeline draws exactly two alpha-blended triangles over the HUD
+// rectangle.  It is created lazily on first use and has no per-frame allocation,
+// readback or synchronization.  If shader/pipeline creation ever fails, the HUD
+// falls back to the old opaque clear rather than disappearing.
+struct hud_blend_state
+{
+    ID3D12RootSignature *rs = nullptr;
+    ID3D12PipelineState *pso = nullptr;
+    bool attempted = false;
+};
+
+hud_blend_state g_hud_blend;
+
+typedef HRESULT (WINAPI *hud_d3dcompile_fn)(LPCVOID, SIZE_T, LPCSTR,
+                                             const D3D_SHADER_MACRO *, ID3DInclude *,
+                                             LPCSTR, LPCSTR, UINT, UINT,
+                                             ID3DBlob **, ID3DBlob **);
+
+bool ensure_hud_blend_pipeline(ID3D12GraphicsCommandList *cl)
+{
+    if (g_hud_blend.pso != nullptr && g_hud_blend.rs != nullptr) return true;
+    if (g_hud_blend.attempted || cl == nullptr) return false;
+    g_hud_blend.attempted = true;
+
+    ID3D12Device *dev = nullptr;
+    if (FAILED(cl->GetDevice(IID_PPV_ARGS(&dev))) || dev == nullptr) return false;
+
+    HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+    if (dc == nullptr) { dev->Release(); return false; }
+    hud_d3dcompile_fn compile = reinterpret_cast<hud_d3dcompile_fn>(
+        GetProcAddress(dc, "D3DCompile"));
+    if (compile == nullptr) { dev->Release(); return false; }
+
+    static const char *hlsl =
+        "cbuffer Hud : register(b0) { float4 rect; float4 color; };\n"
+        "struct V { float4 p : SV_Position; };\n"
+        "V vs(uint id : SV_VertexID) {\n"
+        "  float2 q[6] = { float2(0,0),float2(1,0),float2(0,1),"
+        "float2(0,1),float2(1,0),float2(1,1) };\n"
+        "  float2 p = float2(lerp(rect.x,rect.z,q[id].x),"
+        "lerp(rect.y,rect.w,q[id].y)); V o; o.p=float4(p,0,1); return o; }\n"
+        "float4 ps(V i) : SV_Target { return color; }\n";
+
+    ID3DBlob *vs = nullptr, *ps = nullptr, *err = nullptr;
+    HRESULT hr = compile(hlsl, std::strlen(hlsl), "hud", nullptr, nullptr,
+                         "vs", "vs_5_0", 0, 0, &vs, &err);
+    if (err != nullptr) { err->Release(); err = nullptr; }
+    if (FAILED(hr) || vs == nullptr) { dev->Release(); return false; }
+    hr = compile(hlsl, std::strlen(hlsl), "hud", nullptr, nullptr,
+                 "ps", "ps_5_0", 0, 0, &ps, &err);
+    if (err != nullptr) { err->Release(); err = nullptr; }
+    if (FAILED(hr) || ps == nullptr) { vs->Release(); dev->Release(); return false; }
+
+    D3D12_ROOT_PARAMETER rp{};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp.Constants.ShaderRegister = 0;
+    rp.Constants.RegisterSpace = 0;
+    rp.Constants.Num32BitValues = 8;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    rsd.NumParameters = 1;
+    rsd.pParameters = &rp;
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ID3DBlob *sig = nullptr;
+    hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
+                                     &sig, &err);
+    if (err != nullptr) { err->Release(); err = nullptr; }
+    if (FAILED(hr) || sig == nullptr)
+    {
+        vs->Release(); ps->Release(); dev->Release(); return false;
+    }
+    hr = dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                  IID_PPV_ARGS(&g_hud_blend.rs));
+    sig->Release();
+    if (FAILED(hr) || g_hud_blend.rs == nullptr)
+    {
+        vs->Release(); ps->Release(); dev->Release(); return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_hud_blend.rs;
+    pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+    pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+    pd.BlendState.AlphaToCoverageEnable = FALSE;
+    pd.BlendState.IndependentBlendEnable = FALSE;
+    D3D12_RENDER_TARGET_BLEND_DESC &b = pd.BlendState.RenderTarget[0];
+    b.BlendEnable = TRUE;
+    b.LogicOpEnable = FALSE;
+    b.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    b.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    b.BlendOp = D3D12_BLEND_OP_ADD;
+    b.SrcBlendAlpha = D3D12_BLEND_ONE;
+    b.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    b.LogicOp = D3D12_LOGIC_OP_NOOP;
+    b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.FrontCounterClockwise = FALSE;
+    pd.RasterizerState.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+    pd.RasterizerState.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+    pd.RasterizerState.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.RasterizerState.MultisampleEnable = FALSE;
+    pd.RasterizerState.AntialiasedLineEnable = FALSE;
+    pd.RasterizerState.ForcedSampleCount = 0;
+    pd.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+    pd.DepthStencilState.DepthEnable = FALSE;
+    pd.DepthStencilState.StencilEnable = FALSE;
+    pd.InputLayout = { nullptr, 0 };
+    pd.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
+    pd.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    pd.SampleDesc.Count = 1;
+
+    hr = dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_hud_blend.pso));
+    vs->Release();
+    ps->Release();
+    dev->Release();
+    if (FAILED(hr) || g_hud_blend.pso == nullptr)
+    {
+        if (g_hud_blend.rs != nullptr) { g_hud_blend.rs->Release(); g_hud_blend.rs = nullptr; }
+        return false;
+    }
+    return true;
+}
+
+bool translucent_hud_box(ID3D12GraphicsCommandList *cl,
+                         D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                         int x, int y, int w, int h, int W, int H)
+{
+    if (!ensure_hud_blend_pipeline(cl)) return false;
+
+    // NDC rectangle: left, top, right, bottom.  Alpha 0.58 keeps the neural
+    // frame visible while giving the bitmap text enough contrast to read.
+    const float c[8] = {
+        2.0f * (float)x / (float)W - 1.0f,
+        1.0f - 2.0f * (float)y / (float)H,
+        2.0f * (float)(x + w) / (float)W - 1.0f,
+        1.0f - 2.0f * (float)(y + h) / (float)H,
+        0.018f, 0.020f, 0.023f, 0.58f
+    };
+
+    D3D12_VIEWPORT vp{};
+    vp.Width = (float)W; vp.Height = (float)H;
+    vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
+    D3D12_RECT sc{ 0, 0, W, H };
+
+    cl->SetPipelineState(g_hud_blend.pso);
+    cl->SetGraphicsRootSignature(g_hud_blend.rs);
+    cl->RSSetViewports(1, &vp);
+    cl->RSSetScissorRects(1, &sc);
+    cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    cl->SetGraphicsRoot32BitConstants(0, 8, c, 0);
+    cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->DrawInstanced(6, 1, 0, 0);
+    return true;
+}
+
 void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                   unsigned width, unsigned height, int mode,
                   double input_fps, double nr_fps)
@@ -273,7 +444,8 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
 
     const float bg[4] = { 0.018f, 0.020f, 0.023f, 1.0f };
     const float fg[4] = { 0.88f, 0.90f, 0.94f, 1.0f };
-    fill(cl, rtv, bg, x, y, box_w, box_h, W, H);
+    if (!translucent_hud_box(cl, rtv, x, y, box_w, box_h, W, H))
+        fill(cl, rtv, bg, x, y, box_w, box_h, W, H);
     draw_text(cl, rtv, line1, x + pad, y + pad, px, gap, fg, W, H);
     if (lines == 2)
         draw_text(cl, rtv, line2, x + pad, y + pad * 2 + line_h, px, gap, fg, W, H);
