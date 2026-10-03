@@ -6,6 +6,7 @@
 #include "screen.hpp"
 
 #include <cstring>
+#include <cstdio>
 
 namespace mgpu
 {
@@ -228,6 +229,41 @@ void draw(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
         draw_text(cl, rtv, line2, (W - text_width(line2, px2, gap2)) / 2,
                   y1 + 7 * px + 6 * px, px2, gap2, dim, W, H);
     }
+}
+
+
+void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                  unsigned width, unsigned height, double game_fps, double nr_fps)
+{
+    if (cl == nullptr || width == 0 || height == 0) return;
+
+    const int W = (int)width;
+    const int H = (int)height;
+    int px = W / 960;                 // compact at 4K, still readable at 1440p
+    if (px < 2) px = 2;
+    const int gap = px;
+    const int pad = px * 4;
+    const int line_h = 7 * px;
+
+    char game[48] = {};
+    char nr[48] = {};
+    snprintf(game, sizeof game, "GAME %.1f FPS", game_fps);
+    snprintf(nr, sizeof nr, "NR   %.1f FPS", nr_fps);
+
+    const int tw = (text_width(game, px, gap) > text_width(nr, px, gap))
+                 ? text_width(game, px, gap) : text_width(nr, px, gap);
+    const int box_w = tw + pad * 2;
+    const int box_h = line_h * 2 + pad * 3;
+    const int x = pad;
+    const int y = pad;
+
+    // Opaque neutral backing: ClearRenderTargetView cannot alpha-blend, and an
+    // opaque patch keeps the numbers legible over every scene without shaders.
+    const float bg[4] = { 0.018f, 0.020f, 0.023f, 1.0f };
+    const float fg[4] = { 0.88f, 0.90f, 0.94f, 1.0f };
+    fill(cl, rtv, bg, x, y, box_w, box_h, W, H);
+    draw_text(cl, rtv, game, x + pad, y + pad, px, gap, fg, W, H);
+    draw_text(cl, rtv, nr, x + pad, y + pad * 2 + line_h, px, gap, fg, W, H);
 }
 
 } // namespace screen

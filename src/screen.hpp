@@ -208,6 +208,13 @@ enum state
 #define MGPU_IDLE_L1 "MGPU BRIDGE"
 #define MGPU_IDLE_L2 "WAITING FOR THE FIRST FRAME"
 
+// Diagnostic HUD drawn over a live neural frame. Uses the same scissored-clear
+// bitmap font as the idle screen, so it adds no shader or ImGui dependency.
+void draw_fps_hud(ID3D12GraphicsCommandList *cl,
+                  D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                  unsigned width, unsigned height,
+                  double game_fps, double nr_fps);
+
 void draw(ID3D12GraphicsCommandList *cl,
           D3D12_CPU_DESCRIPTOR_HANDLE rtv,
           unsigned width, unsigned height,

@@ -80,6 +80,8 @@
 // not "no regression".
 // F6 and not F12 because Steam's screenshot key is F12.
 #define MGPU_HOTKEY_PEEK       0x4D50   // CTRL+ALT+F6
+// Experimental FPS HUD. H is mnemonic and avoids the existing F6-F11 controls.
+#define MGPU_HOTKEY_FPS_HUD    0x4D51   // CTRL+ALT+H
 
 namespace mgpu { HMODULE module_handle(); }
 
@@ -762,6 +764,16 @@ namespace
                                 if (k_p) mgpu::diag::info(pk);
                                 else     mgpu::diag::warn(pk);
                             }
+                            const bool k_h = RegisterHotKey(nullptr, MGPU_HOTKEY_FPS_HUD,
+                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'H') != FALSE;
+                            {
+                                char hk[220];
+                                snprintf(hk, sizeof hk,
+                                         "[MGPU][HUD] FPS HUD hotkey: CTRL+ALT+H = %s. HUD starts ON.",
+                                         k_h ? "OK" : "FAILED");
+                                if (k_h) mgpu::diag::info(hk);
+                                else     mgpu::diag::warn(hk);
+                            }
                             const bool k_v = RegisterHotKey(nullptr, MGPU_HOTKEY_VIEW,
                                                 MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F7) != FALSE;
                             const bool s_l  = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L,
@@ -963,6 +975,8 @@ namespace
                     // present loop to pick up, and it runs on the thread that
                     // owns the composition objects. Unreachable in mode 0 -
                     // the key is not registered there.
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_FPS_HUD)
+                    { (void)mgpu::gpu1::fps_hud_toggle(); continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_PEEK)
                     { (void)mgpu::gpu1::dcomp_peek_toggle(); continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_VIEW)
@@ -1302,6 +1316,7 @@ namespace
             UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_DOWN);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_UP);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_VIEW);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_FPS_HUD);
             // V52: only ever registered in ghost mode.
             if (mgpu::gpu1::dcomp_overlay_mode())
                 UnregisterHotKey(nullptr, MGPU_HOTKEY_PEEK);

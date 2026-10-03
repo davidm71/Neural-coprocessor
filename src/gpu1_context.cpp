@@ -355,6 +355,24 @@ static void *g_dcomp_d3d11  = nullptr;
 // tree is built at chain creation but deliberately left unrooted.
 static bool  g_dcomp_rooted = false;
 
+// Experimental FPS HUD. Bridge-thread owned, just like the DComp hotkeys and
+// present path, so no atomic or mutex is needed for the toggle itself.
+static bool g_fps_hud_enabled = true;
+
+bool fps_hud_toggle()
+{
+    g_fps_hud_enabled = !g_fps_hud_enabled;
+    mgpu::diag::info(g_fps_hud_enabled
+        ? "[MGPU][HUD] FPS HUD ON (CTRL+ALT+H toggles)"
+        : "[MGPU][HUD] FPS HUD OFF (CTRL+ALT+H toggles)");
+    return g_fps_hud_enabled;
+}
+
+bool fps_hud_enabled()
+{
+    return g_fps_hud_enabled;
+}
+
 // The game's HWND, pushed from dllmain's on_init_swapchain once the swapchain
 // has been confirmed to be the GAME's by LUID. Authoritative: it is the window
 // the game's own swapchain was created against, not a window we went looking
@@ -1109,6 +1127,7 @@ bool in_recovery();
 void recovery_tick_presented();
 void arm_sentinel_set();
 void arm_sentinel_clear();
+void hud_fps_sample(double &game_fps, double &nr_fps);
 // arm_fault_recover is NOT declared here: it takes a stream_state &, a type
 // that is not declared this early. It is defined in the anonymous namespace
 // immediately above stream_nr_create, which is its only caller.
@@ -1509,16 +1528,15 @@ bool present_frame(float r, float g, float b)
             cl->ResourceBarrier(1, &lb);
         }
 
+        // Return to RENDER_TARGET so the seam (when split) and the FPS HUD are
+        // painted into the SAME backbuffer that DirectComposition presents.
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        cl->ResourceBarrier(1, &barrier);
+
         if (lsrc != nullptr)
         {
-            // The seam, drawn last. Without it a viewer has to guess where the
-            // boundary is, and on a frame where the two halves happen to look
-            // similar they will guess wrong and conclude the split is not
-            // working. Back to RENDER_TARGET for one 3px clear, then PRESENT.
-            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            cl->ResourceBarrier(1, &barrier);
-
+            // The seam, drawn before the HUD.
             const float seam[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
             D3D12_RECT sr{};
             sr.left   = (LONG)((halfw >= 2u) ? (halfw - 2u) : 0u);
@@ -1526,17 +1544,21 @@ bool present_frame(float r, float g, float b)
             sr.right  = (LONG)(halfw + 1u);
             sr.bottom = (LONG)ch;
             cl->ClearRenderTargetView(rtv, seam, 1, &sr);
+        }
 
-            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-            cl->ResourceBarrier(1, &barrier);
-        }
-        else
+        // Diagnostic FPS HUD: producer = game frames entering MGPU; consumer =
+        // frames consumed by the neural GPU. Values update at 4 Hz to stay
+        // readable and to avoid putting a stream-state lock on every frame.
+        if (fps_hud_enabled())
         {
-            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-            cl->ResourceBarrier(1, &barrier);
+            double hud_game_fps = 0.0, hud_nr_fps = 0.0;
+            hud_fps_sample(hud_game_fps, hud_nr_fps);
+            mgpu::screen::draw_fps_hud(cl, rtv, bw, bh, hud_game_fps, hud_nr_fps);
         }
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        cl->ResourceBarrier(1, &barrier);
 
         bool say = false;
         {
@@ -8911,6 +8933,44 @@ namespace
         return s;
     }
 
+
+    // FPS HUD sampler. present_frame is above stream_state in this file, so it
+    // reaches the counters through this small bridge. Query the counters only
+    // four times per second; between samples the cached values are returned.
+    void hud_fps_sample_impl(double &game_fps, double &nr_fps)
+    {
+        static LARGE_INTEGER last{};
+        static unsigned long long plast = 0, clast = 0;
+        static double pfps = 0.0, cfps = 0.0;
+
+        LARGE_INTEGER now{}, freq{};
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+        if (last.QuadPart == 0 || freq.QuadPart == 0)
+        {
+            stream_state &s = str();
+            std::lock_guard<std::mutex> lk(s.cs);
+            plast = s.produced; clast = s.consumed; last = now;
+        }
+        else
+        {
+            const double dt = (double)(now.QuadPart - last.QuadPart) / (double)freq.QuadPart;
+            if (dt >= 0.25)
+            {
+                unsigned long long p = 0, c = 0;
+                {
+                    stream_state &s = str();
+                    std::lock_guard<std::mutex> lk(s.cs);
+                    p = s.produced; c = s.consumed;
+                }
+                pfps = (double)(p - plast) / dt;
+                cfps = (double)(c - clast) / dt;
+                plast = p; clast = c; last = now;
+            }
+        }
+        game_fps = pfps; nr_fps = cfps;
+    }
+
     // P5.0. Forward-declared above present_frame. Copies out the pointer and
     // geometry under the stream's lock and returns immediately - the caller
     // does GPU work with it, and holding a lock the GAME'S render thread takes
@@ -13388,6 +13448,11 @@ int ui_install_layout()
 
     if (beside) return 1;
     return have_private ? 0 : 2;
+}
+
+void hud_fps_sample(double &game_fps, double &nr_fps)
+{
+    hud_fps_sample_impl(game_fps, nr_fps);
 }
 
 void present_screen_state(int &st_out, const char *&l1, const char *&l2)

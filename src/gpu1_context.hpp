@@ -91,6 +91,10 @@ namespace mgpu::gpu1
     bool dcomp_explicit_off_single_display();
     bool dcomp_peek_toggle();
 
+    // Experimental final-output FPS HUD. CTRL+ALT+H toggles it on/off.
+    bool fps_hud_toggle();
+    bool fps_hud_enabled();
+
     void stream_shutdown();
 
     void shutdown();
