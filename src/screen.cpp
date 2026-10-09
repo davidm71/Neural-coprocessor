@@ -405,7 +405,8 @@ bool translucent_hud_box(ID3D12GraphicsCommandList *cl,
 
 void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                   unsigned width, unsigned height, int mode,
-                  double input_fps, double nr_fps, double present_fps)
+                  double input_fps, double consumed_fps, double nr_eval_fps,
+                  double nr_skip_fps, double present_fps, double nr_gpu_ms)
 {
     if (cl == nullptr || width == 0 || height == 0 || mode == 0) return;
 
@@ -420,6 +421,9 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
     char line1[48] = {};
     char line2[48] = {};
     char line3[48] = {};
+    char line4[48] = {};
+    char line5[48] = {};
+    char line6[48] = {};
     int lines = 1;
     if (mode == 1)
     {
@@ -430,10 +434,13 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
     {
         // DETAIL exposes both sides of the MGPU pipeline without implying that
         // the producer counter is an independent measurement of game Present.
-        snprintf(line1, sizeof line1, "MGPU IN %.1f FPS", input_fps);
-        snprintf(line2, sizeof line2, "NR      %.1f FPS", nr_fps);
-        snprintf(line3, sizeof line3, "PRESENT %.1f FPS", present_fps);
-        lines = 3;
+        snprintf(line1, sizeof line1, "MGPU IN  %.1f FPS", input_fps);
+        snprintf(line2, sizeof line2, "CONSUMED %.1f FPS", consumed_fps);
+        snprintf(line3, sizeof line3, "NR EVAL  %.1f FPS", nr_eval_fps);
+        snprintf(line4, sizeof line4, "NR SKIP  %.1f FPS", nr_skip_fps);
+        snprintf(line5, sizeof line5, "PRESENT  %.1f FPS", present_fps);
+        snprintf(line6, sizeof line6, "NR GPU   %.2f MS", nr_gpu_ms);
+        lines = 6;
     }
 
     int tw = text_width(line1, px, gap);
@@ -441,6 +448,12 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
         tw = text_width(line2, px, gap);
     if (lines >= 3 && text_width(line3, px, gap) > tw)
         tw = text_width(line3, px, gap);
+    if (lines >= 4 && text_width(line4, px, gap) > tw)
+        tw = text_width(line4, px, gap);
+    if (lines >= 5 && text_width(line5, px, gap) > tw)
+        tw = text_width(line5, px, gap);
+    if (lines >= 6 && text_width(line6, px, gap) > tw)
+        tw = text_width(line6, px, gap);
     const int box_w = tw + pad * 2;
     const int box_h = line_h * lines + pad * (lines + 1);
     const int x = pad;
@@ -455,6 +468,12 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
         draw_text(cl, rtv, line2, x + pad, y + pad * 2 + line_h, px, gap, fg, W, H);
     if (lines >= 3)
         draw_text(cl, rtv, line3, x + pad, y + pad * 3 + line_h * 2, px, gap, fg, W, H);
+    if (lines >= 4)
+        draw_text(cl, rtv, line4, x + pad, y + pad * 4 + line_h * 3, px, gap, fg, W, H);
+    if (lines >= 5)
+        draw_text(cl, rtv, line5, x + pad, y + pad * 5 + line_h * 4, px, gap, fg, W, H);
+    if (lines >= 6)
+        draw_text(cl, rtv, line6, x + pad, y + pad * 6 + line_h * 5, px, gap, fg, W, H);
 }
 
 } // namespace screen

@@ -1338,6 +1338,7 @@ namespace
         // blocks and the driver snippet DLL - and then the line below released
         // the device underneath them. That is the second-launch crash.
         mgpu::gpu1::stream_shutdown();
+        mgpu::gpu1::late_latch_shutdown();   // HARDEN2: bridge thread, loop has exited
 
         mgpu::gpu1::shutdown();
 

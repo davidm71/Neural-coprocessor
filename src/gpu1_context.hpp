@@ -449,8 +449,32 @@ struct ui_state
     // draw a verdict from it - backlog_mean is the verdict.
     int  reflex_was = -1, reflex_now = -1;   // -1 unknown, 0 off, 1 on
     bool reflex_applied = false;             // SetSleepMode returned 0
+
+    // OPT2: late-latch, live. ll_ready is false when there is no copy queue
+    // this arm (CopyQueue=0, or it failed to come up), which disables it.
+    bool     ll_on = false, ll_ready = false;
+    unsigned ll_age = 2;
+    unsigned long long ll_issued = 0, ll_hits = 0, ll_stale = 0;
+    float ll_recent_pct = -1.0f;   // last ~1200 frames; -1 not yet known
 };
 void ui_read(ui_state &out);
+
+// OPT2: late-latch, live from the next frame. Also written to mgpu.ini by the
+// panel so the next launch starts the same way. Age is clamped to 0..4.
+void ui_set_late_latch(bool on);
+void ui_set_late_latch_age(unsigned age);
+
+// HARDEN2: release the late-latch timer. BRIDGE THREAD ONLY, after its present
+// loop has exited, so nothing can be waiting on the handle.
+void late_latch_shutdown();
+
+// Fork panel: PresentVsync live (the present path reads it every present).
+bool ui_present_vsync();
+void ui_set_present_vsync(bool on);
+// Fork panel: DcompOverlay as the FILE has it: -2 absent, -1 auto, 0 off, 1 on.
+int  ui_ini_read_dcomp();
+// Fork panel: write a text value (DcompOverlay=auto).
+bool ui_ini_write_text(const char *key, const char *value);
 
 // Pass count, live. Every NGX feature handle is created at arm time, so this is
 // only a count change - nothing is created or destroyed, and it takes effect on

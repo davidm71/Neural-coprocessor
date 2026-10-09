@@ -362,6 +362,9 @@ static int g_fps_hud_mode = 1;
 // Successful, non-occluded DXGI presents from the MGPU output swapchain.
 // This is the closest HUD-side measure of frames actually handed to DComp.
 static std::atomic<unsigned long long> g_hud_present_count{0};
+// R5 diagnostic: frames whose FINAL DLSS-NR pass returned Success. Unlike
+// consumed, this does not advance across backlog frames deliberately skipped by P6.4.
+static std::atomic<unsigned long long> g_hud_nr_ok_count{0};
 
 int fps_hud_toggle()
 {
@@ -1133,7 +1136,8 @@ bool in_recovery();
 void recovery_tick_presented();
 void arm_sentinel_set();
 void arm_sentinel_clear();
-void hud_fps_sample(double &game_fps, double &nr_fps, double &present_fps);
+void hud_fps_sample(double &game_fps, double &consumed_fps, double &nr_eval_fps,
+                    double &nr_skip_fps, double &present_fps, double &nr_gpu_ms);
 // arm_fault_recover is NOT declared here: it takes a stream_state &, a type
 // that is not declared this early. It is defined in the anonymous namespace
 // immediately above stream_nr_create, which is its only caller.
@@ -1558,10 +1562,14 @@ bool present_frame(float r, float g, float b)
         const int hud_mode = fps_hud_mode();
         if (hud_mode != 0)
         {
-            double hud_input_fps = 0.0, hud_nr_fps = 0.0, hud_present_fps = 0.0;
-            hud_fps_sample(hud_input_fps, hud_nr_fps, hud_present_fps);
+            double hud_input_fps = 0.0, hud_consumed_fps = 0.0;
+            double hud_nr_eval_fps = 0.0, hud_nr_skip_fps = 0.0;
+            double hud_present_fps = 0.0, hud_nr_gpu_ms = 0.0;
+            hud_fps_sample(hud_input_fps, hud_consumed_fps, hud_nr_eval_fps,
+                           hud_nr_skip_fps, hud_present_fps, hud_nr_gpu_ms);
             mgpu::screen::draw_fps_hud(cl, rtv, bw, bh, hud_mode,
-                                       hud_input_fps, hud_nr_fps, hud_present_fps);
+                                       hud_input_fps, hud_consumed_fps, hud_nr_eval_fps,
+                                       hud_nr_skip_fps, hud_present_fps, hud_nr_gpu_ms);
         }
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -7946,6 +7954,48 @@ namespace
 
         ID3D12Resource *nseal = nullptr;       // READBACK, RING * SEAL_STRIDE
 
+        // ---- OPT5: GPU 0 ASYNC STAGING (ini StageCopy) ----
+        //
+        // Without it the game's OWN command list copies colour, depth and MVec
+        // straight into gxfer, which is a cross-adapter heap in SYSTEM memory:
+        // every byte crosses the render card's PCIe link inside the game's
+        // frame, on the game's graphics queue, and the back buffer cannot go
+        // back to RENDER_TARGET until the colour copy has finished. At
+        // 2560x1440 that is ~44 MB per frame.
+        //
+        // With it the game's list copies into gstage, a VRAM buffer with the
+        // SAME layout (a VRAM-to-VRAM copy, a fraction of a millisecond), and a
+        // COPY queue on GPU 0 moves the whole slot to gxfer on the DMA engine
+        // while the game renders its next frame. gfence is then signalled by
+        // that copy queue rather than by the game's queue, so its meaning for
+        // GPU 1 is unchanged: frame f's slot is complete in gxfer.
+        //
+        // g0cl[k] is recorded ONCE at arm (stage slot k -> gxfer slot k) and
+        // only re-executed. A slot's list runs again RING frames later, after
+        // the game queue has waited for gfence to pass it - see g0_signal.
+        unsigned stage_on = 0;                       // ini StageCopy, 0 or 1
+        ID3D12Resource *gstage = nullptr;            // DEFAULT heap, game device
+        ID3D12CommandQueue *g0cq = nullptr;          // COPY queue, game device
+        ID3D12CommandAllocator *g0ca = nullptr;
+        ID3D12GraphicsCommandList *g0cl[RING] = {};
+        ID3D12Fence *g0sf = nullptr;                 // game queue -> g0cq hand-off
+        unsigned long long stage_last = 0;           // last frame handed to g0cq
+        unsigned long long stage_submits = 0, stage_fail = 0;
+
+        // OPT5 instrumentation, in EITHER mode, so the two can be compared:
+        // GPU time the game's queue spends on our copies, and the DMA time.
+        // Per slot: [0,1] finish-effects copies, [2,3] MVec copy (both on the
+        // game's queue), [4,5] staging DMA (GPU 0 copy queue).
+        ID3D12QueryHeap *g0ts = nullptr;             // TIMESTAMP, RING*4
+        ID3D12QueryHeap *g0cts = nullptr;            // COPY_QUEUE_TIMESTAMP, RING*2
+        ID3D12Resource *g0tsrb = nullptr;            // READBACK, RING*6 UINT64
+        const UINT64 *g0tsrb_cpu = nullptr;
+        UINT64 g0_ts_freq = 0, g0c_ts_freq = 0;
+        double g0_in_sum = 0.0, g0_mv_sum = 0.0, g0_dma_sum = 0.0;
+        unsigned g0_in_n = 0, g0_mv_n = 0, g0_dma_n = 0;
+        double g0_in_ms = -1.0, g0_mv_ms = -1.0, g0_dma_ms = -1.0;   // last window
+        unsigned long long g0_sampled = 0;           // last consumed frame sampled
+
         // ---- P2.2a: GPU timestamps on GPU 1's consume list ----
         //
         // The first numbers in this project that are GPU TIME rather than
@@ -8086,6 +8136,16 @@ namespace
         // blocking under it costs.
         UINT64 cqa_value[2] = {};
         unsigned long long cq_issued = 0;      // highest frame whose copy is submitted
+        // FIX6. Which frame each tex_in half holds, and which half the current
+        // evaluate reads. Upstream tied the half to the frame's PARITY
+        // (tex_in[f & 1]), so late-latch could only latch a frame of the
+        // opposite parity to the one being evaluated: steps of 1 or 3 game
+        // frames, never 2. At a game:NR ratio of ~1.6 that is an uneven
+        // 1,3,1,3 cadence (measured: 69% at 1, 28% at 3, 0 at 2) - visible
+        // judder. Halves are now assigned explicitly: a copy goes into the half
+        // the current evaluate is NOT reading.
+        unsigned long long half_frame[2] = {0ull, 0ull};
+        unsigned eval_half = 0;
         unsigned long long cq_ahead = 0;       // copies that ran ahead of the previous evaluate
         unsigned long long cq_fails = 0;       // frames that fell back to the inline unpack
         // Armed for a frame THAT HAD NOT ARRIVED YET - only possible in mode 2,
@@ -8093,6 +8153,42 @@ namespace
         // construction, which is the difference between the two arms stated as
         // a number rather than as a claim.
         unsigned long long cq_spec = 0;
+        // OPT1. Mode-2 speculative f+1 copies NOT issued because the producer
+        // was already ahead at poll entry. In that regime the next evaluated
+        // frame is the NEWEST arrival, not f+1, so the speculative copy was a
+        // full-frame upload over the bridge card's link that nothing ever read.
+        unsigned long long cq_spec_suppressed = 0;
+
+        // ---- OPT2: LATE-LATCH PREFETCH (LateLatch=1, opt-in) ----
+        //
+        // The newest-only rule means the frame evaluated next is whichever
+        // arrived last, which f+1 prefetch cannot know. Late-latch waits until
+        // the CURRENT evaluate is nearly done (estimated from the last frame's
+        // GPU timestamps), then copies the newest arrived frame of the free
+        // tex_in parity on the copy queue so its unpack overlaps the tail of
+        // the evaluate. The next poll evaluates THAT frame if it is no more
+        // than ll_age frames older than the newest arrival - a bounded latency
+        // cost traded for removing the serial unpack from every frame.
+        unsigned ll_on = 0;                    // ini LateLatch
+        unsigned ll_age = 2;                   // ini LateLatchAge, frames
+        unsigned long long ll_pending = 0;     // frame latched for the next poll
+        double ll_list_ms = 0.0;               // last direct-list GPU time, all segments
+        double ll_copy_ms = 0.0;               // last copy-queue unpack time
+        unsigned long long ll_issued = 0, ll_hits = 0, ll_stale = 0, ll_early = 0;
+        // OPT3. Frames consumed with no evaluate because a submission or the
+        // fence wait FAILED. Previously invisible to every counter.
+        unsigned long long nr_lost = 0;
+        // OPT4. What stream_cq_submit ACTUALLY copied into each tex_in half.
+        // The live per-slot flags are cleared by the game thread when the
+        // ring wraps, so re-reading them at evaluate time can disagree with
+        // what was copied - and with late-latch widening that window, the
+        // evaluate could run without MVec that had been delivered.
+        unsigned char cq_depth_ok[2] = {}, cq_mvec_ok[2] = {};
+        unsigned long long ll_report_at = 0;
+        // Fork: the late-latch hit rate over the last report window (1200
+        // frames), so a hitchy startup does not dominate the panel all session.
+        unsigned long long ll_win_issued_at = 0, ll_win_hits_at = 0;
+        float ll_recent_pct = -1.0f;   // -1 until the first window completes
         // R28. The D3D12 info queue has never been drained anywhere in the
         // stream path - transit_drain_info_queue is called only on P1.3 probe
         // failures - so a validation message raised by a STREAM submission has
@@ -8547,6 +8643,8 @@ namespace
         // evaluates would report a 2-pass run's identical-rate at half its
         // true value.
         unsigned long long nr_frames = 0;
+        // R6 HUD diagnostic: latest GPU timestamp bracket for the complete NR EvaluateFeature stage.
+        double hud_nr_gpu_ms = 0.0;
 
         // ---- P6.2: the knobs ----
         //
@@ -8643,6 +8741,16 @@ namespace
         // Made atomic, they need no lock at all, and the small mutex below is
         // left with exactly one job.
         std::atomic<unsigned char> mvec_slot_valid[RING] = {};
+        // FIX5. The frame whose vectors each slot holds, decided when the seal
+        // is written (0 = none). mvec_slot_valid is ARMED AT ZERO for the next
+        // frame one frame before the slot is rewritten, so a consumer that is
+        // RING-1 frames behind read "no vectors" for a slot whose seal said
+        // they were there, and evaluated without them - 4% of evaluates in a
+        // measured StageCopy=1 run. A frame tag cannot be cleared early: it
+        // only changes when the slot is sealed for a NEW frame, which also
+        // overwrites the colour, so "tag == f" means exactly "frame f's
+        // vectors are in this slot".
+        std::atomic<unsigned long long> mvec_slot_frame[RING] = {};
 
         std::atomic<unsigned long long> mvec_copies{0}, mvec_missing{0};
         // R118. One-shot: the fallback arms once per armed stream and never
@@ -8951,11 +9059,14 @@ namespace
     // FPS HUD sampler. present_frame is above stream_state in this file, so it
     // reaches the counters through this small bridge. Query the counters only
     // four times per second; between samples the cached values are returned.
-    void hud_fps_sample_impl(double &game_fps, double &nr_fps, double &present_fps)
+    void hud_fps_sample_impl(double &game_fps, double &consumed_fps,
+                             double &nr_eval_fps, double &nr_skip_fps,
+                             double &present_fps, double &nr_gpu_ms)
     {
         static LARGE_INTEGER last{};
-        static unsigned long long plast = 0, clast = 0, dlast = 0;
-        static double pfps = 0.0, cfps = 0.0, dfps = 0.0;
+        static unsigned long long plast = 0, clast = 0, nlast = 0, slast = 0, dlast = 0;
+        static double pfps = 0.0, cfps = 0.0, nrfps = 0.0, sfps = 0.0, dfps = 0.0;
+        static double ngpums = 0.0;
 
         LARGE_INTEGER now{}, freq{};
         QueryPerformanceCounter(&now);
@@ -8965,6 +9076,12 @@ namespace
             stream_state &s = str();
             std::lock_guard<std::mutex> lk(s.cs);
             plast = s.produced; clast = s.consumed;
+            // OPT3: every frame consumed without an evaluate, not only the
+            // newest-gate ones. RingWindow skips, overruns and failed submits
+            // were invisible here, so IN != EVAL + SKIP on the HUD.
+            slast = s.nr_skipped + s.rw_skipped + s.overrun + s.nr_lost;
+            ngpums = s.hud_nr_gpu_ms;
+            nlast = g_hud_nr_ok_count.load(std::memory_order_relaxed);
             dlast = g_hud_present_count.load(std::memory_order_relaxed);
             last = now;
         }
@@ -8973,20 +9090,26 @@ namespace
             const double dt = (double)(now.QuadPart - last.QuadPart) / (double)freq.QuadPart;
             if (dt >= 0.25)
             {
-                unsigned long long p = 0, c = 0;
+                unsigned long long p = 0, c = 0, sk = 0;
                 {
                     stream_state &s = str();
                     std::lock_guard<std::mutex> lk(s.cs);
                     p = s.produced; c = s.consumed;
+                    sk = s.nr_skipped + s.rw_skipped + s.overrun + s.nr_lost;   // OPT3
+                    ngpums = s.hud_nr_gpu_ms;
                 }
+                const unsigned long long n = g_hud_nr_ok_count.load(std::memory_order_relaxed);
                 const unsigned long long d = g_hud_present_count.load(std::memory_order_relaxed);
                 pfps = (double)(p - plast) / dt;
                 cfps = (double)(c - clast) / dt;
+                nrfps = (double)(n - nlast) / dt;
+                sfps = (double)(sk - slast) / dt;
                 dfps = (double)(d - dlast) / dt;
-                plast = p; clast = c; dlast = d; last = now;
+                plast = p; clast = c; nlast = n; slast = sk; dlast = d; last = now;
             }
         }
-        game_fps = pfps; nr_fps = cfps; present_fps = dfps;
+        game_fps = pfps; consumed_fps = cfps; nr_eval_fps = nrfps;
+        nr_skip_fps = sfps; present_fps = dfps; nr_gpu_ms = ngpums;
     }
 
     // P5.0. Forward-declared above present_frame. Copies out the pointer and
@@ -9208,9 +9331,11 @@ namespace
     //  3. WRITE A TEMP AND RENAME. A half-written mgpu.ini is a game that
     //     launches with every key at its default and no way to tell (P7.2).
     //     MoveFileExW with REPLACE_EXISTING is atomic enough for this.
-    bool ini_write_int(const char *key, int value)
+    // Fork: upstream's later split (text writer + int wrapper), backported so
+    // the panel can write DcompOverlay=auto.
+    bool ini_write_text(const char *key, const char *value)
     {
-        if (key == nullptr || key[0] == '\0') return false;
+        if (key == nullptr || key[0] == '\0' || value == nullptr) return false;
         const wchar_t *wp = ini_path();
         if (wp == nullptr || wp[0] == L'\0')
         {
@@ -9237,7 +9362,7 @@ namespace
         buf[len] = '\0';
 
         char line_new[160];
-        snprintf(line_new, sizeof line_new, "%s=%d", key, value);
+        snprintf(line_new, sizeof line_new, "%s=%s", key, value);
 
         const size_t klen = strlen(key);
         size_t oi = 0;
@@ -9321,6 +9446,13 @@ namespace
         return ok;
     }
 
+    bool ini_write_int(const char *key, int value)
+    {
+        char v[16];
+        snprintf(v, sizeof v, "%d", value);
+        return ini_write_text(key, v);
+    }
+
     // Defined below, with the rest of the readers. Declared here because the
     // mirror sits beside the writer and both are above it.
     int ini_read_sr_int(const char *key, int dflt, int lo, int hi);
@@ -9331,16 +9463,19 @@ namespace
     struct ini_mirror_ent { const char *key; int val; bool have; };
     // V43: 8 -> 12. ArmCrashed joined the panel keys and the old size
     // was one short of comfortable; a full mirror silently stops caching.
-    ini_mirror_ent g_ini_mirror[12] = {};
+    // Fork: 12 -> 32. The panel reads more keys now, and a key that finds no
+    // free slot is re-read from disk on every panel frame.
+    static const unsigned INI_MIRROR_N = 32u;
+    ini_mirror_ent g_ini_mirror[INI_MIRROR_N] = {};
 
     int ini_mirror_get(const char *key, int def)
     {
-        for (unsigned i = 0; i < 12u; ++i)
+        for (unsigned i = 0; i < INI_MIRROR_N; ++i)
             if (g_ini_mirror[i].have && g_ini_mirror[i].key != nullptr
                 && _stricmp(g_ini_mirror[i].key, key) == 0)
                 return g_ini_mirror[i].val;
         const int v = ini_read_sr_int(key, def, -1000000, 1000000);
-        for (unsigned i = 0; i < 12u; ++i)
+        for (unsigned i = 0; i < INI_MIRROR_N; ++i)
             if (!g_ini_mirror[i].have)
             { g_ini_mirror[i].key = key; g_ini_mirror[i].val = v; g_ini_mirror[i].have = true; break; }
         return v;
@@ -9348,11 +9483,11 @@ namespace
 
     void ini_mirror_set(const char *key, int v)
     {
-        for (unsigned i = 0; i < 12u; ++i)
+        for (unsigned i = 0; i < INI_MIRROR_N; ++i)
             if (g_ini_mirror[i].have && g_ini_mirror[i].key != nullptr
                 && _stricmp(g_ini_mirror[i].key, key) == 0)
             { g_ini_mirror[i].val = v; return; }
-        for (unsigned i = 0; i < 12u; ++i)
+        for (unsigned i = 0; i < INI_MIRROR_N; ++i)
             if (!g_ini_mirror[i].have)
             { g_ini_mirror[i].key = key; g_ini_mirror[i].val = v; g_ini_mirror[i].have = true; return; }
     }
@@ -9996,6 +10131,47 @@ namespace
         if (i == 0) snprintf(out, n, "none");
     }
 
+// Teardown. The game's queue has already been drained past `produced` by the
+// HANGFIX wait in stream_release, and the MVec recorder is stopped, so nothing
+// on the game's queue still references gstage. The copy queue is drained here
+// before gxfer - which it writes - is released.
+static void g0_stage_release(stream_state &s)
+{
+    if (s.g0cq != nullptr)
+    {
+        ID3D12Fence *df = nullptr;
+        ID3D12Device *dev = nullptr;
+        if (SUCCEEDED(s.g0cq->GetDevice(IID_PPV_ARGS(&dev))) && dev != nullptr &&
+            SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&df))) &&
+            SUCCEEDED(s.g0cq->Signal(df, 1)) && df->GetCompletedValue() < 1)
+        {
+            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (ev != nullptr)
+            {
+                if (SUCCEEDED(df->SetEventOnCompletion(1, ev)))
+                    (void)WaitForSingleObject(ev, 2000);
+                CloseHandle(ev);
+            }
+        }
+        if (df != nullptr) df->Release();
+        if (dev != nullptr) dev->Release();
+    }
+    for (unsigned k = 0; k < stream_state::RING; ++k)
+        if (s.g0cl[k] != nullptr) { s.g0cl[k]->Release(); s.g0cl[k] = nullptr; }
+    if (s.g0cts != nullptr) { s.g0cts->Release(); s.g0cts = nullptr; }
+    if (s.g0sf != nullptr) { s.g0sf->Release(); s.g0sf = nullptr; }
+    if (s.g0ca != nullptr) { s.g0ca->Release(); s.g0ca = nullptr; }
+    if (s.g0cq != nullptr) { s.g0cq->Release(); s.g0cq = nullptr; }
+    if (s.gstage != nullptr) { s.gstage->Release(); s.gstage = nullptr; }
+    if (s.g0tsrb != nullptr)
+    {
+        s.g0tsrb->Unmap(0, nullptr);
+        s.g0tsrb->Release(); s.g0tsrb = nullptr;
+    }
+    s.g0tsrb_cpu = nullptr;
+    if (s.g0ts != nullptr) { s.g0ts->Release(); s.g0ts = nullptr; }
+}
+
     void stream_release()
     {
         stream_state &s = str();
@@ -10184,6 +10360,7 @@ namespace
             std::lock_guard<std::mutex> mlk(s.mvec_cs);
             s.mvec_live.store(false, std::memory_order_release);
         }
+        g0_stage_release(s);   // OPT5: drains the GPU 0 copy queue that writes gxfer
         if (s.gxfer != nullptr) { s.gxfer->Release(); s.gxfer = nullptr; }
         if (s.gheap != nullptr) { s.gheap->Release(); s.gheap = nullptr; }
         if (s.gshare!= nullptr) { CloseHandle(s.gshare); s.gshare = nullptr; }
@@ -13468,9 +13645,11 @@ int ui_install_layout()
     return have_private ? 0 : 2;
 }
 
-void hud_fps_sample(double &game_fps, double &nr_fps, double &present_fps)
+void hud_fps_sample(double &game_fps, double &consumed_fps, double &nr_eval_fps,
+                    double &nr_skip_fps, double &present_fps, double &nr_gpu_ms)
 {
-    hud_fps_sample_impl(game_fps, nr_fps, present_fps);
+    hud_fps_sample_impl(game_fps, consumed_fps, nr_eval_fps, nr_skip_fps,
+                        present_fps, nr_gpu_ms);
 }
 
 void present_screen_state(int &st_out, const char *&l1, const char *&l2)
@@ -13821,6 +14000,13 @@ void ui_read(ui_state &out)
     out.ring_depth   = stream_state::RING;
     out.ring_window  = (s.rw_on != 0u) ? s.rw : 0u;
     out.ring_skipped = s.rw_skipped;
+    out.ll_on        = (s.ll_on != 0u);          // OPT2
+    out.ll_ready     = s.copy_queue && s.cq != nullptr;
+    out.ll_age       = s.ll_age;
+    out.ll_issued    = s.ll_issued;
+    out.ll_hits      = s.ll_hits;
+    out.ll_stale     = s.ll_stale;
+    out.ll_recent_pct = s.ll_recent_pct;
 
     // ---- DLSS Super Resolution ----
     out.sr_on        = (s.sr_on != 0u && s.sr_handle != nullptr);
@@ -14145,6 +14331,65 @@ void ui_set_present_mode(int mode)
     mgpu::diag::info(l);
 }
 
+// OPT2: late-latch from the overlay panel. Safe to flip mid-run: turning it
+// off leaves at most one latched frame, which the next poll uses or drops by
+// the same age rule; turning it on engages only when the copy queue is up
+// (the wait site tests s.copy_queue && use_cq).
+void ui_set_late_latch(bool on)
+{
+    stream_state &s = str();
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        const unsigned v = on ? 1u : 0u;
+        if (s.ll_on == v) return;
+        s.ll_on = v;
+    }
+    mgpu::diag::info(on ? "[MGPU][OPT2] LateLatch ON from the panel, live from the next frame"
+                        : "[MGPU][OPT2] LateLatch OFF from the panel, live from the next frame");
+}
+
+void ui_set_late_latch_age(unsigned age)
+{
+    if (age > 4u) age = 4u;
+    stream_state &s = str();
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        if (s.ll_age == age) return;
+        s.ll_age = age;
+    }
+    char l[160];
+    snprintf(l, sizeof l, "[MGPU][OPT2] LateLatchAge=%u from the panel, live from the next frame", age);
+    mgpu::diag::info(l);
+}
+
+bool ui_present_vsync()
+{
+    return g_present_vsync.load(std::memory_order_relaxed) != 0u;
+}
+
+void ui_set_present_vsync(bool on)
+{
+    const unsigned v = on ? 1u : 0u;
+    if (g_present_vsync.exchange(v, std::memory_order_relaxed) == v) return;
+    {
+        stream_state &s = str();
+        std::lock_guard<std::mutex> lk(s.cs);
+        s.present_vsync = v;
+    }
+    mgpu::diag::info(on ? "[MGPU][L5] PresentVsync=1 from the panel, live from the next present"
+                        : "[MGPU][L5] PresentVsync=0 from the panel, live - expect tearing");
+}
+
+int ui_ini_read_dcomp()
+{
+    return ini_read_dcomp_setting();
+}
+
+bool ui_ini_write_text(const char *key, const char *value)
+{
+    return ini_write_text(key, value);
+}
+
 void ui_set_neural(bool on)
 {
     stream_state &s = str();
@@ -14339,6 +14584,26 @@ void stream_request()
             s.present_vsync = (unsigned)ini_read_sr_int("PresentVsync", 1, 0, 1);
             s.sr_snippet    = (unsigned)ini_read_sr_int("SRSnippet", 1, 0, 1);
             s.rw_on         = (unsigned)ini_read_sr_int("RingWindow", 0, 0, 1);
+            s.ll_on         = (unsigned)ini_read_sr_int("LateLatch", 0, 0, 1);
+            s.ll_age        = (unsigned)ini_read_sr_int("LateLatchAge", 2, 0, 4);
+            s.stage_on      = (unsigned)ini_read_sr_int("StageCopy", 0, 0, 1);   // OPT5
+            s.stage_last = 0; s.stage_submits = 0; s.stage_fail = 0;
+            s.g0_in_sum = s.g0_mv_sum = s.g0_dma_sum = 0.0;
+            s.g0_in_n = s.g0_mv_n = s.g0_dma_n = 0;
+            s.g0_in_ms = s.g0_mv_ms = s.g0_dma_ms = -1.0;
+            s.g0_sampled = 0;
+            s.ll_pending    = 0;
+            s.ll_list_ms    = 0.0;
+            s.ll_copy_ms    = 0.0;
+            // HARDEN3: every fork counter starts from zero on each arm, so a
+            // re-arm in the same process reports that run and nothing older.
+            s.ll_issued = 0; s.ll_hits = 0; s.ll_stale = 0; s.ll_early = 0;
+            s.ll_report_at = 0;
+            s.ll_win_issued_at = 0; s.ll_win_hits_at = 0; s.ll_recent_pct = -1.0f;
+            s.half_frame[0] = s.half_frame[1] = 0ull; s.eval_half = 0u;   // FIX6
+            s.nr_lost = 0; s.cq_spec_suppressed = 0;
+            s.cq_depth_ok[0] = s.cq_depth_ok[1] = 0u;
+            s.cq_mvec_ok[0]  = s.cq_mvec_ok[1]  = 0u;
             s.sr_mv_mode    = (unsigned)ini_read_sr_int("SRMvLowRes", 0, 0, 2);
             g_present_vsync.store(s.present_vsync, std::memory_order_relaxed);
             if (s.present_vsync == 0u)
@@ -14417,6 +14682,22 @@ void stream_request()
               "overlap - that is the expected result of this mode, not a fault. CopyQueue=2 is "
               "the one that overlaps in the steady state. NOT THE CONTROL: every published "
               "figure was measured at CopyQueue=0.");
+    }
+    if (s.ll_on != 0u)
+    {
+        char lll[600];
+        snprintf(lll, sizeof lll,
+                 "[MGPU][OPT2] LateLatch=1, LateLatchAge=%u. Near the end of each evaluate the "
+                 "newest arrived frame of the free parity is copied on the copy queue, and the "
+                 "next poll evaluates it if it is at most %u frame(s) older than the newest "
+                 "arrival. Output latency rises by up to that many game frames; the serial "
+                 "unpack leaves the per-frame critical path. %s",
+                 s.ll_age, s.ll_age,
+                 s.copy_queue ? "Copy queue is ON, so this is active."
+                              : "CopyQueue=0 - LATE-LATCH NEEDS CopyQueue=1 or 2 AND IS INACTIVE "
+                                "THIS RUN.");
+        if (s.copy_queue) mgpu::diag::info(lll);
+        else              mgpu::diag::warn(lll);
     }
     {
         char ml[760];
@@ -14641,6 +14922,256 @@ void stream_request()
     mgpu::diag::info(l);
 }
 
+// ---- OPT5 helpers ----
+
+// Where the game's list writes this frame's slot: the VRAM staging buffer when
+// StageCopy is up, the cross-adapter heap otherwise. Same layout either way.
+static ID3D12Resource *g0_dst(stream_state &s)
+{
+    return (s.stage_on != 0u && s.gstage != nullptr) ? s.gstage : s.gxfer;
+}
+
+// A timestamp mark on the GAME's queue, slot-relative. q: 0/1 finish copies,
+// 2/3 MVec copy. Resolved by the caller with g0_ts_resolve after the end mark.
+static void g0_ts_mark(stream_state &s, ID3D12GraphicsCommandList *gl, unsigned slot, unsigned q)
+{
+    if (s.g0ts == nullptr || gl == nullptr) return;
+    gl->EndQuery(s.g0ts, D3D12_QUERY_TYPE_TIMESTAMP, slot * 4u + q);
+}
+static void g0_ts_resolve(stream_state &s, ID3D12GraphicsCommandList *gl, unsigned slot, unsigned q0)
+{
+    if (s.g0ts == nullptr || s.g0tsrb == nullptr || gl == nullptr) return;
+    gl->ResolveQueryData(s.g0ts, D3D12_QUERY_TYPE_TIMESTAMP, slot * 4u + q0, 2,
+                         s.g0tsrb, (UINT64)slot * 48ull + (UINT64)q0 * 8ull);
+}
+
+// Consumer side, once per consumed frame: fold frame f's GPU 0 marks into the
+// running sums. Frame f has passed gfence, so every mark for it has resolved.
+// A slot whose marks were not written this lap reads as the previous lap's
+// values or as end<=begin; the range check drops the second and the first is
+// a duplicate sample of a real frame, which is harmless in a mean.
+static void g0_ts_sample(stream_state &s, unsigned long long f)
+{
+    if (s.g0tsrb_cpu == nullptr || f == 0) return;
+    const unsigned slot = (unsigned)((f - 1) % stream_state::RING);
+    const UINT64 *m = s.g0tsrb_cpu + (size_t)slot * 6u;
+    auto ms = [](UINT64 a, UINT64 b, UINT64 freq) -> double {
+        if (freq == 0 || b <= a) return -1.0;
+        const double v = (double)(b - a) * 1000.0 / (double)freq;
+        return (v > 100.0) ? -1.0 : v;
+    };
+    double v = ms(m[0], m[1], s.g0_ts_freq);
+    if (v >= 0.0) { s.g0_in_sum += v; ++s.g0_in_n; }
+    v = ms(m[2], m[3], s.g0_ts_freq);
+    if (v >= 0.0) { s.g0_mv_sum += v; ++s.g0_mv_n; }
+    if (s.stage_on != 0u)
+    {
+        v = ms(m[4], m[5], s.g0c_ts_freq);
+        if (v >= 0.0) { s.g0_dma_sum += v; ++s.g0_dma_n; }
+    }
+}
+
+// Close the window: means into the *_ms fields, sums back to zero.
+static void g0_ts_window(stream_state &s)
+{
+    s.g0_in_ms  = s.g0_in_n  ? s.g0_in_sum  / s.g0_in_n  : -1.0;
+    s.g0_mv_ms  = s.g0_mv_n  ? s.g0_mv_sum  / s.g0_mv_n  : -1.0;
+    s.g0_dma_ms = s.g0_dma_n ? s.g0_dma_sum / s.g0_dma_n : -1.0;
+    s.g0_in_sum = s.g0_mv_sum = s.g0_dma_sum = 0.0;
+    s.g0_in_n = s.g0_mv_n = s.g0_dma_n = 0;
+}
+
+// THE PRODUCED-COUNT SIGNAL, routed. Called from the two places that used to
+// call gq->Signal(gfence, f) directly, at the same moment, under s.cs.
+//
+// StageCopy off: exactly the old call.
+// StageCopy on:  the game's queue signals g0sf (its copies into gstage are
+// done), the GPU 0 copy queue waits on that, moves every slot not yet moved
+// up to f into gxfer, and signals gfence. Then the game's queue is told to
+// wait - ON THE GPU, never the CPU - until the slot its next frame will write
+// has been moved out, which is what makes re-executing g0cl[k] and reusing
+// gstage slot k safe. That wait is satisfied RING-2 frames in advance in
+// any healthy run; if it ever is not, the DMA engine is that far behind and
+// throttling the producer is the correct answer, the same back-pressure the
+// cross-adapter ring already relies on.
+static void g0_signal(stream_state &s, ID3D12CommandQueue *gq, unsigned long long f)
+{
+    if (s.stage_on == 0u || s.g0cq == nullptr || s.g0sf == nullptr)
+    {
+        (void)gq->Signal(s.gfence, f);
+        return;
+    }
+    if (f <= s.stage_last) return;   // already handed over
+
+    unsigned long long from = s.stage_last + 1ull;
+    if (f - from + 1ull > (unsigned long long)stream_state::RING)
+        from = f + 1ull - stream_state::RING;   // older slots are already overwritten
+
+    if (FAILED(gq->Signal(s.g0sf, f)))
+    {
+        // Nothing reached gxfer for these frames. Signalling gfence anyway
+        // keeps GPU 1 from waiting forever; the seal checker will see stale
+        // slots and say so. Counted, because it should never happen.
+        ++s.stage_fail;
+        (void)gq->Signal(s.gfence, f);
+        s.stage_last = f;
+        return;
+    }
+    (void)s.g0cq->Wait(s.g0sf, f);
+    ID3D12CommandList *ls[stream_state::RING];
+    UINT n = 0;
+    for (unsigned long long k = from; k <= f; ++k)
+        ls[n++] = s.g0cl[(unsigned)((k - 1ull) % stream_state::RING)];
+    s.g0cq->ExecuteCommandLists(n, ls);
+    (void)s.g0cq->Signal(s.gfence, f);
+    s.stage_last = f;
+    s.stage_submits += n;
+
+    if (f + 2ull > (unsigned long long)stream_state::RING)
+        (void)gq->Wait(s.gfence, f + 2ull - stream_state::RING);
+}
+
+// Build the staging buffer, the GPU 0 copy queue, its prerecorded lists and
+// the timestamp heaps. Called once at arm, after gxfer exists. NEVER FATAL:
+// on any failure StageCopy is turned off for the run, loudly, and the old
+// path runs - which is the control configuration anyway.
+static void g0_stage_create(stream_state &s, ID3D12Device *gdev, ID3D12CommandQueue *gq,
+                            UINT64 heap_bytes)
+{
+    char line[700];
+
+    // Timing first, in either mode: game-queue timestamps.
+    {
+        D3D12_QUERY_HEAP_DESC qh{};
+        qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qh.Count = stream_state::RING * 4u;
+        HRESULT th = gdev->CreateQueryHeap(&qh, IID_PPV_ARGS(&s.g0ts));
+        if (SUCCEEDED(th))
+            th = make_buf(gdev, (UINT64)stream_state::RING * 48ull,
+                          D3D12_HEAP_TYPE_READBACK, &s.g0tsrb);
+        if (SUCCEEDED(th))
+        {
+            void *p = nullptr;
+            th = s.g0tsrb->Map(0, nullptr, &p);
+            if (SUCCEEDED(th) && p != nullptr)
+            {
+                memset(p, 0, (size_t)stream_state::RING * 48u);
+                s.g0tsrb_cpu = reinterpret_cast<const UINT64 *>(p);
+            }
+            else th = E_FAIL;
+        }
+        if (SUCCEEDED(th)) th = gq->GetTimestampFrequency(&s.g0_ts_freq);
+        if (FAILED(th) || s.g0_ts_freq == 0)
+        {
+            if (s.g0tsrb != nullptr) { s.g0tsrb->Release(); s.g0tsrb = nullptr; }
+            if (s.g0ts != nullptr) { s.g0ts->Release(); s.g0ts = nullptr; }
+            s.g0tsrb_cpu = nullptr;
+            s.g0_ts_freq = 0;
+        }
+    }
+
+    if (s.stage_on == 0u)
+    {
+        snprintf(line, sizeof line,
+                 "[MGPU][OPT5] StageCopy=0: the game's queue copies straight to the shared heap "
+                 "(upstream path). GPU 0 copy timing %s - see 'GPU0' in the [MGPU][OPT] line.",
+                 s.g0ts ? "ON" : "OFF");
+        mgpu::diag::info(line);
+        return;
+    }
+
+    HRESULT h = S_OK;
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = heap_bytes; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        h = gdev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                          IID_PPV_ARGS(&s.gstage));
+    }
+    if (SUCCEEDED(h))
+    {
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        h = gdev->CreateCommandQueue(&qd, IID_PPV_ARGS(&s.g0cq));
+    }
+    if (SUCCEEDED(h))
+        h = gdev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&s.g0ca));
+    if (SUCCEEDED(h))
+        h = gdev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.g0sf));
+
+    // Copy-queue timestamps are optional; their absence only loses the DMA ms.
+    if (SUCCEEDED(h) && s.g0tsrb != nullptr)
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3{};
+        HRESULT th = gdev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof o3);
+        if (SUCCEEDED(th) && !o3.CopyQueueTimestampQueriesSupported) th = E_NOTIMPL;
+        if (SUCCEEDED(th))
+        {
+            D3D12_QUERY_HEAP_DESC cqh{};
+            cqh.Type = D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP;
+            cqh.Count = stream_state::RING * 2u;
+            th = gdev->CreateQueryHeap(&cqh, IID_PPV_ARGS(&s.g0cts));
+        }
+        if (SUCCEEDED(th)) th = s.g0cq->GetTimestampFrequency(&s.g0c_ts_freq);
+        if (FAILED(th) || s.g0c_ts_freq == 0)
+        {
+            if (s.g0cts != nullptr) { s.g0cts->Release(); s.g0cts = nullptr; }
+            s.g0c_ts_freq = 0;
+        }
+    }
+
+    // The RING prerecorded lists: stage slot k -> gxfer slot k, whole slot.
+    for (unsigned k = 0; k < stream_state::RING && SUCCEEDED(h); ++k)
+    {
+        h = gdev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, s.g0ca, nullptr,
+                                    IID_PPV_ARGS(&s.g0cl[k]));
+        if (FAILED(h)) break;
+        const UINT64 off = (UINT64)k * s.slot_bytes;
+        if (s.g0cts != nullptr)
+            s.g0cl[k]->EndQuery(s.g0cts, D3D12_QUERY_TYPE_TIMESTAMP, k * 2u);
+        s.g0cl[k]->CopyBufferRegion(s.gxfer, off, s.gstage, off, s.slot_bytes);
+        if (s.g0cts != nullptr)
+        {
+            s.g0cl[k]->EndQuery(s.g0cts, D3D12_QUERY_TYPE_TIMESTAMP, k * 2u + 1u);
+            s.g0cl[k]->ResolveQueryData(s.g0cts, D3D12_QUERY_TYPE_TIMESTAMP, k * 2u, 2,
+                                        s.g0tsrb, (UINT64)k * 48ull + 32ull);
+        }
+        h = s.g0cl[k]->Close();
+    }
+
+    if (FAILED(h))
+    {
+        snprintf(line, sizeof line,
+                 "[MGPU][OPT5] StageCopy FAILED TO COME UP hr=0x%08X - turned off for this run, "
+                 "the game's queue copies straight to the shared heap as upstream does.",
+                 (unsigned)h);
+        mgpu::diag::error(line);
+        for (unsigned k = 0; k < stream_state::RING; ++k)
+            if (s.g0cl[k] != nullptr) { s.g0cl[k]->Release(); s.g0cl[k] = nullptr; }
+        if (s.g0cts != nullptr) { s.g0cts->Release(); s.g0cts = nullptr; }
+        if (s.g0sf != nullptr) { s.g0sf->Release(); s.g0sf = nullptr; }
+        if (s.g0ca != nullptr) { s.g0ca->Release(); s.g0ca = nullptr; }
+        if (s.g0cq != nullptr) { s.g0cq->Release(); s.g0cq = nullptr; }
+        if (s.gstage != nullptr) { s.gstage->Release(); s.gstage = nullptr; }
+        s.stage_on = 0u;
+        return;
+    }
+
+    snprintf(line, sizeof line,
+             "[MGPU][OPT5] StageCopy=1 UP: %llu-byte VRAM staging ring on GPU 0, a GPU 0 COPY "
+             "queue with %u prerecorded slot copies (%llu bytes each), DMA timing %s. The game's "
+             "list now copies VRAM to VRAM and the PCIe transfer runs on the DMA engine. Compare "
+             "'GPU0 in-frame copies' in [MGPU][OPT] against a StageCopy=0 run.",
+             (unsigned long long)heap_bytes, stream_state::RING,
+             (unsigned long long)s.slot_bytes, s.g0cts ? "ON" : "OFF");
+    mgpu::diag::info(line);
+}
+
 // Game thread, every frame, with the game's command list open.
 // L3. THE PRODUCED-COUNT SIGNAL, ONE EVENT EARLIER.
 //
@@ -14671,7 +15202,7 @@ void stream_on_present(void *cmd_queue_v)
     ID3D12CommandQueue *gq = reinterpret_cast<ID3D12CommandQueue *>(cmd_queue_v);
     if (gq == nullptr) return;
 
-    (void)gq->Signal(s.gfence, s.produced);
+    g0_signal(s, gq, s.produced);   // OPT5: routed; identical when StageCopy=0
 }
 
 // ================= REFLEX: FORCE LOW LATENCY ON GPU 0 =====================
@@ -15904,6 +16435,9 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             mgpu::diag::info(ml);
         }
 
+        // OPT5. Never fails the arm; turns StageCopy off on its own failure.
+        if (SUCCEEDED(h)) g0_stage_create(s, gdev, gq, heap_bytes);
+
         if (FAILED(h))
         {
             mgpu::diag::error("[MGPU][P4.0] arm failed - the stream is inert for this launch and "
@@ -15918,7 +16452,10 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // does not value-initialise before C++20, and relying on the static
         // storage being zero is the kind of assumption this file pays for.
         for (unsigned q = 0; q < stream_state::RING; ++q)
+        {
             s.mvec_slot_valid[q].store(0u, std::memory_order_relaxed);
+            s.mvec_slot_frame[q].store(0ull, std::memory_order_relaxed);   // FIX5
+        }
         s.mvec_live.store(s.mvec_mode == 3 && s.mvec_bytes2 != 0,
                           std::memory_order_release);
         return;    // record nothing on the arming frame
@@ -16069,7 +16606,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // instead, one event earlier, which is a whole frame earlier. See
         // stream_on_present.
         if (s.signal_at == 0u)
-            (void)gq->Signal(s.gfence, s.produced);
+            g0_signal(s, gq, s.produced);   // OPT5: routed; identical when StageCopy=0
     }
 
     if (s.produced >= s.max_frames)
@@ -16249,6 +16786,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         if (s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u) seal.mvec_valid = 1u;
         else ++s.mvec_missing;
     }
+    s.mvec_slot_frame[slot].store(seal.mvec_valid ? fi : 0ull, std::memory_order_release);   // FIX5
 
     // ---- THE DEPTH DECISION IS MADE HERE, BEFORE THE SEAL IS STAGED ----
     //
@@ -16315,7 +16853,9 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // Seal first, payload second, in one list. Command-list order guarantees
     // the seal is written before the pixels within the same submission, and the
     // single fence signal covers both.
-    gl->CopyBufferRegion(s.gxfer, slot_off, s.gup, (UINT64)slot * SEAL_STRIDE, sizeof(MgpuSeal));
+    ID3D12Resource *const xdst = g0_dst(s);   // OPT5: gstage or gxfer, same layout
+    g0_ts_mark(s, gl, slot, 0u);              // OPT5 timing: start of our copies
+    gl->CopyBufferRegion(xdst, slot_off, s.gup, (UINT64)slot * SEAL_STRIDE, sizeof(MgpuSeal));
 
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -16328,7 +16868,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     D3D12_TEXTURE_COPY_LOCATION cs{}, cd{};
     cs.pResource = src; cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     cs.SubresourceIndex = 0;
-    cd.pResource = s.gxfer; cd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    cd.pResource = xdst; cd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     cd.PlacedFootprint = s.fp; cd.PlacedFootprint.Offset = slot_off + SEAL_STRIDE;
     gl->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
 
@@ -16356,12 +16896,14 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         ds.pResource = dsrc;
         ds.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         ds.SubresourceIndex = 0;
-        dt.pResource = s.gxfer;
+        dt.pResource = xdst;
         dt.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         dt.PlacedFootprint = s.depth_fp;
         dt.PlacedFootprint.Offset = slot_off + s.depth_off;
         gl->CopyTextureRegion(&dt, 0, 0, 0, &ds, nullptr);
     }
+    g0_ts_mark(s, gl, slot, 1u);              // OPT5 timing: end of our copies
+    g0_ts_resolve(s, gl, slot, 0u);
 
     s.produced = fi;
     s.produced_a.store(fi, std::memory_order_release);   // R88: the lock-free mirror
@@ -16480,11 +17022,14 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     ms.pResource = msrc;
     ms.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     ms.SubresourceIndex = 0;
-    mt.pResource = s.gxfer;
+    mt.pResource = g0_dst(s);   // OPT5
     mt.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     mt.PlacedFootprint = s.mvec_fp2;
     mt.PlacedFootprint.Offset = slot_off + s.mvec_off;
+    g0_ts_mark(s, gl, slot, 2u);
     gl->CopyTextureRegion(&mt, 0, 0, 0, &ms, nullptr);
+    g0_ts_mark(s, gl, slot, 3u);
+    g0_ts_resolve(s, gl, slot, 2u);
 
     // Counted ONCE per frame even if the engine binds the target twice, so
     // that copies + missing equals the number of frames sealed and a
@@ -16520,9 +17065,8 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
 //    in COMMON in this mode, is read as NON_PIXEL_SHADER_RESOURCE on the
 //    direct queue, and is put back to COMMON at the end of that list, ready
 //    for the copy queue to take it again two frames later.
-static bool stream_cq_submit(stream_state &s, unsigned long long f)
+static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)   // FIX6: half explicit
 {
-    const unsigned ii = (unsigned)(f & 1ull);
     if (s.cq == nullptr || s.cqf == nullptr || s.cqa[ii] == nullptr ||
         s.cql[ii] == nullptr || s.tex_in[ii] == nullptr || s.nxfer == nullptr)
         return false;
@@ -16554,6 +17098,7 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f)
     ud.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     ud.SubresourceIndex = 0;
     s.cql[ii]->CopyTextureRegion(&ud, 0, 0, 0, &us, nullptr);
+    bool depth_copied = false, mvec_copied = false;   // OPT4
 
     // ---- WHERE THE ACQUISITION PAYLOAD LANDS (R26a step 2) ----
     //
@@ -16579,6 +17124,7 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f)
         ddu.SubresourceIndex = 0;
         s.cql[ii]->CopyTextureRegion(&ddu, 0, 0, 0, &dsu, nullptr);
         ++s.depth_unpacks;
+        depth_copied = true;   // OPT4
     }
 
     // R78: and MVec, in the SAME batch, under the SAME Signal. Third region,
@@ -16586,7 +17132,7 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f)
     // round trip. The synthetic modes still never appear here: they are
     // uploaded on GPU 1 and never touch the bus.
     if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
-        s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u)
+        s.mvec_bytes2 != 0 && s.mvec_slot_frame[slot].load(std::memory_order_acquire) == f)   // FIX5
     {
         D3D12_TEXTURE_COPY_LOCATION msu{}, mdu{};
         msu.pResource = s.nxfer;
@@ -16598,6 +17144,7 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f)
         mdu.SubresourceIndex = 0;
         s.cql[ii]->CopyTextureRegion(&mdu, 0, 0, 0, &msu, nullptr);
         ++s.mvec_unpacks;
+        mvec_copied = true;   // OPT4
     }
 
     if (s.cq_ts_ok)
@@ -16636,7 +17183,18 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f)
     if (FAILED(s.cq->Signal(s.cqf, (UINT64)f))) return false;
     s.cqf_value = (UINT64)f;
     s.cqa_value[ii] = (UINT64)f;
+    s.cq_depth_ok[ii] = depth_copied ? 1u : 0u;   // OPT4
+    s.cq_mvec_ok[ii]  = mvec_copied  ? 1u : 0u;
+    s.half_frame[ii]  = f;   // FIX6
     return true;
+}
+
+// FIX6. The half holding frame f, or 2 if neither does.
+static unsigned cq_half_of(const stream_state &s, unsigned long long f)
+{
+    if (f != 0ull && s.half_frame[0] == f) return 0u;
+    if (f != 0ull && s.half_frame[1] == f) return 1u;
+    return 2u;
 }
 
 // Bridge thread, once per present. Cheap and does nothing until frames exist.
@@ -16872,6 +17430,12 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                     if (tv[i] < tv[i - 1]) sane = false;   // a wrapped or unwritten mark
                 if (sane)
                 {
+                    // OPT2: the whole direct list, first mark to last. This is
+                    // the late-latch's estimate of how long the NEXT evaluate
+                    // will take, so it is taken from every frame, calibration
+                    // frames included - it predicts, it does not report.
+                    s.ll_list_ms = (double)(tv[stream_state::TS_MARKS - 1] - tv[0]) * 1000.0
+                                 / (double)s.ts_freq;
                     for (UINT i = 0; i + 1 < stream_state::TS_MARKS; ++i)
                     {
                         const double ms = (double)(tv[i + 1] - tv[i]) * 1000.0
@@ -16904,6 +17468,8 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         // frames are excluded for the same reason they are
                         // excluded from every other statistic - they describe
                         // the measurement, not the run.
+                        if (i == 2)
+                            s.hud_nr_gpu_ms = ms;
                         if (i == 2 && !cc_busy)
                         { s.auto_win_sum += ms; ++s.auto_win_n; }
                         if (!cc_busy)
@@ -17027,6 +17593,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                     const double cms = (double)(mk[1] - mk[0]) * 1000.0
                                      / (double)s.cq_ts_freq;
                     s.cq_ts_sum += cms;
+                    s.ll_copy_ms = cms;   // OPT2: the late-latch's copy estimate
                     if (cms < s.cq_ts_min) s.cq_ts_min = cms;
                     if (cms > s.cq_ts_max) s.cq_ts_max = cms;
                     ++s.cq_ts_n;
@@ -17219,7 +17786,10 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
 
                 // The seal crossed the adapter; mvec_slot_valid did not. Same
                 // fact by two routes, so a disagreement is a finding.
-                if ((got.mvec_valid != 0u) != (s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u))
+                // FIX5: compared against the frame tag the copy decision now
+                // uses, so this counts real disagreements and should read 0.
+                if ((got.mvec_valid != 0u) !=
+                    (s.mvec_slot_frame[slot].load(std::memory_order_acquire) == f))
                     ++s.mvec_flag_disagree;
 
                 if (f >= s.mvec_report_at)
@@ -17680,6 +18250,174 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
         }
 }
 
+// ---- OPT2: LATE-LATCH PREFETCH ----
+//
+// WHY: the consumer evaluates only the newest arrival, so the frame it will
+// evaluate next is unknown until the current evaluate ends. The shipped f+1
+// prefetch guesses f+1, which under a backlog is never the frame evaluated
+// (measured: 86 fps in, 32 evaluated), so every evaluated frame paid its full
+// unpack serially in front of EvaluateFeature. This waits until the current
+// list is nearly done, THEN picks the newest arrival of the free tex_in parity
+// and copies it, so the copy overlaps the evaluate's tail.
+//
+// SAFETY: the latched frame always has the OPPOSITE parity of f, so it writes
+// the tex_in half f is NOT reading; stream_cq_submit already refuses a half
+// whose previous copy has not completed. Mode 1 never latches an unarrived
+// frame (it has no GPU gate). The stream mutex is held only around the submit,
+// never across a wait - DEFECT E's rule.
+// ---- HARDEN1: a fence wait that survives a failed SetEventOnCompletion ----
+//
+// The consumer registered its event and ignored the HRESULT, so a failed
+// registration became a silent 5 s wait followed by "frame lost" - with the
+// GPU work STILL IN FLIGHT, and the next frame then resetting an allocator the
+// GPU was using. Polling the fence instead waits for the real completion.
+// Call with the stream mutex RELEASED. Returns WAIT_OBJECT_0 when the fence
+// reached `value`, WAIT_TIMEOUT otherwise.
+static DWORD fence_poll_wait(ID3D12Fence *fence, UINT64 value, DWORD timeout_ms)
+{
+    if (fence == nullptr) return WAIT_FAILED;
+    const ULONGLONG t0 = GetTickCount64();
+    for (;;)
+    {
+        // UINT64_MAX on a removed device reads as complete; the next D3D call
+        // reports the removal, which is the right place for it.
+        if (fence->GetCompletedValue() >= value) return WAIT_OBJECT_0;
+        if (GetTickCount64() - t0 >= (ULONGLONG)timeout_ms) return WAIT_TIMEOUT;
+        Sleep(1);
+    }
+}
+
+static void fence_event_failed_once(HRESULT hr)
+{
+    static std::atomic<bool> said{false};
+    if (said.exchange(true)) return;
+    char l[300];
+    snprintf(l, sizeof l, "[MGPU][HARDEN1] SetEventOnCompletion failed (0x%08X) - falling back to "
+             "polling the fence for this and any later frame where it fails. Said once.",
+             (unsigned)hr);
+    mgpu::diag::warn(l);
+}
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+// Bridge thread only. Created on first use, closed by ll_timer_close() from
+// stream_shutdown (HARDEN2), and re-created if the stream is armed again.
+static HANDLE g_ll_timer = nullptr;
+static bool   g_ll_timer_tried = false;
+
+static HANDLE ll_timer()
+{
+    if (!g_ll_timer_tried)
+    {
+        g_ll_timer_tried = true;
+        g_ll_timer = CreateWaitableTimerExW(nullptr, nullptr,
+                                            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+        if (g_ll_timer == nullptr)
+            g_ll_timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);   // pre-1803 fallback
+    }
+    return g_ll_timer;
+}
+
+static void ll_timer_close();
+void late_latch_shutdown() { ll_timer_close(); }
+
+static void ll_timer_close()
+{
+    if (g_ll_timer != nullptr)
+    {
+        CancelWaitableTimer(g_ll_timer);
+        CloseHandle(g_ll_timer);
+        g_ll_timer = nullptr;
+    }
+    g_ll_timer_tried = false;
+}
+
+// Called with s.cs HELD.
+static void ll_latch(stream_state &s, unsigned long long f)
+{
+    if (s.nfence == nullptr || s.cq == nullptr) return;
+    const unsigned long long arrived = (unsigned long long)s.nfence->GetCompletedValue();
+
+    // FIX6: the newest arrival, whatever its parity - the copy goes into the
+    // half this evaluate is not reading, so parity no longer constrains it.
+    unsigned long long p = (arrived > f) ? arrived : 0ull;
+    if (p == 0)
+    {
+        if (!s.cq_gated) return;   // mode 1: never copy a slot that has not landed
+        p = f + 1;                 // mode 2: GPU-gated on the game fence, as shipped
+    }
+    if (p <= s.cq_issued) return;
+    // The copy must finish before the producer laps p's ring slot.
+    if (arrived + 2ull >= p + (unsigned long long)stream_state::RING) return;
+
+    if (stream_cq_submit(s, p, 1u - s.eval_half))   // FIX6
+    {
+        s.cq_issued = p;
+        s.ll_pending = p;
+        ++s.ll_issued;
+        if (p > arrived) ++s.cq_spec;
+    }
+}
+
+// Replaces the plain WaitForSingleObject(s.nev, 5000) when late-latch is on.
+// Called with lk HELD, returns with lk HELD, returns the result of the wait on
+// s.nev (WAIT_OBJECT_0 on success) exactly as the original call did.
+static DWORD ll_wait_and_latch(stream_state &s, std::unique_lock<std::mutex> &lk,
+                               unsigned long long f)
+{
+    const double margin_ms = 1.5;
+    double lead = s.ll_list_ms - s.ll_copy_ms - margin_ms;
+    if (lead < 0.0) lead = 0.0;
+    const HANDLE ev = s.nev;
+
+    lk.unlock();
+
+    bool nr_done = false;   // the evaluate finished before we latched
+    bool failed  = false;   // the wait itself failed or hit 5 s
+    DWORD wr = WAIT_TIMEOUT;
+
+    if (lead > 0.0)
+    {
+        const HANDLE tm = ll_timer();
+        LARGE_INTEGER due{};
+        due.QuadPart = -(LONGLONG)(lead * 10000.0);   // relative, 100 ns units
+        if (tm != nullptr && SetWaitableTimer(tm, &due, 0, nullptr, nullptr, FALSE))
+        {
+            const HANDLE hs[2] = { ev, tm };
+            const DWORD r = WaitForMultipleObjects(2, hs, FALSE, 5000);
+            if (r == WAIT_OBJECT_0)          { nr_done = true; wr = r; CancelWaitableTimer(tm); }
+            else if (r != WAIT_OBJECT_0 + 1) { failed = true;  wr = r; CancelWaitableTimer(tm); }
+        }
+        else
+        {
+            // No timer: a coarse wait that still returns the moment NR ends.
+            const DWORD r = WaitForSingleObject(ev, (DWORD)(lead + 0.5));
+            if (r == WAIT_OBJECT_0)     { nr_done = true; wr = r; }
+            else if (r != WAIT_TIMEOUT) { failed = true;  wr = r; }
+        }
+    }
+
+    if (!failed)
+    {
+        // Latch even when NR already finished: the copy then overlaps the
+        // present and the next poll's CPU work instead of sitting in front of
+        // the next evaluate.
+        lk.lock();
+        if (nr_done) ++s.ll_early;
+        ll_latch(s, f);
+        lk.unlock();
+    }
+
+    if (!nr_done && !failed)
+        wr = WaitForSingleObject(ev, 5000);
+
+    lk.lock();
+    return wr;
+}
+
 void stream_poll()
 {
     stream_state &s = str();
@@ -17870,6 +18608,20 @@ void stream_poll()
                 (void)WaitForSingleObject(s.nev, 20000);
             }
 
+            // OPT2: a late-latched (or mode-2 speculative) unpack may still be
+            // running on the COPY queue, which the direct-queue wait above
+            // does not cover. Drain it before anything is released, and drop
+            // the latch - the frame it holds belongs to the old feature.
+            if (s.cq != nullptr && s.cqf != nullptr && s.nev != nullptr &&
+                s.cqf->GetCompletedValue() < s.cqf_value)
+            {
+                if (SUCCEEDED(s.cqf->SetEventOnCompletion(s.cqf_value, s.nev)))
+                    (void)WaitForSingleObject(s.nev, 2000);
+                else
+                    (void)fence_poll_wait(s.cqf, s.cqf_value, 2000);   // HARDEN1
+            }
+            s.ll_pending = 0;
+
             mgpu::diag::info("[MGPU][C2-SR] rebuild step 3: releasing - IF THIS IS THE LAST "
                              "LINE, IT DIED IN THE TEARDOWN");
             stream_sr_release_only(s);
@@ -17937,29 +18689,63 @@ void stream_poll()
         s.faults_muted = 0;
     }
 
-    const unsigned long long completed =
+    // OPT2: completed_raw is what has ARRIVED. `completed` below is the frame
+    // this poll will evaluate up to, which equals completed_raw unless a
+    // late-latched frame is waiting to be used.
+    const unsigned long long completed_raw =
         (s.nfence != nullptr) ? (unsigned long long)s.nfence->GetCompletedValue() : 0;
 
     // L2: the instant this poll first saw the fence move. Every frame the
     // advance exposed became READY at or before now, and this is the earliest
     // moment we could possibly have known.
-    if (completed > s.seen_fence_val)
+    if (completed_raw > s.seen_fence_val)
     {
         LARGE_INTEGER fnow{};
         QueryPerformanceCounter(&fnow);
         s.seen_fence_at  = (unsigned long long)fnow.QuadPart;
-        s.seen_fence_val = completed;
+        s.seen_fence_val = completed_raw;
     }
 
     char line[1400];   // P6.0: the P2.2 and P4.1 summaries carry the pass split now
 
-    if (s.consumed >= completed) ++s.idle_polls;
+    if (s.consumed >= completed_raw) ++s.idle_polls;
+
+    // OPT1: how far ahead the producer was when this poll started. Above 1,
+    // the frame evaluated after this one will be the newest arrival and not
+    // f+1, so a speculative f+1 copy would never be read.
+    const unsigned long long poll_backlog =
+        (completed_raw > s.consumed) ? (completed_raw - s.consumed) : 0ull;
+
+    // OPT2: use the late-latched frame if it has arrived and is fresh enough.
+    unsigned long long completed = completed_raw;
+    if (s.ll_pending != 0ull)
+    {
+        const unsigned long long lp = s.ll_pending;
+        if (lp <= s.consumed)
+        {
+            s.ll_pending = 0;                       // overtaken; nothing to do
+        }
+        else if (lp <= completed_raw)
+        {
+            s.ll_pending = 0;
+            if (completed_raw - lp <= (unsigned long long)s.ll_age)
+            {
+                completed = lp;
+                ++s.ll_hits;
+            }
+            else
+            {
+                ++s.ll_stale;                       // its copy is wasted; take newest
+            }
+        }
+        // else: latched speculatively and not arrived yet - keep it pending.
+    }
 
     // P4.1: bring the neural stage up on the first frame that is actually
     // consumable. Not at arm time - the geometry is only trustworthy once a
     // seal has carried it across, and CreateFeature costs ~180 ms that would
     // otherwise be spent before we knew the stream worked at all.
-    if (s.neural && !s.nr_tried && s.consumed < completed)
+    if (s.neural && !s.nr_tried && s.consumed < completed_raw)
     {
         // V29. Only latched once the attempt actually reached NGX. A stale
         // session clears the latch below and comes back in ~120 frames.
@@ -18146,12 +18932,14 @@ void stream_poll()
             bh = s.nq->Signal(s.nf, s.nf_value);
             if (SUCCEEDED(bh))
             {
-                s.nf->SetEventOnCompletion(s.nf_value, s.nev);
+                const HRESULT beh = s.nf->SetEventOnCompletion(s.nf_value, s.nev);
+                if (FAILED(beh)) fence_event_failed_once(beh);   // HARDEN1
                 // DEFECT E's discipline, unchanged: the one blocking call runs
                 // with the mutex RELEASED, so the game's render thread is free
                 // to record and signal while we are here.
                 lk.unlock();
-                const DWORD bwr = WaitForSingleObject(s.nev, 5000);
+                const DWORD bwr = SUCCEEDED(beh) ? WaitForSingleObject(s.nev, 5000)
+                                                 : fence_poll_wait(s.nf, s.nf_value, 5000);
                 lk.lock();
                 if (bwr != WAIT_OBJECT_0) bh = E_FAIL;
             }
@@ -18172,6 +18960,7 @@ void stream_poll()
             // A failed batch must not be retried forever. Advance past it; the
             // seals it would have checked are lost and the next frame's gap
             // check will say so, which is the correct report.
+            if (bulk_last > s.consumed) s.nr_lost += bulk_last - s.consumed;   // OPT3
             s.consumed = bulk_last;
         }
     }
@@ -18272,7 +19061,12 @@ void stream_poll()
         bool use_cq = false;
         if (s.copy_queue && run_nr && s.cq != nullptr)
         {
-            ii = (unsigned)(f & 1ull);
+            // FIX6: the half that already holds f (late-latched or prefetched),
+            // else the older of the two - never the half a pending latched copy
+            // of a NEWER frame is landing in.
+            ii = cq_half_of(s, f);
+            const bool have_f = (ii != 2u);
+            if (!have_f) ii = (s.half_frame[0] <= s.half_frame[1]) ? 0u : 1u;
             // Never re-issue for a frame the overrun check already walked past.
             if (s.cq_issued + 1 < f) s.cq_issued = f - 1;
             // MODE 1: only ever arm a frame the CPU already knows has landed,
@@ -18286,22 +19080,51 @@ void stream_poll()
             // STILL EXACTLY ONE AHEAD IN BOTH MODES. tex_in has two halves;
             // f+2 would land in the one frame f is reading. The bound and the
             // pair are the same fact and neither mode may exceed it.
-            const unsigned long long want = (s.cq_gated || completed > f) ? (f + 1) : f;
+            // OPT1: speculate on f+1 ONLY when the producer was not already
+            // ahead at poll entry. When it was, the next evaluate takes the
+            // newest arrival (newest-only rule), f+1 is never read, and its
+            // copy was a full-frame upload competing for GPU 1's link for
+            // nothing. With LateLatch on, the latch chooses the next frame
+            // instead, so no f+1 speculation at all.
+            const bool spec_ok = s.cq_gated && s.ll_on == 0u && poll_backlog <= 1ull;
+            if (s.cq_gated && s.ll_on == 0u && !spec_ok && s.cq_issued < f + 1) ++s.cq_spec_suppressed;
+            const unsigned long long want = (spec_ok || completed > f) ? (f + 1) : f;
+            // FIX6: copy f itself if no half holds it, then (when wanted) f+1
+            // into the OTHER half. Frames between are never evaluated
+            // (newest-only), so they are not copied - upstream walked every
+            // frame from cq_issued+1 because the parity scheme needed it.
             bool ok = true;
-            while (ok && s.cq_issued < want)
+            if (!have_f)
             {
-                const unsigned long long n = s.cq_issued + 1;
-                ok = stream_cq_submit(s, n);
-                if (ok)
-                {
-                    s.cq_issued = n;
-                    if (n > f) ++s.cq_ahead;
-                    if (n > completed) ++s.cq_spec;   // armed before arrival - mode 2 only
-                }
+                ok = stream_cq_submit(s, f, ii);
+                if (ok && f > s.cq_issued) s.cq_issued = f;
             }
-            use_cq = (s.cq_issued >= f);
+            if (ok && want > f && cq_half_of(s, f + 1) == 2u &&
+                stream_cq_submit(s, f + 1, 1u - ii))
+            {
+                if (f + 1 > s.cq_issued) s.cq_issued = f + 1;
+                ++s.cq_ahead;
+                if (f + 1 > completed_raw) ++s.cq_spec;   // armed before arrival - mode 2 only
+            }
+            use_cq = (cq_half_of(s, f) == ii);
             if (!use_cq) ++s.cq_fails;
         }
+
+        // FIX6: record which half this evaluate reads, so a late-latch issued
+        // during it targets the other one. An inline unpack lands in ii too.
+        if (run_nr)
+        {
+            if (!use_cq) s.half_frame[ii] = f;
+            s.eval_half = ii;
+        }
+
+        // OPT4: one validity decision per frame, used by the bind and by
+        // BOTH barriers. With the copy queue it is what was actually copied;
+        // inline, the copy is in this same list, so read the flag once now.
+        const bool fr_depth = use_cq ? (s.cq_depth_ok[ii] != 0u)
+                                     : (s.depth_slot_valid[slot] != 0u);
+        const bool fr_mvec  = use_cq ? (s.cq_mvec_ok[ii] != 0u)
+                                     : (s.mvec_slot_frame[slot].load(std::memory_order_acquire) == f);   // FIX5
 
         HRESULT h = s.na->Reset();
         if (SUCCEEDED(h)) h = s.nl->Reset(s.na, nullptr);
@@ -18362,7 +19185,7 @@ void stream_poll()
                 // rather than reasoned about a second time.
                 const bool depth_here =
                     (s.depth_mode != 0 && s.tex_depth[ii] != nullptr &&
-                     s.depth_bytes != 0 && s.depth_slot_valid[slot] != 0u);
+                     s.depth_bytes != 0 && fr_depth);
                 if (depth_here)
                 {
                     if (!use_cq)
@@ -18392,7 +19215,7 @@ void stream_poll()
                 // missed unpack nothing and bind nothing.
                 const bool mvec_here =
                     (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
-                     s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u);
+                     s.mvec_bytes2 != 0 && fr_mvec);
                 if (mvec_here)
                 {
                     if (!use_cq)
@@ -18655,7 +19478,7 @@ void stream_poll()
                     // input carries its own subrect; this is the input that
                     // makes that mandatory rather than tidy.
                     if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
-                        s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u)
+                        s.mvec_bytes2 != 0 && fr_mvec)
                     {
                         s.nr_params->Set("DLSSNR.MVec", s.tex_mvec_r[ii]);
                         // R87: scaled by the frames that actually elapsed. With
@@ -18707,7 +19530,7 @@ void stream_poll()
                     // from the unpack: it is three loads, and it cannot be
                     // wrong about a scope.
                     if (s.depth_mode == 1 && s.tex_depth[ii] != nullptr &&
-                        s.depth_slot_valid[slot] != 0u)
+                        fr_depth)
                     {
                         s.nr_params->Set("DLSSNR.Depth", s.tex_depth[ii]);
                         s.nr_params->Set("DLSSNR.DepthSubrectBaseX", 0u);
@@ -18840,10 +19663,20 @@ void stream_poll()
                     // The game's scale, corrected by R/mvec. At SRScale=0 the two
                     // extents are equal, the factors are 1.0, and this is
                     // byte-identical to what shipped before.
+                    //
+                    // FORK (SRFIX1): times mv_el, exactly as the NR evaluate
+                    // above does since R87. The game's vectors describe ONE
+                    // game frame of motion, but SR reprojects its history from
+                    // its PREVIOUS evaluate, which is mv_el game frames back
+                    // whenever the consumer cannot keep up. Without this SR
+                    // shifted its history by a fraction of the real motion, by
+                    // a fraction that changed every frame - shimmer and flicker
+                    // while the camera moved, nothing while it stood still.
+                    // A consumer that keeps up multiplies by 1.0, unchanged.
                     s.sr_params->Set(NVSDK_NGX_Parameter_MV_Scale_X,
-                                     s.mvec_scale_x * s.sr_mv_fix_x);
+                                     s.mvec_scale_x * s.sr_mv_fix_x * mv_el);
                     s.sr_params->Set(NVSDK_NGX_Parameter_MV_Scale_Y,
-                                     s.mvec_scale_y * s.sr_mv_fix_y);
+                                     s.mvec_scale_y * s.sr_mv_fix_y * mv_el);
                     // JITTER IS ZERO, AND THAT IS CORRECT HERE - but read the
                     // consequence. The frame we hand SR has already been
                     // resolved by the GAME'S DLSS and tone mapped; it carries
@@ -18861,7 +19694,11 @@ void stream_poll()
                     s.sr_params->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
                     s.sr_params->Set(NVSDK_NGX_Parameter_ExposureTexture, s.sr_expose);
                     s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, 1.0f);
-                    s.sr_params->Set(NVSDK_NGX_Parameter_Reset, s.sr_first ? 1u : 0u);
+                    // SRFIX1: a gap of 8+ game frames is a resync (a hitch, a
+                    // load), not motion a linear scale can describe - drop the
+                    // history instead of reprojecting it that far.
+                    s.sr_params->Set(NVSDK_NGX_Parameter_Reset,
+                                     (s.sr_first || mv_el >= 8.0f) ? 1u : 0u);
                     s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
                                      (unsigned int)s.sr_w);
                     s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
@@ -18890,6 +19727,10 @@ void stream_poll()
 
                 if (final_pass_ok)
                 {
+                    // R5 diagnostic: one successfully produced DLSS-NR frame.
+                    // Count FRAMES, not passes, and do not advance this counter
+                    // for P6.4 backlog frames that were consumed without NR.
+                    g_hud_nr_ok_count.fetch_add(1, std::memory_order_relaxed);
                     // C2-SR writes the display-extent result into tex_out
                     // whatever the pass parity did at R, so the presenter takes
                     // tex_out directly rather than the ping-pong winner.
@@ -18948,7 +19789,7 @@ void stream_poll()
                 // and COMMON with the copy queue on, and depth is written by
                 // whichever of the two wrote tex_in.
                 if (s.depth_mode != 0 && s.tex_depth[ii] != nullptr &&
-                    s.depth_slot_valid[slot] != 0u)
+                    fr_depth)
                     barrier(s.nl, s.tex_depth[ii],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, s.tex_in_rest);
 
@@ -18961,7 +19802,7 @@ void stream_poll()
                 // has a standing note about; it is written the same way as
                 // depth's so the two cannot drift apart.
                 if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
-                    s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u)
+                    s.mvec_bytes2 != 0 && fr_mvec)
                     barrier(s.nl, s.tex_mvec_r[ii],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, s.tex_in_rest);
 
@@ -18986,13 +19827,20 @@ void stream_poll()
             // barrier that a copy queue is not allowed to record happens on
             // this side of it.
             if (use_cq && s.cqf != nullptr) (void)s.nq->Wait(s.cqf, (UINT64)f);
+            // OPT2 safety: an inline-unpack fallback writes tex_in[ii] on THIS
+            // queue. A late-latched copy into the same half may still be in
+            // flight on the copy queue, so wait for it - but only if its frame
+            // has arrived, so the wait cannot hang on a gated copy.
+            else if (s.copy_queue && s.cqf != nullptr && s.cqf_value != 0 &&
+                     s.cqf_value <= (UINT64)completed_raw)
+                (void)s.nq->Wait(s.cqf, s.cqf_value);
             ID3D12CommandList *const ls[1] = { s.nl };
             s.nq->ExecuteCommandLists(1, ls);
             ++s.nf_value;
             h = s.nq->Signal(s.nf, s.nf_value);
             if (SUCCEEDED(h))
             {
-                s.nf->SetEventOnCompletion(s.nf_value, s.nev);
+                const HRESULT eh = s.nf->SetEventOnCompletion(s.nf_value, s.nev);   // HARDEN1
                 // DEFECT E. THE ONLY BLOCKING CALL IN THIS FUNCTION, AND IT
                 // RUNS WITH THE MUTEX RELEASED. What the game thread does while
                 // we are here is exactly what it should be free to do: record
@@ -19006,17 +19854,72 @@ void stream_poll()
                 // overrun condition and the check at the top of the next
                 // iteration names it. Being lapped is a fact about our speed;
                 // blocking the game to avoid it never was.
-                lk.unlock();
-                const DWORD wr = WaitForSingleObject(s.nev, 5000);
-                lk.lock();
+                DWORD wr;
+                if (FAILED(eh))
+                {
+                    // HARDEN1: no event to wait on, so no late-latch this frame
+                    // either - poll the fence to the real completion.
+                    fence_event_failed_once(eh);
+                    lk.unlock();
+                    wr = fence_poll_wait(s.nf, s.nf_value, 5000);
+                    lk.lock();
+                }
+                else if (s.ll_on != 0u && s.copy_queue && use_cq && run_nr)
+                {
+                    // OPT2: same wait, with the next frame's copy latched
+                    // into the other tex_in half shortly before it clears.
+                    wr = ll_wait_and_latch(s, lk, f);
+                }
+                else
+                {
+                    lk.unlock();
+                    wr = WaitForSingleObject(s.nev, 5000);
+                    lk.lock();
+                }
                 if (wr != WAIT_OBJECT_0) h = E_FAIL;
             }
         }
-        if (FAILED(h)) { s.consumed = f; continue; }
+        if (FAILED(h)) { ++s.nr_lost; s.consumed = f; continue; }   // OPT3: was uncounted
 
         // D1: one checker, two callers. See seal_consume.
         seal_consume(s, f, slot, run_nr, use_cq, ii);
         s.consumed = f;
+    }
+
+    // OPT5 timing: one sample per newly consumed frame (the newest only - a
+    // poll that consumed several samples the last, which is enough for a mean).
+    if (s.consumed > s.g0_sampled)
+    {
+        g0_ts_sample(s, s.consumed);
+        s.g0_sampled = s.consumed;
+    }
+
+    // ---- OPT: periodic accounting. Frames=0 runs never print a summary, so
+    // the counters that judge OPT1/OPT2 are printed every 1200 frames too.
+    if (s.consumed >= s.ll_report_at && s.consumed > 0)
+    {
+        s.ll_report_at = s.consumed + 1200ull;
+        g0_ts_window(s);
+        {
+            const unsigned long long di = s.ll_issued - s.ll_win_issued_at;
+            const unsigned long long dh = s.ll_hits   - s.ll_win_hits_at;
+            if (di >= 50ull) s.ll_recent_pct = (float)(100.0 * (double)dh / (double)di);
+            s.ll_win_issued_at = s.ll_issued;
+            s.ll_win_hits_at   = s.ll_hits;
+        }
+        snprintf(line, sizeof line,
+                 "[MGPU][OPT] f=%llu | speculative f+1 copies suppressed: %llu | LateLatch=%u "
+                 "age<=%u: latched=%llu used=%llu too-old=%llu latched-after-NR=%llu | last "
+                 "list %.2f ms, last copy %.2f ms | lost to failed submit/wait: %llu | MVec "
+                 "flag disagreements (diagnostic, seal vs live flag): %llu | GPU0 (render "
+                 "card) StageCopy=%u: in-frame copies %.2f ms + MVec copy %.2f ms on the game's "
+                 "queue, staging DMA %.2f ms off it (-1 = not measured), staged slots %llu, "
+                 "staging failures %llu",
+                 s.consumed, s.cq_spec_suppressed, s.ll_on, s.ll_age, s.ll_issued, s.ll_hits,
+                 s.ll_stale, s.ll_early, s.ll_list_ms, s.ll_copy_ms, s.nr_lost,
+                 s.mvec_flag_disagree, s.stage_on, s.g0_in_ms, s.g0_mv_ms, s.g0_dma_ms,
+                 s.stage_submits, s.stage_fail);
+        mgpu::diag::info(line);
     }
 
     // ---- summary, once, after the producer has stopped and drained ----
@@ -19481,7 +20384,7 @@ void stream_poll()
                     s.cq_spec);
                 mgpu::diag::info(line);
             }
-            else if (s.cq_gated)
+            else if (s.cq_gated && s.cq_spec_suppressed == 0 && s.ll_on == 0u)
                 mgpu::diag::warn(
                     "[MGPU][R28] CopyQueue=2 RAN BUT THE GATE NEVER FIRED: cq_spec is 0, so no "
                     "copy was ever armed for a frame that had not already arrived. That should "
@@ -19506,6 +20409,19 @@ void stream_poll()
                     "still being evaluated, so their unpack ran on the DMA engine inside the 3D "
                     "engine's shadow. The win applies to THOSE FRAMES ONLY, so this run is not "
                     "the paced case and must not be compared as though it were.");
+
+            // OPT1 / OPT2 / OPT3 accounting.
+            snprintf(line, sizeof line,
+                     "[MGPU][OPT] speculative f+1 copies suppressed (producer already ahead): %llu | "
+                     "LateLatch=%u age<=%u: latched=%llu used=%llu too-old=%llu "
+                     "latched-after-NR-finished=%llu | last list est %.2f ms, last copy %.2f ms | "
+                     "frames lost to a failed submit or wait: %llu. HOW TO READ IT: used/latched "
+                     "near 1 means the unpack left the critical path; too-old high means raise "
+                     "LateLatchAge or the estimate is early; latched-after-NR-finished high means "
+                     "the estimate is late and the copy still runs mostly in series.",
+                     s.cq_spec_suppressed, s.ll_on, s.ll_age, s.ll_issued, s.ll_hits, s.ll_stale,
+                     s.ll_early, s.ll_list_ms, s.ll_copy_ms, s.nr_lost);
+            mgpu::diag::info(line);
         }
 
         // R28. Everything the device complained about across the whole run,

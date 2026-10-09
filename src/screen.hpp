@@ -213,7 +213,8 @@ enum state
 void draw_fps_hud(ID3D12GraphicsCommandList *cl,
                   D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                   unsigned width, unsigned height, int mode,
-                  double input_fps, double nr_fps, double present_fps);
+                  double input_fps, double consumed_fps, double nr_eval_fps,
+                  double nr_skip_fps, double present_fps, double nr_gpu_ms);
 
 void draw(ID3D12GraphicsCommandList *cl,
           D3D12_CPU_DESCRIPTOR_HANDLE rtv,

@@ -758,7 +758,15 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         : avail_w;
     // Tall enough that neither column scrolls in the common case, short enough
     // to leave the probe section visible underneath.
-    const float col_h   = 560.0f;
+    //
+    // Fork: the Late-latch and Latency sections made the bridge column taller
+    // than 560 px, which hid its last rows behind a scrollbar. Grow both
+    // columns into whatever height the overlay window has, keeping 240 px for
+    // the probe section below and 560 px as the floor. Stacked mode keeps the
+    // fixed height, since two columns' worth of height would not fit there.
+    const float avail_h = ImGui::GetContentRegionAvail().y;
+    const float col_h   = (two_col && avail_h - 240.0f > 560.0f) ? (avail_h - 240.0f)
+                                                                 : 560.0f;
 
     ImGui::BeginChild("mgpu_box_bridge", ImVec2(col_w, col_h), true);
     ImGui::SeparatorText("MGPU BRIDGE  -  neural rendering");
@@ -830,6 +838,149 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         mgpu::gpu1::ui_set_neural(neural);
     ImGui::SameLine();
     ImGui::TextDisabled(st.nr_ok ? "(running)" : "(transport only)");
+
+    // ---- OPT2: late-latch, live. Applied immediately AND written to mgpu.ini
+    // so the next launch starts the same way. Before arm, the arm reads the
+    // file the panel just wrote, so the two cannot disagree.
+    {
+        ImGui::SeparatorText("Late-latch");
+        const bool cq_ini = mgpu::gpu1::ui_ini_read("CopyQueue", 0) != 0;
+        const bool usable = st.armed ? st.ll_ready : cq_ini;
+        ImGui::BeginDisabled(!usable);
+        // Before arm the stream has not read the file yet: show the file.
+        const bool ll_now = st.armed ? st.ll_on
+                                     : (mgpu::gpu1::ui_ini_read("LateLatch", 0) != 0);
+        bool ll = ll_now;
+        if (ImGui::Checkbox("late-latch prefetch", &ll))
+        {
+            mgpu::gpu1::ui_set_late_latch(ll);
+            (void)mgpu::gpu1::ui_ini_write("LateLatch", ll ? 1 : 0);
+        }
+        ImGui::BeginDisabled(!ll_now);
+        static int age = -1;
+        if (age < 0 || (st.armed && !ImGui::IsAnyItemActive()))
+            age = st.armed ? (int)st.ll_age : mgpu::gpu1::ui_ini_read("LateLatchAge", 2);
+        ImGui::SliderInt("max age (frames)", &age, 0, 4, "%d", ImGuiSliderFlags_AlwaysClamp);
+        if (ImGui::IsItemDeactivatedAfterEdit())
+        {
+            mgpu::gpu1::ui_set_late_latch_age((unsigned)age);
+            (void)mgpu::gpu1::ui_ini_write("LateLatchAge", age);
+        }
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+        if (!usable)
+            ImGui::TextDisabled("Needs CopyQueue=1 or 2 in mgpu.ini (restart to apply).");
+        else if (st.ll_on && st.ll_issued > 0)
+        {
+            char llt[200];
+            if (st.ll_recent_pct >= 0.0f)
+                snprintf(llt, sizeof llt, "used %.1f%% recently  |  %.1f%% of %llu since arm",
+                         (double)st.ll_recent_pct,
+                         100.0 * (double)st.ll_hits / (double)st.ll_issued, st.ll_issued);
+            else
+                snprintf(llt, sizeof llt, "used %.1f%% of %llu latched  |  too old %llu",
+                         100.0 * (double)st.ll_hits / (double)st.ll_issued,
+                         st.ll_issued, st.ll_stale);
+            ImGui::TextDisabled("%s", llt);
+        }
+        else
+            ImGui::TextDisabled("More neural fps; up to 'max age' frames of extra lag. 2 recommended.");
+    }
+
+    // ---- Fork: latency and display. Everything here is written to mgpu.ini.
+    // Vsync is also live; the rest are read at launch or arm, so the panel
+    // compares against what this session started with and says RESTART.
+    //
+    // Reflex is safe to offer now. The upstream objection (the driver mode
+    // outlives a crash and unticking could not undo it) was answered by V43:
+    // reflex::clear_residue runs at every launch whenever ReflexApplied=1 is
+    // left behind, whatever Reflex is set to.
+    {
+        static bool loaded = false;
+        static int rfx = 0, rfx_sleep = 0, cq = 0, rw = 0, dco = -2, stg = 0;
+        static int rfx0 = 0, rfx_sleep0 = 0, cq0 = 0, rw0 = 0, dco0 = -2, stg0 = 0;
+        if (!loaded)
+        {
+            loaded = true;
+            rfx       = mgpu::gpu1::ui_ini_read("Reflex", 0);
+            rfx_sleep = mgpu::gpu1::ui_ini_read("ReflexSleep", 0);
+            cq        = mgpu::gpu1::ui_ini_read("CopyQueue", 0);
+            rw        = mgpu::gpu1::ui_ini_read("RingWindow", 0);
+            dco       = mgpu::gpu1::ui_ini_read_dcomp();
+            stg       = mgpu::gpu1::ui_ini_read("StageCopy", 0);
+            rfx0 = rfx; rfx_sleep0 = rfx_sleep; cq0 = cq; rw0 = rw; dco0 = dco; stg0 = stg;
+        }
+
+        ImGui::SeparatorText("Latency and display");
+
+        // Reflex on the render GPU (GPU 0).
+        ImGui::TextUnformatted("Reflex");
+        ImGui::SameLine();
+        int r = rfx;
+        if (ImGui::RadioButton("off##rfx", &r, 0) && mgpu::gpu1::ui_ini_write("Reflex", 0)) rfx = 0;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("on##rfx", &r, 1) && mgpu::gpu1::ui_ini_write("Reflex", 1)) rfx = 1;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("on + boost##rfx", &r, 2) && mgpu::gpu1::ui_ini_write("Reflex", 2)) rfx = 2;
+        ImGui::BeginDisabled(rfx == 0);
+        bool sl = (rfx_sleep != 0);
+        if (ImGui::Checkbox("Reflex sleep (shortens the render queue)", &sl) &&
+            mgpu::gpu1::ui_ini_write("ReflexSleep", sl ? 1 : 0))
+            rfx_sleep = sl ? 1 : 0;
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("If the game has its own Reflex option, use one or the other.");
+
+        // Bridge present vsync: live.
+        bool vs = mgpu::gpu1::ui_present_vsync();
+        if (ImGui::Checkbox("bridge vsync", &vs))
+        {
+            mgpu::gpu1::ui_set_present_vsync(vs);
+            (void)mgpu::gpu1::ui_ini_write("PresentVsync", vs ? 1 : 0);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled(vs ? "(live)" : "(live - expect tearing)");
+
+        // Copy queue.
+        ImGui::TextUnformatted("copy queue");
+        ImGui::SameLine();
+        int c = cq;
+        if (ImGui::RadioButton("off##cq", &c, 0) && mgpu::gpu1::ui_ini_write("CopyQueue", 0)) cq = 0;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("split##cq", &c, 1) && mgpu::gpu1::ui_ini_write("CopyQueue", 1)) cq = 1;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("gated##cq", &c, 2) && mgpu::gpu1::ui_ini_write("CopyQueue", 2)) cq = 2;
+        ImGui::SameLine();
+        ImGui::TextDisabled("(gated recommended; late-latch needs split or gated)");
+
+        // OPT5: GPU 0 async staging.
+        bool stb = (stg != 0);
+        if (ImGui::Checkbox("GPU 0 async staging (moves the PCIe copy off the game's queue)", &stb) &&
+            mgpu::gpu1::ui_ini_write("StageCopy", stb ? 1 : 0))
+            stg = stb ? 1 : 0;
+
+        // Ring window.
+        bool rwb = (rw != 0);
+        if (ImGui::Checkbox("ring window (drop stale backlog)", &rwb) &&
+            mgpu::gpu1::ui_ini_write("RingWindow", rwb ? 1 : 0))
+            rw = rwb ? 1 : 0;
+
+        // Composition overlay. This fork accepts On with any number of displays.
+        ImGui::TextUnformatted("overlay mode");
+        ImGui::SameLine();
+        int d = (dco == 1) ? 1 : ((dco == -1) ? 2 : 0);
+        if (ImGui::RadioButton("window##dco", &d, 0) && mgpu::gpu1::ui_ini_write("DcompOverlay", 0)) dco = 0;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("overlay##dco", &d, 1) && mgpu::gpu1::ui_ini_write("DcompOverlay", 1)) dco = 1;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("auto##dco", &d, 2) && mgpu::gpu1::ui_ini_write_text("DcompOverlay", "auto")) dco = -1;
+        ImGui::TextDisabled("overlay: draws on the game's own window and keeps input (CTRL+ALT+F6 hides it).");
+
+        const bool dco_changed = ((dco0 == 1) != (dco == 1)) || ((dco0 == -1) != (dco == -1));
+        if (rfx != rfx0 || rfx_sleep != rfx_sleep0 || cq != cq0 || rw != rw0 || stg != stg0 ||
+            dco_changed)
+            ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
+                               "Restart the game once to apply.");
+    }
 
     // ---- Intensity ----
     ImGui::SeparatorText("Intensity");
