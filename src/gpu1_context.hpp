@@ -462,6 +462,19 @@ void ui_read(ui_state &out);
 // OPT2: late-latch, live from the next frame. Also written to mgpu.ini by the
 // panel so the next launch starts the same way. Age is clamped to 0..4.
 void ui_set_late_latch(bool on);
+// FG1/FG2: frame generation prototype. Mode 0 off, 1 on, 2 motion view.
+// FG2: the bridge thread hands each finished NR frame (and its in-between
+// frame) to a present thread, which paces them; true means handed over and
+// the caller must not present it. `failed` reports a present failure there.
+bool fg_handoff(float r, float g, float b, bool &failed);
+void fg_present_stop();
+double hud_gen_fps();
+int  ui_frame_gen();
+void ui_set_frame_gen(int mode);   // 0 off, 1 ours, 2 motion view, 3 AMD FSR 3
+int  ui_frame_gen_last();          // FSR1: the mode CTRL+ALT+G turns back on
+int  ui_fsr_state();               // FSR1: 0 not tried, 1 up, -1 failed
+bool ui_fg_hudfix();             // FG3
+void ui_set_fg_hudfix(bool on);
 void ui_set_late_latch_age(unsigned age);
 
 // HARDEN2: release the late-latch timer. BRIDGE THREAD ONLY, after its present
@@ -775,6 +788,11 @@ void stream_on_finish_effects(void *cmd_list, void *cmd_queue,
 // Inert unless MVec=3 and the stream is armed, so a colour-only or synthetic
 // run costs one mutex and two loads per frame.
 void stream_mvec_copy(void *cmd_list, unsigned long long mvec_handle);
+
+// HL1. The HUD-less scene texture, copied mid-frame into the slot's 4th
+// region. Same caller contract as stream_mvec_copy: the probe has put the
+// resource in COPY_SOURCE around the call. Inert unless HudLess=1 and armed.
+void stream_hud_copy(void *cmd_list, unsigned long long handle);
 
 // Bridge thread, once per present. Consumes whatever the fence says has
 // arrived, checks each seal, and prints the summary once the producer has

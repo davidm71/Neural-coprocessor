@@ -104,6 +104,8 @@
 #include "gpu1_context.hpp"
 #include "calibrator.hpp"
 #include "probe.hpp"
+#include "hud_probe.hpp"   // HUD1
+#include "sl_tags.hpp"   // SLT3 early_install
 #include "sl_probe.hpp"   // SL1
 #include "worker.hpp"
 
@@ -194,6 +196,12 @@ static void on_init_device(reshade::api::device *device)
 static void mgpu_mvec_transport_hook(void *cmd_list_native, unsigned long long resource)
 {
     mgpu::gpu1::stream_mvec_copy(cmd_list_native, resource);
+}
+
+// HL1: the HUD-less scene texture, same route as the motion vectors.
+static void mgpu_hud_transport_hook(void *cmd_list_native, unsigned long long resource)
+{
+    mgpu::gpu1::stream_hud_copy(cmd_list_native, resource);
 }
 
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
@@ -303,6 +311,8 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             mgpu::probe::set_mvec_hook(&mgpu_mvec_transport_hook);
 
             mgpu::probe::set_mode(mgpu::probe::mode_from_ini());
+            mgpu::hudprobe::set_copy_hook(&mgpu_hud_transport_hook);   // HL1
+            mgpu::hudprobe::start();   // HUD1/HL1: off unless HudProbe=1 or HudLess=1
 
             // ---- R101: THE NGX TAP, INSTALLED ON THE SAME ONE-SHOT ----
             //
@@ -838,6 +848,65 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         mgpu::gpu1::ui_set_neural(neural);
     ImGui::SameLine();
     ImGui::TextDisabled(st.nr_ok ? "(running)" : "(transport only)");
+
+    // ---- FG1: frame generation, its own section so it is easy to find ----
+    {
+        ImGui::SeparatorText("Frame generation (prototype)");
+        const int fgm = mgpu::gpu1::ui_frame_gen();
+        bool fg_on = (fgm != 0);
+        if (ImGui::Checkbox("Frame generation", &fg_on))
+            mgpu::gpu1::ui_set_frame_gen(fg_on ? mgpu::gpu1::ui_frame_gen_last() : 0);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(live - also CTRL+ALT+G in game)");
+        ImGui::BeginDisabled(!fg_on);
+        // FSR1: which generator.
+        int eng = (fgm == 3) ? 1 : 0;
+        ImGui::TextUnformatted("generator");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("mod's own##fge", &eng, 0) && fgm == 3) mgpu::gpu1::ui_set_frame_gen(1);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("AMD FSR 3##fge", &eng, 1) && fgm != 3) mgpu::gpu1::ui_set_frame_gen(3);
+        if (fgm == 3)
+        {
+            const int fs = mgpu::gpu1::ui_fsr_state();
+            if (fs < 0)
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                                   "AMD FSR failed to start - using the mod's own (see ReShade.log [MGPU][FSR]).");
+            else if (fs > 0)
+                ImGui::TextDisabled("AMD FSR 3 running.");
+            else
+                ImGui::TextDisabled("AMD FSR 3 starts on the next frame (needs the AMD DLL in the mgpu folder).");
+        }
+        bool mv = (fgm == 2);
+        ImGui::BeginDisabled(fgm == 3);
+        if (ImGui::Checkbox("motion view (debug: shows the motion vectors instead)", &mv))
+            mgpu::gpu1::ui_set_frame_gen(mv ? 2 : 1);
+        ImGui::EndDisabled();
+        bool hf = mgpu::gpu1::ui_fg_hudfix();
+        if (ImGui::Checkbox("HUD fix (keep on-screen text and menus still)", &hf))
+            mgpu::gpu1::ui_set_fg_hudfix(hf);
+        // HUD1: the HUD-less frame search (HudProbe=1 in mgpu.ini).
+        if (mgpu::hudprobe::enabled())
+        {
+            const int hs = mgpu::hudprobe::state();
+            ImGui::BeginDisabled(hs != 0);
+            if (ImGui::Button("Capture HUD-less candidates (CTRL+ALT+J)"))
+                mgpu::hudprobe::request_capture();
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (hs != 0)
+                ImGui::TextDisabled("working...");
+            else if (mgpu::hudprobe::last_capture_id() != 0)
+                ImGui::TextDisabled("capture %u: %u images in mgpu\\hudprobe",
+                                    mgpu::hudprobe::last_capture_id(),
+                                    mgpu::hudprobe::last_capture_images());
+        }
+        ImGui::EndDisabled();
+        if (fg_on)
+            ImGui::Text("generated: %.1f fps", mgpu::gpu1::hud_gen_fps());
+        ImGui::TextDisabled("One in-between frame per NR frame from the game's motion vectors. "
+                            "Adds about half a frame of latency.");
+    }
 
     // ---- OPT2: late-latch, live. Applied immediately AND written to mgpu.ini
     // so the next launch starts the same way. Before arm, the arm reads the
@@ -2592,6 +2661,7 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
                     rt_is_game = true;
                     mgpu::probe::note_effects(runtime, cmd_list);
                     mgpu::probe::note_frame();
+                    mgpu::hudprobe::note_frame(runtime, cmd_list);   // HUD1
                     // R101. Same tick, same runtime, same reason: the tap's
                     // ns/frame figure has to be against the GAME's frames.
                     mgpu::calibrator::note_frame();
@@ -2927,6 +2997,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         reshade::log::message(reshade::log::level::info,
             "[MGPU][T1] MGPU Bridge add-on registered - stock ReShade, add-on API version "
             MGPU_STR(RESHADE_API_VERSION));
+        // SLT3: must be in place before the engine resolves Streamline, so it
+        // runs here. Does nothing unless mgpu.ini says SLTags=3.
+        mgpu::sltags::early_install(hModule);
         // T2: per-event logging, provisional LUID capture, one-time table
         // enumeration; the selection itself is deferred to the
         // swapchain-derived game LUID.
@@ -3042,6 +3115,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // P9.1 before worker::stop: unregistering our events while the game
         // thread may still raise them is the one ordering that matters here,
         // and DllMain is single-threaded with respect to ReShade's dispatch.
+        mgpu::hudprobe::stop();
         mgpu::probe::shutdown();
         mgpu::worker::stop();
         // R101c: PUT THE IMPORT SLOTS BACK BEFORE THIS DLL GOES AWAY.

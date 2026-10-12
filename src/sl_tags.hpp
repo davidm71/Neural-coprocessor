@@ -76,6 +76,13 @@ namespace mgpu::sltags
     //         recreation looks like from here
     void tick(unsigned long long frames, int mode);
 
+    // SLT3 (SLTags=3). Called once from DllMain after registration. Reads
+    // SLTags from mgpu.ini itself (Win32 only); when it is 3, swaps the game
+    // exe's GetProcAddress import so the engine's runtime lookup of
+    // slSetConstants / slSetTagForFrame returns read-only pass-throughs. Any
+    // other value: touches nothing. Reports through tick().
+    void early_install(void *self_module);
+
     // The authoritative motion-vector resource the game declared, or 0 if the
     // tap never fired or never saw kBufferTypeMotionVectors. Read by whoever
     // wants to override a ranked guess; zero means "no answer", which every

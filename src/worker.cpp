@@ -43,6 +43,7 @@
 #include "diag.hpp"
 #include "gpu1_context.hpp"
 #include "worker.hpp"
+#include "hud_probe.hpp"   // HUD1
 
 // T4 (brief section 00, exception 1): the add-on's own module handle,
 // defined in dllmain.cpp and captured at DLL_PROCESS_ATTACH.
@@ -82,6 +83,8 @@
 #define MGPU_HOTKEY_PEEK       0x4D50   // CTRL+ALT+F6
 // Experimental FPS HUD. H is mnemonic and avoids the existing F6-F11 controls.
 #define MGPU_HOTKEY_FPS_HUD    0x4D51   // CTRL+ALT+H
+#define MGPU_HOTKEY_FRAMEGEN   0x4D52   // CTRL+ALT+G - FG1 frame generation on/off
+#define MGPU_HOTKEY_HUDPROBE   0x4D53   // CTRL+ALT+J - HUD1 HUD-less capture
 
 namespace mgpu { HMODULE module_handle(); }
 
@@ -774,6 +777,23 @@ namespace
                                 if (k_h) mgpu::diag::info(hk);
                                 else     mgpu::diag::warn(hk);
                             }
+                            const bool k_g = RegisterHotKey(nullptr, MGPU_HOTKEY_FRAMEGEN,
+                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G') != FALSE;
+                            if (k_g)
+                                mgpu::diag::info("[MGPU][FG1] frame generation hotkey: CTRL+ALT+G "
+                                                 "= OK. Toggles off/on live and saves FrameGen "
+                                                 "to mgpu.ini.");
+                            else
+                                mgpu::diag::warn("[MGPU][FG1] frame generation hotkey: CTRL+ALT+G "
+                                                 "= FAILED (another program holds it). Use the "
+                                                 "panel instead.");
+                            {
+                                const bool k_j = RegisterHotKey(nullptr, MGPU_HOTKEY_HUDPROBE,
+                                                    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'J') != FALSE;
+                                if (k_j) mgpu::diag::info("[MGPU][HUD1] capture hotkey: CTRL+ALT+J = OK (does nothing unless HudProbe=1).");
+                                else     mgpu::diag::warn("[MGPU][HUD1] capture hotkey: CTRL+ALT+J = FAILED "
+                                                          "(another program holds it). Use the panel button.");
+                            }
                             const bool k_v = RegisterHotKey(nullptr, MGPU_HOTKEY_VIEW,
                                                 MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F7) != FALSE;
                             const bool s_l  = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L,
@@ -977,6 +997,24 @@ namespace
                     // the key is not registered there.
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_FPS_HUD)
                     { (void)mgpu::gpu1::fps_hud_toggle(); continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_HUDPROBE)
+                    {
+                        if (mgpu::hudprobe::enabled())
+                        {
+                            mgpu::hudprobe::request_capture();
+                            mgpu::diag::info("[MGPU][HUD1] CTRL+ALT+J: capture requested");
+                        }
+                        continue;
+                    }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_FRAMEGEN)
+                    {
+                        const int fgm = (mgpu::gpu1::ui_frame_gen() != 0)
+                                            ? 0 : mgpu::gpu1::ui_frame_gen_last();
+                        mgpu::gpu1::ui_set_frame_gen(fgm);
+                        mgpu::diag::info(fgm ? "[MGPU][FG1] CTRL+ALT+G: frame generation ON"
+                                             : "[MGPU][FG1] CTRL+ALT+G: frame generation OFF");
+                        continue;
+                    }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_PEEK)
                     { (void)mgpu::gpu1::dcomp_peek_toggle(); continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_VIEW)
@@ -1190,7 +1228,13 @@ namespace
                 if (!mgpu::gpu1::stream_present_gate(4))
                     continue;
 
-                if (!mgpu::gpu1::present_frame(cr, cg, cb))
+                // FG2: with frame generation on, the present thread shows the
+                // in-between and real frames; this thread goes back to NR.
+                bool fg_failed = false;
+                const bool fg_taken = mgpu::gpu1::fg_handoff(cr, cg, cb, fg_failed);
+                if (fg_failed) break;
+
+                if (!fg_taken && !mgpu::gpu1::present_frame(cr, cg, cb))
                 {
                     // The first failure is already logged with its step,
                     // HRESULT and removal reason (one-shot, in
@@ -1317,6 +1361,8 @@ namespace
             UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_UP);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_VIEW);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_FPS_HUD);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_FRAMEGEN);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_HUDPROBE);
             // V52: only ever registered in ghost mode.
             if (mgpu::gpu1::dcomp_overlay_mode())
                 UnregisterHotKey(nullptr, MGPU_HOTKEY_PEEK);
@@ -1337,6 +1383,7 @@ namespace
         // game exit abandoned the NR handles, the SR handle, both parameter
         // blocks and the driver snippet DLL - and then the line below released
         // the device underneath them. That is the second-launch crash.
+        mgpu::gpu1::fg_present_stop();       // FG2: before anything it presents with goes
         mgpu::gpu1::stream_shutdown();
         mgpu::gpu1::late_latch_shutdown();   // HARDEN2: bridge thread, loop has exited
 

@@ -26,10 +26,14 @@
 #include <cstdio>
 #include <cstdlib>   // atoll, malloc/free - used throughout; made explicit for P5.0
 #include <cstring>
+#include <cmath>     // FSR1: atanf/tanf for the vertical FOV
 #include <cwchar>    // V45: wcsrchr, for splitting our own module path. Pulled in
                      // transitively by windows.h on MSVC, made explicit because a
                      // load path that fails to compile is not a fix.
 #include <mutex>
+#include <thread>   // FG2: the present thread
+#include <condition_variable>
+#include <vector>   // FIX7: the present thread's retire list
 #include <atomic>    // R78: one counter, written from the game's render thread
                      // without this file's mutex - it counts the times that
                      // mutex was NOT taken, so it cannot be guarded by it.
@@ -41,6 +45,12 @@
 #include "mgpu_ini_parser.hpp"
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
+// FSR1: AMD FidelityFX API headers (MIT), for FrameGen=3. Types only - the
+// functions come from AMD's signed DLL, loaded at run time from the mgpu folder.
+#include "ffx/ffx_api.h"
+#include "ffx/ffx_api_types.h"
+#include "ffx/ffx_api_dx12.h"
+#include "ffx/ffx_framegeneration.h"
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
 // Guarded because it is a SUCCESS code and a build where it went missing
@@ -365,6 +375,48 @@ static std::atomic<unsigned long long> g_hud_present_count{0};
 // R5 diagnostic: frames whose FINAL DLSS-NR pass returned Success. Unlike
 // consumed, this does not advance across backlog frames deliberately skipped by P6.4.
 static std::atomic<unsigned long long> g_hud_nr_ok_count{0};
+// FG2: the frame the PRESENT THREAD wants shown, thread-local so the bridge
+// thread's own present_frame calls are never redirected. Set for exactly one
+// present_frame call at a time.
+static thread_local ID3D12Resource *t_fg_src = nullptr;
+static thread_local D3D12_RESOURCE_STATES t_fg_rest = D3D12_RESOURCE_STATE_COMMON;
+// FIX8: what the last present_frame call on THIS thread left on the GPU.
+//   0          nothing submitted (failed before ExecuteCommandLists)
+//   N          submitted and covered by present fence value N
+//   UINT64_MAX submitted but NOT covered by any fence (Signal failed)
+static thread_local unsigned long long t_present_fv = 0;
+static std::atomic<unsigned long long> g_hud_gen_count{0};
+// FG2: present_frame is called from two threads while frame generation runs;
+// one present at a time.
+static std::mutex g_present_mx;
+
+// ---- FIX7 (audit 2026-10-10): who may write an FG buffer set ----
+//
+// The present thread reads fg_real[k] / fg_out[k] on the PRESENT queue; the NR
+// list writes them on the NR queue. Three-set rotation alone does not order
+// the two queues: a Present that blocks can leave set k unread when the NR
+// list comes round to it again. So each set carries
+//   busy  - handed to the present thread and not yet submitted by it, and
+//   fence - the present-queue fence value after its last copy was submitted,
+// and fg_record writes set k only when busy == 0 and that fence has completed.
+// The check never waits: the present thread takes the stream lock that
+// fg_record runs under, so waiting there could deadlock. A set that is not
+// free is skipped for one frame (shown without an in-between frame).
+static std::atomic<unsigned> g_fg_set_busy[3] = {};
+static std::atomic<unsigned long long> g_fg_set_fence[3] = {};
+static std::atomic<ID3D12Fence *> g_fg_pfence{nullptr};   // present fence, AddRef'd
+static std::atomic<unsigned long long> g_fg_set_skips{0};
+static std::atomic<unsigned long long> g_fg_presented{0};
+
+static bool fg_set_writable(unsigned k)
+{
+    if (k >= 3u) return false;
+    if (g_fg_set_busy[k].load(std::memory_order_acquire) != 0u) return false;
+    const unsigned long long v = g_fg_set_fence[k].load(std::memory_order_acquire);
+    if (v == 0ull) return true;
+    ID3D12Fence *f = g_fg_pfence.load(std::memory_order_acquire);
+    return f != nullptr && f->GetCompletedValue() >= v;
+}
 
 int fps_hud_toggle()
 {
@@ -1138,12 +1190,16 @@ void arm_sentinel_set();
 void arm_sentinel_clear();
 void hud_fps_sample(double &game_fps, double &consumed_fps, double &nr_eval_fps,
                     double &nr_skip_fps, double &present_fps, double &nr_gpu_ms);
+double hud_gen_fps();   // FG1, defined beside fg_handoff
+int ui_frame_gen();     // FG1
 // arm_fault_recover is NOT declared here: it takes a stream_state &, a type
 // that is not declared this early. It is defined in the anonymous namespace
 // immediately above stream_nr_create, which is its only caller.
 
 bool present_frame(float r, float g, float b)
 {
+    std::lock_guard<std::mutex> present_lock(g_present_mx);   // FG2
+    t_present_fv = 0;   // FIX8
     auto &S = st();
 
     ID3D12Device *dev = nullptr;
@@ -1569,7 +1625,8 @@ bool present_frame(float r, float g, float b)
                            hud_nr_skip_fps, hud_present_fps, hud_nr_gpu_ms);
             mgpu::screen::draw_fps_hud(cl, rtv, bw, bh, hud_mode,
                                        hud_input_fps, hud_consumed_fps, hud_nr_eval_fps,
-                                       hud_nr_skip_fps, hud_present_fps, hud_nr_gpu_ms);
+                                       hud_nr_skip_fps, hud_present_fps, hud_nr_gpu_ms,
+                                       (ui_frame_gen() != 0) ? hud_gen_fps() : -1.0);   // FG1
         }
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -1692,6 +1749,7 @@ bool present_frame(float r, float g, float b)
 
     ID3D12CommandList *const lists[1] = { cl };
     queue->ExecuteCommandLists(1, lists);
+    t_present_fv = ~0ull;   // FIX8: on the GPU, not yet covered by a fence
 
     // Signal the fence for this frame, present with vsync - Present(1, 0),
     // never Present(0, 0): an uncapped loop would spin GPU 1 at full rate
@@ -1700,6 +1758,19 @@ bool present_frame(float r, float g, float b)
     hr = queue->Signal(fence, fence_value);
     if (FAILED(hr))
         return fail("Signal", static_cast<unsigned>(hr));
+
+    // FIX8: PUBLISH THE VALUE AS SOON AS IT IS SIGNALLED, not after Present.
+    // It used to be published only on full success, so a failed Present left
+    // S.fence_value one behind work that IS on the queue: the next call would
+    // reuse this slot's allocator while its list could still be executing, and
+    // the FG present thread would retire buffers against a value the copy is
+    // not covered by.
+    {
+        std::lock_guard<std::mutex> lk(S.cs);
+        S.fence_value = fence_value;
+        S.slot_value[slot] = fence_value;   // D6: this slot is busy until here
+    }
+    t_present_fv = fence_value;
 
     // ---- L5: THE PRESENT INTERVAL IS A LATENCY DECISION, NOT A STYLE ONE ----
     //
@@ -1778,8 +1849,7 @@ bool present_frame(float r, float g, float b)
     // section 09).
     {
         std::lock_guard<std::mutex> lk(S.cs);
-        S.fence_value = fence_value;
-        S.slot_value[slot] = fence_value;   // D6: this slot is busy until here
+        // FIX8: fence_value / slot_value were published right after Signal.
         // R111. A frame that reached Present clears the consecutive count.
         // The total is left alone: it is the session's history and the thing
         // the occlusion reading is checked against.
@@ -8189,6 +8259,101 @@ namespace
         // frames), so a hitchy startup does not dominate the panel all session.
         unsigned long long ll_win_issued_at = 0, ll_win_hits_at = 0;
         float ll_recent_pct = -1.0f;   // -1 until the first window completes
+
+        // ---- FG1: frame generation prototype (ini FrameGen, FG-test build) ----
+        //
+        // One in-between frame per pair of NR outputs, built on GPU 1 in the
+        // same command list as the evaluate, from: the previous NR output
+        // (fg_prev, our own copy), the current one (nr_final), the game's
+        // motion vectors for the current frame (tex_mvec_r[ii]) scaled by the
+        // game frames elapsed since the previous evaluate, and depth for a
+        // closest-surface pick at edges. The bridge then presents the
+        // generated frame, waits half a frame interval, and presents the real
+        // one. Latency cost: about half a frame.
+        unsigned fg_on = 0;                    // ini FrameGen (live via the panel)
+        unsigned fg_invert = 0;                // ini FGInvertMV: flip the MV sign
+        // FG3: HUD fix. A pixel that is the same in both real frames AT THE
+        // SAME SCREEN POSITION while the motion vector under it says the
+        // world moved is screen-fixed - objective text, menus, crosshair - so
+        // the in-between frame keeps it where it is instead of moving it with
+        // the world behind it. Flat areas (sky, walls) pass the same test and
+        // are unaffected either way, because moving a flat colour changes
+        // nothing.
+        unsigned fg_hudfix = 1;                // ini FGHudFix, default on
+        // FG2: three buffer sets, rotated per NR frame. fg_real[k] is a copy
+        // of NR frame N (NON_PIXEL_SHADER_RESOURCE), fg_out[k] the in-between
+        // frame of N-1 and N (UNORDERED_ACCESS); the previous real frame is
+        // the set before k. The present thread shows at most one set while
+        // one more waits, so the set being rewritten (three frames old) is
+        // never one the present queue can still be reading. (Review 2026-10-10:
+        // two sets left a window when Present blocked on vblank.)
+        static const unsigned FG_SETS = 3;
+        ID3D12Resource *fg_real[FG_SETS] = {};
+        ID3D12Resource *fg_out[FG_SETS] = {};
+        unsigned fg_k = 0;                     // parity of the newest set
+        unsigned fg_ready_k = 0;
+        bool fg_ready_gen = false;             // set fg_ready_k holds a generated frame
+        ID3D12RootSignature *fg_rs = nullptr;
+        ID3D12PipelineState *fg_pso = nullptr;
+        ID3D12DescriptorHeap *fg_heap = nullptr;
+        UINT fg_inc = 0;
+        bool fg_built = false, fg_failed = false, fg_prev_valid = false;
+        unsigned long long fg_ready = 0, fg_shown = 0;   // frame index of the generated frame
+        unsigned long long fg_made = 0, fg_nomv = 0, fg_presented = 0;
+
+        // ---- FSR1: AMD FSR 3 frame generation (FrameGen=3) ----
+        //
+        // AMD's frame generation in "no swapchain" mode: each NR frame, the
+        // NR list records ffxConfigure + Prepare (depth and motion vectors)
+        // + the frame generation dispatch, which writes the in-between frame
+        // of the previous and current real frames into fsr_out. AMD keeps the
+        // previous frame itself. Our compose pass then copies it into
+        // fg_out[k], applying the HUD fix, and the FG2 present thread shows
+        // it exactly as it shows our own generated frames. AMD's replacement
+        // swapchain is NOT used: it needs a window handle, and the composition
+        // swapchain of DcompOverlay=1 has none.
+        ID3D12Resource *fsr_out = nullptr;     // UNORDERED_ACCESS
+        // FG4: the temporal HUD mask, R8_UNORM at output size, ping-ponged.
+        // fg_mask[fg_mask_i] is the newest (read next time), the other is
+        // written. Both rest in UNORDERED_ACCESS; the read side is barriered
+        // to NON_PIXEL_SHADER_RESOURCE around the pass.
+        ID3D12Resource *fg_mask[2] = {};
+        unsigned fg_mask_i = 0;
+        bool fg_mask_valid = false;
+
+        // ---- HL1: the HUD-less frame (HudLess=1) ----
+        //
+        // The game draws the finished scene into its own texture, then the
+        // HUD on top of it in the back buffer. The probe finds that texture
+        // (hud_probe.inl) and copies it into a 4th slot region at hud_off.
+        // On GPU 1 the HUD-less frame goes into tex_in - so NR, SR and frame
+        // generation all work on the scene alone - and the frame WITH the HUD
+        // goes into tex_ui. The HUD is then added back as (tex_ui - tex_in)
+        // onto the real output and onto every generated frame, never warped.
+        // A frame without a HUD-less copy (menus, loading) runs as before.
+        unsigned hud_mode = 0;                 // ini HudLess
+        UINT64 hud_off = 0;                    // region offset in the slot, 0 = none
+        ID3D12Resource *tex_ui[2] = {};        // frame WITH HUD, per tex_in half
+        unsigned char cq_hud_ok[2] = {};
+        ID3D12Resource *fg_hl[FG_SETS] = {};   // HUD-less NR output per FG set
+        bool fg_hl_k[FG_SETS] = {};            // set q holds a HUD-less real frame
+        bool fg_hud_now = false;               // this frame runs HUD-less (HUD fix off)
+        ID3D12RootSignature *ui_rs = nullptr;
+        ID3D12PipelineState *ui_pso = nullptr;
+        ID3D12DescriptorHeap *ui_heap = nullptr;
+        UINT ui_inc = 0;
+        bool ui_built = false, ui_failed = false;
+        unsigned long long hud_eval = 0, hud_plain = 0, hud_report_at = 0;
+        void *fsr_ctx = nullptr;               // ffxContext
+        bool fsr_up = false, fsr_failed = false;
+        unsigned long long fsr_frame_id = 0, fsr_made = 0, fsr_errors = 0;
+        LARGE_INTEGER fsr_last{};
+        float fsr_fov_h = 90.0f;               // ini FSRFov, horizontal degrees
+        float fsr_near = 10.0f;                // ini FSRNear, game units
+        float fsr_far = 100000.0f;             // ini FSRFar, game units
+        float fsr_units_m = 0.01f;             // ini FSRUnitsToMeters (Unreal: cm)
+        unsigned fsr_transfer = 0;             // ini FSRTransfer: 0 sRGB (SDR), 1 PQ (HDR10), 2 scRGB
+        unsigned fg_last_mode = 1;             // what CTRL+ALT+G turns back on
         // R28. The D3D12 info queue has never been drained anywhere in the
         // stream path - transit_drain_info_queue is called only on P1.3 probe
         // failures - so a validation message raised by a STREAM submission has
@@ -8751,6 +8916,12 @@ namespace
         // overwrites the colour, so "tag == f" means exactly "frame f's
         // vectors are in this slot".
         std::atomic<unsigned long long> mvec_slot_frame[RING] = {};
+        // HL1: the same pair for the HUD-less region.
+        std::atomic<unsigned char> hud_slot_valid[RING] = {};
+        std::atomic<unsigned long long> hud_slot_frame[RING] = {};
+        std::atomic<bool> hud_live{false};
+        std::atomic<unsigned long long> hud_copies{0}, hud_rejects{0}, hud_lock_skips{0},
+                                        hud_sealed{0}, hud_missing{0};
 
         std::atomic<unsigned long long> mvec_copies{0}, mvec_missing{0};
         // R118. One-shot: the fallback arms once per armed stream and never
@@ -9161,6 +9332,11 @@ namespace
         // Passes=1 nr_final is tex_out and this is the P5 behaviour exactly.
         if (s.nr_final == nullptr) return nullptr;
         rest = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        if (t_fg_src != nullptr)
+        {
+            rest = t_fg_rest;   // FG2: the present thread's frame
+            return t_fg_src;
+        }
         return s.nr_final;
     }
 
@@ -10131,6 +10307,321 @@ namespace
         if (i == 0) snprintf(out, n, "none");
     }
 
+// ---- FSR1: AMD FSR 3 FRAME GENERATION, LOADED AT RUN TIME ----
+//
+// amd_fidelityfx_framegeneration_dx12.dll exports the FidelityFX API itself
+// (ffxCreateContext and the other four), so no AMD loader DLL is needed. It is
+// looked for in the mgpu folder beside this add-on first, then beside the
+// add-on. Loaded once, never unloaded: the frame generation context lives as
+// long as the stream and the process outlives both.
+static HMODULE        g_ffx_mod = nullptr;
+static bool           g_ffx_tried = false;
+static PfnFfxCreateContext  g_ffx_create = nullptr;
+static PfnFfxDestroyContext g_ffx_destroy = nullptr;
+static PfnFfxConfigure      g_ffx_configure = nullptr;
+static PfnFfxQuery          g_ffx_query = nullptr;
+static PfnFfxDispatch       g_ffx_dispatch = nullptr;
+static std::atomic<int>     g_ffx_msgs{0};
+
+static void ffx_message(uint32_t type, const wchar_t *message)
+{
+    // AMD's own diagnostics, into ReShade.log. Capped: a per-frame warning
+    // must not flood the log.
+    if (message == nullptr || g_ffx_msgs.fetch_add(1) >= 40) return;
+    char nb[700];
+    const int n = WideCharToMultiByte(CP_UTF8, 0, message, -1, nb, (int)sizeof nb - 1,
+                                      nullptr, nullptr);
+    if (n <= 0) return;
+    char line[800];
+    snprintf(line, sizeof line, "[MGPU][FSR] AMD %s: %s",
+             (type == FFX_API_MESSAGE_TYPE_ERROR) ? "ERROR" : "warning", nb);
+    if (type == FFX_API_MESSAGE_TYPE_ERROR) mgpu::diag::error(line);
+    else                                    mgpu::diag::warn(line);
+}
+
+static bool fsr_load_dll(char *where, size_t where_n)
+{
+    if (g_ffx_tried) return g_ffx_create != nullptr;
+    g_ffx_tried = true;
+    wchar_t dir[MAX_PATH * 2] = {};
+    const DWORD n = GetModuleFileNameW(mgpu::module_handle(), dir, MAX_PATH * 2);
+    if (n == 0 || n >= MAX_PATH * 2) return false;
+    wchar_t *slash = wcsrchr(dir, L'\\');
+    if (slash == nullptr) return false;
+    slash[1] = L'\0';
+    const wchar_t *names[2] = { L"mgpu\\amd_fidelityfx_framegeneration_dx12.dll",
+                                L"amd_fidelityfx_framegeneration_dx12.dll" };
+    DWORD load_err = 0;
+    for (int i = 0; i < 2 && g_ffx_mod == nullptr; ++i)
+    {
+        wchar_t full[MAX_PATH * 2] = {};
+        _snwprintf_s(full, MAX_PATH * 2, _TRUNCATE, L"%s%s", dir, names[i]);
+        g_ffx_mod = LoadLibraryExW(full, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (g_ffx_mod == nullptr && i == 0) load_err = GetLastError();
+        if (g_ffx_mod != nullptr)
+            WideCharToMultiByte(CP_UTF8, 0, full, -1, where, (int)where_n, nullptr, nullptr);
+    }
+    if (g_ffx_mod == nullptr)
+    {
+        // Say WHICH failure: absent, or present but refused by the loader
+        // (that is nearly always a missing Visual C++ 2015-2022 x64 runtime).
+        char line[900];
+        wchar_t full[MAX_PATH * 2] = {};
+        _snwprintf_s(full, MAX_PATH * 2, _TRUNCATE, L"%s%s", dir, names[0]);
+        const DWORD attr = GetFileAttributesW(full);
+        const DWORD err = load_err;
+        char nf[600];
+        WideCharToMultiByte(CP_UTF8, 0, full, -1, nf, (int)sizeof nf, nullptr, nullptr);
+        if (attr == INVALID_FILE_ATTRIBUTES)
+            snprintf(line, sizeof line,
+                     "[MGPU][FSR] AMD DLL NOT FOUND at %s (nor beside the add-on). Copy "
+                     "amd_fidelityfx_framegeneration_dx12.dll from the package's redist\\mgpu "
+                     "folder into the game's mgpu folder, next to nvngx_dlssnr.dll.", nf);
+        else
+            snprintf(line, sizeof line,
+                     "[MGPU][FSR] AMD DLL IS PRESENT at %s but Windows refused to load it "
+                     "(error %lu). Error 126 means one of its dependencies is missing: install "
+                     "the Microsoft Visual C++ 2015-2022 Redistributable (x64).", nf, (unsigned long)err);
+        mgpu::diag::error(line);
+        return false;
+    }
+    g_ffx_create    = (PfnFfxCreateContext)(void *)GetProcAddress(g_ffx_mod, "ffxCreateContext");
+    g_ffx_destroy   = (PfnFfxDestroyContext)(void *)GetProcAddress(g_ffx_mod, "ffxDestroyContext");
+    g_ffx_configure = (PfnFfxConfigure)(void *)GetProcAddress(g_ffx_mod, "ffxConfigure");
+    g_ffx_query     = (PfnFfxQuery)(void *)GetProcAddress(g_ffx_mod, "ffxQuery");
+    g_ffx_dispatch  = (PfnFfxDispatch)(void *)GetProcAddress(g_ffx_mod, "ffxDispatch");
+    if (!g_ffx_create || !g_ffx_destroy || !g_ffx_configure || !g_ffx_query || !g_ffx_dispatch)
+    {
+        g_ffx_create = nullptr;
+        return false;
+    }
+    return true;
+}
+
+static void fsr_destroy(stream_state &s)
+{
+    if (s.fsr_ctx != nullptr && g_ffx_destroy != nullptr)
+    {
+        ffxContext c = (ffxContext)s.fsr_ctx;
+        (void)g_ffx_destroy(&c, nullptr);
+    }
+    s.fsr_ctx = nullptr;
+    s.fsr_up = false;
+}
+
+// Creates the frame generation context on GPU 1. Display size = the NR output;
+// render size = the motion vector / depth extent (the game's, at whatever
+// resolution it hands them over). Depth is reverse-Z infinite on Unreal.
+static bool fsr_create(stream_state &s, ID3D12Device *dev, const D3D12_RESOURCE_DESC &out_desc)
+{
+    char where[600] = {};
+    char line[900];
+    if (!fsr_load_dll(where, sizeof where))
+    {
+        mgpu::diag::error("[MGPU][FSR] FrameGen=3 needs AMD's amd_fidelityfx_framegeneration_dx12.dll "
+                          "in the mgpu folder next to the add-on (or next to the add-on). It was not "
+                          "found or did not export the FidelityFX API. Falling back to the mod's own "
+                          "frame generation (FrameGen=1) for this run.");
+        return false;
+    }
+
+    if (s.depth_w != s.mvec_w || s.depth_h != s.mvec_h)
+    {
+        snprintf(line, sizeof line,
+                 "[MGPU][FSR] depth is %ux%u but the motion vectors are %ux%u. AMD frame "
+                 "generation needs both at one size. Falling back to the mod's own frame "
+                 "generation (FrameGen=1) for this run.",
+                 s.depth_w, s.depth_h, s.mvec_w, s.mvec_h);
+        mgpu::diag::error(line);
+        return false;
+    }
+    if (s.mvec_w == 0u || s.mvec_h == 0u || out_desc.Width == 0 || out_desc.Height == 0 ||
+        ffxApiGetSurfaceFormatDX12(out_desc.Format) == FFX_API_SURFACE_FORMAT_UNKNOWN)
+    {
+        mgpu::diag::error("[MGPU][FSR] the NR output format or the vector extent is not one "
+                          "AMD frame generation accepts. Falling back to the mod's own.");
+        return false;
+    }
+
+    ffxCreateBackendDX12Desc be{};
+    be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+    be.device = dev;
+
+    ffxCreateContextDescFrameGenerationVersion ver{};
+    ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
+    ver.version = FFX_FRAMEGENERATION_VERSION;
+
+    ffxCreateContextDescFrameGeneration cd{};
+    cd.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+    cd.flags = 0u;
+    if (s.depth_inverted)
+        cd.flags |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED | FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
+    if (s.fsr_transfer != 0u)
+        cd.flags |= FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE;
+    cd.displaySize.width  = (uint32_t)out_desc.Width;
+    cd.displaySize.height = (uint32_t)out_desc.Height;
+    cd.maxRenderSize.width  = s.mvec_w;
+    cd.maxRenderSize.height = s.mvec_h;
+    if (s.mvec_w == (unsigned)out_desc.Width && s.mvec_h == out_desc.Height)
+        cd.flags |= FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS;
+    cd.backBufferFormat = ffxApiGetSurfaceFormatDX12(out_desc.Format);
+
+    // Chain: create -> backend -> version. Retry without the version block
+    // if this DLL does not know it.
+    cd.header.pNext = &be.header;
+    be.header.pNext = &ver.header;
+    ffxContext ctx = nullptr;
+    ffxReturnCode_t rc = g_ffx_create(&ctx, &cd.header, nullptr);
+    if (rc != FFX_API_RETURN_OK)
+    {
+        be.header.pNext = nullptr;
+        ctx = nullptr;
+        rc = g_ffx_create(&ctx, &cd.header, nullptr);
+    }
+    if (rc != FFX_API_RETURN_OK || ctx == nullptr)
+    {
+        snprintf(line, sizeof line,
+                 "[MGPU][FSR] ffxCreateContext(frame generation) failed, code %u, from %s. "
+                 "Falling back to the mod's own frame generation (FrameGen=1) for this run.",
+                 (unsigned)rc, where);
+        mgpu::diag::error(line);
+        return false;
+    }
+    s.fsr_ctx = ctx;
+
+    ffxConfigureDescGlobalDebug1 dbg{};
+    dbg.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
+    dbg.fpMessage = &ffx_message;
+    dbg.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_ERRORS | FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS;
+    (void)g_ffx_configure(&ctx, &dbg.header);
+
+    ffxQueryGetProviderVersion pv{};
+    pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+    (void)g_ffx_query(&ctx, &pv.header);
+
+    snprintf(line, sizeof line,
+             "[MGPU][FSR] AMD FSR FRAME GENERATION UP: provider \"%s\" from %s | display %llux%u, "
+             "vectors/depth %ux%u%s, depth %s, FOV %.0f deg horizontal, near %.2f far %.0f, "
+             "%.3f m/unit, transfer %s. No AMD swapchain: the mod's present thread paces the frames. AMD's "
+             "licence for the DLL ships beside it as LICENSE-AMD-FSR.txt.",
+             (pv.versionName != nullptr) ? pv.versionName : "unknown", where,
+             (unsigned long long)out_desc.Width, out_desc.Height, s.mvec_w, s.mvec_h,
+             (cd.flags & FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) ? " (display res)" : "",
+             s.depth_inverted ? "reverse-Z infinite" : "standard",
+             s.fsr_fov_h, s.fsr_near, s.fsr_far, s.fsr_units_m,
+             (s.fsr_transfer == 1u) ? "PQ (HDR10)" : (s.fsr_transfer == 2u) ? "scRGB" : "sRGB (SDR)");
+    mgpu::diag::info(line);
+    s.fsr_up = true;
+    return true;
+}
+
+// Records AMD's three steps for NR frame f into `cl`: configure (no swapchain),
+// prepare (depth + motion vectors), dispatch (writes fsr_out). `real` is this
+// frame's copy of the NR output, in NON_PIXEL_SHADER_RESOURCE. Returns false
+// on any failure; after three, FSR is switched off for the run.
+static bool fsr_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
+                       ID3D12Resource *real, float mv_el)
+{
+    char line[600];
+    if (!s.fsr_up)
+    {
+        if (!fsr_create(s, s.ndev_b, real->GetDesc())) { s.fsr_failed = true; return false; }
+    }
+    ffxContext ctx = (ffxContext)s.fsr_ctx;
+
+    LARGE_INTEGER now{}, fq{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&fq);
+    float dt_ms = 16.0f;
+    if (s.fsr_last.QuadPart != 0 && fq.QuadPart != 0)
+        dt_ms = (float)((double)(now.QuadPart - s.fsr_last.QuadPart) * 1000.0 / (double)fq.QuadPart);
+    if (dt_ms < 1.0f || dt_ms > 200.0f) dt_ms = 16.0f;
+    s.fsr_last = now;
+
+    const uint64_t fid = ++s.fsr_frame_id;
+    const D3D12_RESOURCE_DESC rd = real->GetDesc();
+
+    ffxConfigureDescFrameGeneration cfg{};
+    cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    cfg.swapChain = nullptr;
+    cfg.presentCallback = nullptr;
+    cfg.frameGenerationCallback = nullptr;
+    cfg.frameGenerationEnabled = true;
+    cfg.allowAsyncWorkloads = false;
+    cfg.HUDLessColor = FfxApiResource{};
+    cfg.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+    cfg.onlyPresentGenerated = false;
+    cfg.generationRect.left = 0; cfg.generationRect.top = 0;
+    cfg.generationRect.width = (int32_t)rd.Width; cfg.generationRect.height = (int32_t)rd.Height;
+    cfg.frameID = fid;
+    ffxReturnCode_t rc = g_ffx_configure(&ctx, &cfg.header);
+
+    if (rc == FFX_API_RETURN_OK)
+    {
+        // Vertical FOV from the horizontal one and the output aspect.
+        const float aspect = (rd.Height != 0) ? (float)rd.Width / (float)rd.Height : 16.0f / 9.0f;
+        const float hrad = s.fsr_fov_h * 3.14159265f / 180.0f;
+        const float vfov = 2.0f * atanf(tanf(hrad * 0.5f) / aspect);
+        const float sgn = s.fg_invert ? -1.0f : 1.0f;
+
+        ffxDispatchDescFrameGenerationPrepareV2 pr{};
+        pr.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
+        pr.frameID = fid;
+        pr.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+        pr.commandList = cl;
+        pr.renderSize.width = s.mvec_w;
+        pr.renderSize.height = s.mvec_h;
+        pr.jitterOffset.x = 0.0f; pr.jitterOffset.y = 0.0f;   // the game's vectors are unjittered
+        // Same contract as DLSS: pixels, current -> previous. Scaled by the
+        // game frames between this NR frame and the last one, as NR is.
+        pr.motionVectorScale.x = sgn * s.mvec_scale_x * mv_el;
+        pr.motionVectorScale.y = sgn * s.mvec_scale_y * mv_el;
+        pr.frameTimeDelta = dt_ms;
+        pr.reset = false;
+        pr.cameraNear = s.fsr_near;
+        pr.cameraFar = s.fsr_far;
+        pr.cameraFovAngleVertical = vfov;
+        pr.viewSpaceToMetersFactor = s.fsr_units_m;
+        pr.depth = ffxApiGetResourceDX12(s.tex_depth[ii], FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        pr.motionVectors = ffxApiGetResourceDX12(s.tex_mvec_r[ii], FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        rc = g_ffx_dispatch(&ctx, &pr.header);
+    }
+    if (rc == FFX_API_RETURN_OK)
+    {
+        ffxDispatchDescFrameGeneration dg{};
+        dg.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
+        dg.commandList = cl;
+        dg.presentColor = ffxApiGetResourceDX12(real, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        dg.outputs[0] = ffxApiGetResourceDX12(s.fsr_out, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+        dg.numGeneratedFrames = 1;
+        dg.reset = false;
+        dg.backbufferTransferFunction =
+            (s.fsr_transfer == 1u) ? FFX_API_BACKBUFFER_TRANSFER_FUNCTION_PQ
+          : (s.fsr_transfer == 2u) ? FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SCRGB
+                                   : FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+        dg.minMaxLuminance[0] = 0.0f;
+        dg.minMaxLuminance[1] = (s.fsr_transfer != 0u) ? 1000.0f : 1.0f;
+        dg.generationRect.left = 0; dg.generationRect.top = 0;
+        dg.generationRect.width = (int32_t)rd.Width; dg.generationRect.height = (int32_t)rd.Height;
+        dg.frameID = fid;
+        rc = g_ffx_dispatch(&ctx, &dg.header);
+    }
+    if (rc != FFX_API_RETURN_OK)
+    {
+        ++s.fsr_errors;
+        snprintf(line, sizeof line,
+                 "[MGPU][FSR] frame %llu: AMD frame generation call failed, code %u (%llu so far). "
+                 "%s", (unsigned long long)fid, (unsigned)rc, s.fsr_errors,
+                 (s.fsr_errors >= 3) ? "Switching to the mod's own frame generation for this run."
+                                     : "This frame shows no in-between frame.");
+        mgpu::diag::error(line);
+        if (s.fsr_errors >= 3) s.fsr_failed = true;
+        return false;
+    }
+    ++s.fsr_made;
+    return true;
+}
+
 // Teardown. The game's queue has already been drained past `produced` by the
 // HANGFIX wait in stream_release, and the MVec recorder is stopped, so nothing
 // on the game's queue still references gstage. The copy queue is drained here
@@ -10234,6 +10725,27 @@ static void g0_stage_release(stream_state &s)
             }
         }
 
+        // FIX8: the NR queue, before anything its lists read is freed (NGX
+        // features, SR, FG and HUD buffers, AMD's context). Every frame is
+        // normally CPU-waited, so this returns at once; it matters only after
+        // a timed-out per-frame wait, when the last list may still be running.
+        if (s.nq != nullptr && s.nf != nullptr && s.nf->GetCompletedValue() < s.nf_value)
+        {
+            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            DWORD wr = WAIT_FAILED;
+            if (ev != nullptr)
+            {
+                if (SUCCEEDED(s.nf->SetEventOnCompletion(s.nf_value, ev)))
+                    wr = WaitForSingleObject(ev, 5000);
+                CloseHandle(ev);
+            }
+            char fl[260];
+            snprintf(fl, sizeof fl,
+                     "[MGPU][FIX8] release: the NR queue still had work in flight - waited, %s.",
+                     (wr == WAIT_OBJECT_0) ? "it finished" : "it did NOT finish within 5 s");
+            mgpu::diag::warn(fl);
+        }
+
         // The NGX features first: they hold references to the textures.
         // Released in reverse creation order, every one of them - a partial
         // release on a failed create is how a handle leaks past the summary.
@@ -10260,6 +10772,21 @@ static void g0_stage_release(stream_state &s)
         if (s.sr_expose != nullptr) { s.sr_expose->Release(); s.sr_expose = nullptr; }
         s.nr_final = nullptr;   // borrowed; released with tex_out / tex_pong
         if (s.nr_read != nullptr) { s.nr_read->Release(); s.nr_read = nullptr; }
+        // FG1
+        for (unsigned q = 0; q < stream_state::FG_SETS; ++q)
+        {
+            if (s.fg_real[q] != nullptr) { s.fg_real[q]->Release(); s.fg_real[q] = nullptr; }
+            if (s.fg_out[q]  != nullptr) { s.fg_out[q]->Release();  s.fg_out[q]  = nullptr; }
+        }
+        fsr_destroy(s);   // FSR1: the AMD context goes before the resources it saw
+        if (s.fsr_out != nullptr) { s.fsr_out->Release(); s.fsr_out = nullptr; }
+        for (unsigned q = 0; q < 2u; ++q)
+            if (s.fg_mask[q] != nullptr) { s.fg_mask[q]->Release(); s.fg_mask[q] = nullptr; }
+        s.fg_mask_valid = false;
+        if (s.fg_pso  != nullptr) { s.fg_pso->Release();  s.fg_pso  = nullptr; }
+        if (s.fg_rs   != nullptr) { s.fg_rs->Release();   s.fg_rs   = nullptr; }
+        if (s.fg_heap != nullptr) { s.fg_heap->Release(); s.fg_heap = nullptr; }
+        s.fg_built = false; s.fg_prev_valid = false;
         // P8.0, before the textures it describes.
         if (s.mvec_up != nullptr && s.mvec_cpu != nullptr) { s.mvec_up->Unmap(0, nullptr); }
         s.mvec_cpu = nullptr;
@@ -10279,6 +10806,17 @@ static void g0_stage_release(stream_state &s)
         s.tex_in_show = nullptr;   // borrowed; released with the pair below
         for (int ti = 1; ti >= 0; --ti)
             if (s.tex_in[ti] != nullptr) { s.tex_in[ti]->Release(); s.tex_in[ti] = nullptr; }
+        for (unsigned ui = 0; ui < 2u; ++ui)   // HL1
+            if (s.tex_ui[ui] != nullptr) { s.tex_ui[ui]->Release(); s.tex_ui[ui] = nullptr; }
+        for (unsigned q = 0; q < stream_state::FG_SETS; ++q)
+        {
+            if (s.fg_hl[q] != nullptr) { s.fg_hl[q]->Release(); s.fg_hl[q] = nullptr; }
+            s.fg_hl_k[q] = false;
+        }
+        if (s.ui_pso  != nullptr) { s.ui_pso->Release();  s.ui_pso  = nullptr; }
+        if (s.ui_rs   != nullptr) { s.ui_rs->Release();   s.ui_rs   = nullptr; }
+        if (s.ui_heap != nullptr) { s.ui_heap->Release(); s.ui_heap = nullptr; }
+        s.ui_built = false; s.ui_failed = false;
         // nr_params is NOT destroyed: it is the core's capability block and the
         // NGX session is deliberately kept open for the process lifetime.
         if (s.gup != nullptr && s.gup_cpu != nullptr) { s.gup->Unmap(0, nullptr); }
@@ -10359,6 +10897,7 @@ static void g0_stage_release(stream_state &s)
         {
             std::lock_guard<std::mutex> mlk(s.mvec_cs);
             s.mvec_live.store(false, std::memory_order_release);
+            s.hud_live.store(false, std::memory_order_release);   // HL1
         }
         g0_stage_release(s);   // OPT5: drains the GPU 0 copy queue that writes gxfer
         if (s.gxfer != nullptr) { s.gxfer->Release(); s.gxfer = nullptr; }
@@ -10608,6 +11147,684 @@ namespace
     }
 
     // Per parity: SRV(colour full) SRV(depth full) UAV(colour small) UAV(depth small)
+    // ---- FG1: the interpolation shader ----
+    //
+    // Motion vectors follow the DLSS convention this add-on already hands
+    // NR: a vector points from a pixel's position in the CURRENT frame to its
+    // position in the PREVIOUS one, in MV-texture pixels once scaled. Scaled
+    // here by the game frames elapsed between the two NR outputs, so it spans
+    // the whole gap. For an output pixel x at time t (0 = previous, 1 =
+    // current) the current frame is sampled at x - (1-t)v and the previous at
+    // x + t v, with v read at x - the usual backward-warp approximation.
+    //
+    // At edges the vector at x may belong to either surface. A 3x3 closest-
+    // depth pick takes the foreground's vector, which is the standard way to
+    // keep moving silhouettes from tearing. Where the two samples disagree
+    // strongly (a surface uncovered in one frame but not the other) the
+    // current frame wins, because it is the newer truth.
+    static const char *kFgHLSL =
+        "Texture2D<float4> gPrev : register(t0);\n"
+        "Texture2D<float4> gCurr : register(t1);\n"
+        "Texture2D<float2> gMV   : register(t2);\n"
+        "Texture2D<float>  gDep  : register(t3);\n"
+        "Texture2D<float4> gGen  : register(t4);\n"
+        "Texture2D<float>  gMask : register(t5);\n"
+        "RWTexture2D<float4> oOut : register(u0);\n"
+        "RWTexture2D<float>  oMask : register(u1);\n"
+        "SamplerState gLin : register(s0);\n"
+        "cbuffer C : register(b0) { uint2 gOut; uint2 gMVsz; uint2 gDsz; float2 gScale;\n"
+        "                           float gT; uint gFlags; };\n"
+        "[numthreads(8,8,1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID)\n"
+        "{\n"
+        "  if (id.x >= gOut.x || id.y >= gOut.y) return;\n"
+        "  float2 uv = (float2(id.xy) + 0.5f) / float2(gOut);\n"
+        "  int2 mp = clamp(int2(uv * float2(gMVsz)), int2(0,0), int2(gMVsz) - 1);\n"
+        "  int2 best = mp;\n"
+        "  if ((gFlags & 1u) != 0u) {\n"
+        "    float2 dscale = float2(gDsz) / float2(gMVsz);\n"
+        "    float bd = ((gFlags & 2u) != 0u) ? -1.0f : 2.0f;\n"
+        "    [unroll] for (int j = -1; j <= 1; ++j)\n"
+        "    [unroll] for (int i = -1; i <= 1; ++i) {\n"
+        "      int2 q = clamp(mp + int2(i, j), int2(0,0), int2(gMVsz) - 1);\n"
+        "      int2 dq = clamp(int2((float2(q) + 0.5f) * dscale), int2(0,0), int2(gDsz) - 1);\n"
+        "      float d = gDep.Load(int3(dq, 0));\n"
+        "      bool closer = ((gFlags & 2u) != 0u) ? (d > bd) : (d < bd);\n"
+        "      if (closer) { bd = d; best = q; }\n"
+        "    }\n"
+        "  }\n"
+        "  float2 v = gMV.Load(int3(best, 0)) * gScale / float2(gMVsz);\n"
+        "  float4 o;\n"
+        "  if ((gFlags & 16u) != 0u) {\n"
+        "    o = gGen.Load(int3(id.xy, 0));\n"
+        "  } else {\n"
+        "  float2 uc = uv - (1.0f - gT) * v;\n"
+        "  float2 up = uv + gT * v;\n"
+        "  bool cOut = any(uc < 0.0f) || any(uc > 1.0f);\n"
+        "  bool pOut = any(up < 0.0f) || any(up > 1.0f);\n"
+        "  float4 cc = gCurr.SampleLevel(gLin, saturate(uc), 0);\n"
+        "  float4 pc = gPrev.SampleLevel(gLin, saturate(up), 0);\n"
+        "  if (cOut && !pOut) o = pc;\n"
+        "  else if (pOut && !cOut) o = cc;\n"
+        "  else {\n"
+        "    float diff = dot(abs(cc.rgb - pc.rgb), float3(0.3333f, 0.3333f, 0.3333f));\n"
+        "    float w = saturate((diff - 0.08f) * 6.0f);\n"
+        "    o = lerp(lerp(pc, cc, gT), cc, w);\n"
+        "  }\n"
+        "  }\n"
+        "  if ((gFlags & 8u) != 0u) {\n"
+        "    // FG4: a HUD mask with memory. Per real frame, a pixel that stays\n"
+        "    // the same at the same screen position while the world under it\n"
+        "    // moves is evidence of HUD; one that changes is evidence against.\n"
+        "    // The mask follows that evidence slowly, so a single ambiguous\n"
+        "    // frame cannot flip it, and it is spread by one pixel for edges.\n"
+        "    float4 c0 = gCurr.SampleLevel(gLin, uv, 0);\n"
+        "    float4 p0 = gPrev.SampleLevel(gLin, uv, 0);\n"
+        "    float st = dot(abs(c0.rgb - p0.rgb), float3(0.3333f, 0.3333f, 0.3333f));\n"
+        "    float mpx = length(v * float2(gOut));\n"
+        "    bool fresh = (gFlags & 32u) != 0u;\n"
+        "    float m = fresh ? 0.0f : gMask.Load(int3(id.xy, 0));\n"
+        "    if (mpx > 0.75f) {\n"
+        "      float ev = saturate((0.05f - st) / 0.03f);\n"
+        "      m = lerp(m, ev, 0.35f);\n"
+        "    }\n"
+        "    oMask[id.xy] = m;\n"
+        "    float md = m;\n"
+        "    if (!fresh) {\n"
+        "      [unroll] for (int j = -1; j <= 1; ++j)\n"
+        "      [unroll] for (int i = -1; i <= 1; ++i) {\n"
+        "        int2 q = clamp(int2(id.xy) + int2(i, j), int2(0,0), int2(gOut) - 1);\n"
+        "        md = max(md, gMask.Load(int3(q, 0)));\n"
+        "      }\n"
+        "    }\n"
+        "    float ws = saturate((md - 0.45f) / 0.15f);\n"
+        "    o = lerp(o, c0, ws);\n"
+        "  }\n"
+        "  if ((gFlags & 4u) != 0u) o = float4(saturate(abs(v.x) * 40.0f), saturate(abs(v.y) * 40.0f), 0.0f, 1.0f);\n"
+        "  oOut[id.xy] = o;\n"
+        "}\n";
+
+    static bool fg_build(stream_state &s, ID3D12Device *ndev, ID3D12Resource *like)
+    {
+        char line[700];
+        if (ndev == nullptr || like == nullptr) return false;
+
+        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        pfn_d3dcompile p_compile = (dc != nullptr)
+            ? (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile") : nullptr;
+        if (p_compile == nullptr)
+        {
+            mgpu::diag::error("[MGPU][FG1] d3dcompiler_47.dll / D3DCompile unavailable - frame "
+                              "generation is off for this run.");
+            return false;
+        }
+        ID3DBlob *cs = nullptr, *err = nullptr;
+        HRESULT hr = p_compile(kFgHLSL, strlen(kFgHLSL), "fg", nullptr, nullptr,
+                               "main", "cs_5_1", 0, 0, &cs, &err);
+        if (FAILED(hr) || cs == nullptr)
+        {
+            snprintf(line, sizeof line, "[MGPU][FG1] shader failed to compile: 0x%08X %s",
+                     (unsigned)hr, (err != nullptr) ? (const char *)err->GetBufferPointer() : "");
+            mgpu::diag::error(line);
+            if (err != nullptr) err->Release();
+            return false;
+        }
+        if (err != nullptr) { err->Release(); err = nullptr; }
+
+        D3D12_DESCRIPTOR_RANGE rng[2] = {};
+        rng[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        rng[0].NumDescriptors = 6; rng[0].BaseShaderRegister = 0;   // t4 FSR output, t5 HUD mask in
+        rng[0].OffsetInDescriptorsFromTableStart = 0;
+        rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        rng[1].NumDescriptors = 2; rng[1].BaseShaderRegister = 0;   // u0 out, u1 HUD mask out
+        rng[1].OffsetInDescriptorsFromTableStart = 6;
+        D3D12_ROOT_PARAMETER rp[2] = {};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[0].DescriptorTable.NumDescriptorRanges = 2;
+        rp[0].DescriptorTable.pDescriptorRanges = rng;
+        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[1].Constants.ShaderRegister = 0;
+        rp[1].Constants.Num32BitValues = 10;
+        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC ss{};
+        ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        ss.MaxLOD = D3D12_FLOAT32_MAX;
+        ss.ShaderRegister = 0;
+        ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2; rsd.pParameters = rp;
+        rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &ss;
+        ID3DBlob *sig = nullptr;
+        hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+        if (FAILED(hr))
+        {
+            if (err != nullptr) err->Release();
+            cs->Release();
+            mgpu::diag::error("[MGPU][FG1] root signature failed - frame generation is off.");
+            return false;
+        }
+        hr = ndev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                       IID_PPV_ARGS(&s.fg_rs));
+        sig->Release();
+        if (SUCCEEDED(hr))
+        {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+            pd.pRootSignature = s.fg_rs;
+            pd.CS.pShaderBytecode = cs->GetBufferPointer();
+            pd.CS.BytecodeLength  = cs->GetBufferSize();
+            hr = ndev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&s.fg_pso));
+        }
+        cs->Release();
+        if (SUCCEEDED(hr))
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC hd{};
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            hd.NumDescriptors = 8;
+            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            hr = ndev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.fg_heap));
+            s.fg_inc = ndev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        // fg_prev and fg_out: the NR output's own size and format, so the copy
+        // into fg_prev is a CopyResource and fg_out can be presented exactly
+        // the way nr_final is.
+        D3D12_RESOURCE_DESC rd = like->GetDesc();
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        for (unsigned q = 0; q < stream_state::FG_SETS && SUCCEEDED(hr); ++q)
+        {
+            rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+            hr = ndev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                               nullptr, IID_PPV_ARGS(&s.fg_real[q]));
+            if (FAILED(hr)) break;
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            hr = ndev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                               nullptr, IID_PPV_ARGS(&s.fg_out[q]));
+        }
+        if (SUCCEEDED(hr))   // FSR1: AMD writes its in-between frame here
+        {
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            hr = ndev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                               nullptr, IID_PPV_ARGS(&s.fsr_out));
+        }
+        for (unsigned q = 0; q < stream_state::FG_SETS && SUCCEEDED(hr); ++q)
+        {   // HL1 + FIX7: the NR-queue-private history of each real frame (HUD-less
+            // when HL1 runs). A failure only turns HL1 off and falls back to
+            // reading the previous frame from fg_real; FG itself carries on.
+            rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+            if (FAILED(ndev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                    nullptr, IID_PPV_ARGS(&s.fg_hl[q]))))
+            {
+                for (unsigned r = 0; r < stream_state::FG_SETS; ++r)
+                    if (s.fg_hl[r] != nullptr) { s.fg_hl[r]->Release(); s.fg_hl[r] = nullptr; }
+                break;
+            }
+            s.fg_hl_k[q] = false;
+        }
+        for (unsigned q = 0; q < 2u && SUCCEEDED(hr); ++q)   // FG4: HUD masks
+        {
+            D3D12_RESOURCE_DESC md = rd;
+            md.Format = DXGI_FORMAT_R8_UNORM;
+            md.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            hr = ndev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &md,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                               nullptr, IID_PPV_ARGS(&s.fg_mask[q]));
+        }
+        s.fg_mask_valid = false; s.fg_mask_i = 0;
+        if (FAILED(hr))
+        {
+            snprintf(line, sizeof line, "[MGPU][FG1] resource setup failed 0x%08X - frame "
+                     "generation is off for this run.", (unsigned)hr);
+            mgpu::diag::error(line);
+            return false;
+        }
+        snprintf(line, sizeof line,
+                 "[MGPU][FG1] FRAME GENERATION PROTOTYPE UP: %llux%u fmt=%d, motion vectors "
+                 "%ux%u, depth %ux%u, MV sign %s. One generated frame per NR frame, shown by a "
+                 "separate present thread half an interval before the real one, so the NR loop "
+                 "never waits for it (FG2). HUD: GENERATED line (CTRL+ALT+H).",
+                 (unsigned long long)rd.Width, rd.Height, (int)rd.Format, s.mvec_w, s.mvec_h,
+                 s.depth_w, s.depth_h, s.fg_invert ? "INVERTED (FGInvertMV=1)" : "as NR");
+        mgpu::diag::info(line);
+        return true;
+    }
+
+    // ---- HL1: put the HUD back ----
+    //
+    // dst += (frame WITH HUD) - (HUD-less frame), both as they came from the
+    // game. Outside the HUD the two are bit-identical, so the difference is
+    // exactly zero there and those pixels are not even written. Where the HUD
+    // is opaque this restores it exactly; where it is see-through it carries
+    // the HUD's contribution, laid over whatever NR or frame generation made
+    // of the scene behind it. Never warped.
+    static const char *kUiHLSL =
+        "Texture2D<float4> hl : register(t0);\n"
+        "Texture2D<float4> full : register(t1);\n"
+        "RWTexture2D<float4> dst : register(u0);\n"
+        "cbuffer C : register(b0) { uint w; uint h; };\n"
+        "[numthreads(8, 8, 1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID)\n"
+        "{\n"
+        "    if (id.x >= w || id.y >= h) return;\n"
+        "    float3 d = full[id.xy].rgb - hl[id.xy].rgb;\n"
+        "    if (all(abs(d) < 0.25 / 1023.0)) return;\n"
+        "    float4 o = dst[id.xy];\n"
+        "    o.rgb = saturate(o.rgb + d);\n"
+        "    dst[id.xy] = o;\n"
+        "}\n";
+
+    static bool ui_build(stream_state &s)
+    {
+        if (s.ui_built) return true;
+        if (s.ui_failed) return false;
+        char line[500];
+        ID3D12Device *dev = s.ndev_b;
+        if (dev == nullptr || s.nr_final == nullptr) return false;   // not yet - try again later
+        s.ui_failed = true;   // until proven otherwise
+
+        // The pass READS the destination through its UAV. That needs typed
+        // UAV loads for the output format, which every recent NVIDIA card has
+        // for RGB10A2 - but it is asked, not assumed.
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{};
+        fs.Format = s.nr_final->GetDesc().Format;
+        if (FAILED(dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) ||
+            (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) == 0)
+        {
+            snprintf(line, sizeof line, "[MGPU][HL1] the neural card cannot read format %d through a "
+                     "UAV - HUD-less mode is off for this run.", (int)fs.Format);
+            mgpu::diag::warn(line);
+            return false;
+        }
+        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        pfn_d3dcompile p_compile = (dc != nullptr)
+            ? (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile") : nullptr;
+        if (p_compile == nullptr) { mgpu::diag::warn("[MGPU][HL1] no D3DCompile - HUD-less mode off."); return false; }
+        ID3DBlob *cs = nullptr, *err = nullptr;
+        HRESULT hr = p_compile(kUiHLSL, strlen(kUiHLSL), "ui", nullptr, nullptr,
+                               "main", "cs_5_1", 0, 0, &cs, &err);
+        if (FAILED(hr) || cs == nullptr)
+        {
+            snprintf(line, sizeof line, "[MGPU][HL1] shader failed: 0x%08X %s - HUD-less mode off.",
+                     (unsigned)hr, (err != nullptr) ? (const char *)err->GetBufferPointer() : "");
+            mgpu::diag::warn(line);
+            if (err != nullptr) err->Release();
+            return false;
+        }
+        if (err != nullptr) { err->Release(); err = nullptr; }
+        D3D12_DESCRIPTOR_RANGE rng[2] = {};
+        rng[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        rng[0].NumDescriptors = 2; rng[0].BaseShaderRegister = 0;
+        rng[0].OffsetInDescriptorsFromTableStart = 0;
+        rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        rng[1].NumDescriptors = 1; rng[1].BaseShaderRegister = 0;
+        rng[1].OffsetInDescriptorsFromTableStart = 2;
+        D3D12_ROOT_PARAMETER rp[2] = {};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[0].DescriptorTable.NumDescriptorRanges = 2;
+        rp[0].DescriptorTable.pDescriptorRanges = rng;
+        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[1].Constants.ShaderRegister = 0;
+        rp[1].Constants.Num32BitValues = 2;
+        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2; rsd.pParameters = rp;
+        ID3DBlob *sig = nullptr;
+        hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+        if (err != nullptr) err->Release();
+        if (SUCCEEDED(hr))
+        {
+            hr = dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                          IID_PPV_ARGS(&s.ui_rs));
+            sig->Release();
+        }
+        if (SUCCEEDED(hr))
+        {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+            pd.pRootSignature = s.ui_rs;
+            pd.CS.pShaderBytecode = cs->GetBufferPointer();
+            pd.CS.BytecodeLength  = cs->GetBufferSize();
+            hr = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&s.ui_pso));
+        }
+        cs->Release();
+        if (SUCCEEDED(hr))
+        {
+            // Two sets of three descriptors: one call for the generated frame
+            // and one for the real frame can sit in the same list.
+            D3D12_DESCRIPTOR_HEAP_DESC hd{};
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            hd.NumDescriptors = 6;
+            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            hr = dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.ui_heap));
+            s.ui_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        if (FAILED(hr))
+        {
+            snprintf(line, sizeof line, "[MGPU][HL1] pipeline setup failed 0x%08X - HUD-less mode off.",
+                     (unsigned)hr);
+            mgpu::diag::warn(line);
+            return false;
+        }
+        s.ui_failed = false;
+        s.ui_built = true;
+        mgpu::diag::info("[MGPU][HL1] HUD compositing pass ready on the neural card.");
+        return true;
+    }
+
+    // dst must be in UNORDERED_ACCESS; tex_in[ii] / tex_ui[ii] in
+    // NON_PIXEL_SHADER_RESOURCE. set = 0 or 1 (which descriptor set).
+    static bool ui_apply(stream_state &s, ID3D12GraphicsCommandList *cl, ID3D12Resource *dst,
+                         unsigned ii, unsigned set)
+    {
+        if (!ui_build(s)) return false;
+        ID3D12Resource *hl = s.tex_in[ii], *full = s.tex_ui[ii];
+        if (cl == nullptr || dst == nullptr || hl == nullptr || full == nullptr) return false;
+        const D3D12_RESOURCE_DESC dd = dst->GetDesc();
+        if ((UINT)dd.Width != s.width || dd.Height != s.height) return false;
+        ID3D12Device *dev = s.ndev_b;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = s.ui_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)set * 3u * s.ui_inc;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        sv.Format = hl->GetDesc().Format;
+        dev->CreateShaderResourceView(hl, &sv, h); h.ptr += s.ui_inc;
+        sv.Format = full->GetDesc().Format;
+        dev->CreateShaderResourceView(full, &sv, h); h.ptr += s.ui_inc;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+        uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        uv.Format = dd.Format;
+        dev->CreateUnorderedAccessView(dst, nullptr, &uv, h);
+        ID3D12DescriptorHeap *hs[1] = { s.ui_heap };
+        cl->SetDescriptorHeaps(1, hs);
+        cl->SetComputeRootSignature(s.ui_rs);
+        cl->SetPipelineState(s.ui_pso);
+        D3D12_GPU_DESCRIPTOR_HANDLE g = s.ui_heap->GetGPUDescriptorHandleForHeapStart();
+        g.ptr += (UINT64)set * 3u * s.ui_inc;
+        cl->SetComputeRootDescriptorTable(0, g);
+        const UINT c[2] = { (UINT)dd.Width, dd.Height };
+        cl->SetComputeRoot32BitConstants(1, 2, c, 0);
+        cl->Dispatch(((UINT)dd.Width + 7u) / 8u, (dd.Height + 7u) / 8u, 1);
+        D3D12_RESOURCE_BARRIER ub{};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        ub.UAV.pResource = dst;
+        cl->ResourceBarrier(1, &ub);
+        return true;
+    }
+
+    // Recorded into the NR list right after the final pass, while the
+    // current frame's motion vectors and depth are still in
+    // NON_PIXEL_SHADER_RESOURCE. Leaves every resource in the state it found
+    // it, and always refreshes fg_real[k] with the current output.
+    //
+    // One compute pass, two uses. FrameGen=1/2: it IS the in-between frame
+    // (our warp). FrameGen=3: AMD has already written the in-between frame to
+    // fsr_out, and the pass only copies it to fg_out[k] while applying the
+    // HUD fix (flag 16 selects the AMD source instead of the warp).
+    static void fg_dispatch_pass(stream_state &s, ID3D12GraphicsCommandList *cl,
+                                 ID3D12Resource *prev, ID3D12Resource *curr, unsigned ii,
+                                 bool depth_ok, ID3D12Resource *gen_src, ID3D12Resource *outk,
+                                 float mv_el, unsigned extra_flags)
+    {
+        ID3D12Device *dev = s.ndev_b;
+        const D3D12_RESOURCE_DESC cd = curr->GetDesc();
+        D3D12_CPU_DESCRIPTOR_HANDLE h = s.fg_heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        sv.Format = prev->GetDesc().Format;
+        dev->CreateShaderResourceView(prev, &sv, h); h.ptr += s.fg_inc;
+        sv.Format = cd.Format;
+        dev->CreateShaderResourceView(curr, &sv, h); h.ptr += s.fg_inc;
+        sv.Format = (DXGI_FORMAT)s.mvec_format;
+        dev->CreateShaderResourceView(s.tex_mvec_r[ii], &sv, h); h.ptr += s.fg_inc;
+        sv.Format = depth_ok ? s.tex_depth[ii]->GetDesc().Format : DXGI_FORMAT_R32_FLOAT;
+        dev->CreateShaderResourceView(depth_ok ? s.tex_depth[ii] : nullptr, &sv, h);
+        h.ptr += s.fg_inc;
+        sv.Format = (gen_src != nullptr) ? gen_src->GetDesc().Format : cd.Format;
+        dev->CreateShaderResourceView(gen_src, &sv, h); h.ptr += s.fg_inc;   // t4 (null = unused)
+        ID3D12Resource *const mask_in  = s.fg_mask[s.fg_mask_i];
+        ID3D12Resource *const mask_out = s.fg_mask[s.fg_mask_i ^ 1u];
+        sv.Format = DXGI_FORMAT_R8_UNORM;
+        dev->CreateShaderResourceView(mask_in, &sv, h); h.ptr += s.fg_inc;   // t5
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+        uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        uv.Format = cd.Format;
+        dev->CreateUnorderedAccessView(outk, nullptr, &uv, h); h.ptr += s.fg_inc;   // u0
+        uv.Format = DXGI_FORMAT_R8_UNORM;
+        dev->CreateUnorderedAccessView(mask_out, nullptr, &uv, h);                 // u1
+        barrier(cl, mask_in, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        ID3D12DescriptorHeap *hs[1] = { s.fg_heap };
+        cl->SetDescriptorHeaps(1, hs);
+        cl->SetComputeRootSignature(s.fg_rs);
+        cl->SetPipelineState(s.fg_pso);
+        cl->SetComputeRootDescriptorTable(0, s.fg_heap->GetGPUDescriptorHandleForHeapStart());
+        const float sgn = s.fg_invert ? -1.0f : 1.0f;
+        const float sx = sgn * s.mvec_scale_x * mv_el;
+        const float sy = sgn * s.mvec_scale_y * mv_el;
+        const float tm = 0.5f;
+        unsigned flags = (depth_ok ? 1u : 0u) | extra_flags;
+        if (s.depth_inverted) flags |= 2u;
+        if (s.fg_on == 2u) flags |= 4u;          // debug view: motion magnitude
+        if (s.fg_hudfix != 0u && !s.fg_hud_now) flags |= 8u;   // FG3 (not needed HUD-less: HL1)
+        if (!s.fg_mask_valid) flags |= 32u;      // FG4: the mask read side is not written yet
+        UINT c[10];
+        c[0] = (UINT)cd.Width; c[1] = (UINT)cd.Height;
+        c[2] = s.mvec_w; c[3] = s.mvec_h;
+        c[4] = depth_ok ? s.depth_w : 1u; c[5] = depth_ok ? s.depth_h : 1u;
+        memcpy(&c[6], &sx, 4); memcpy(&c[7], &sy, 4); memcpy(&c[8], &tm, 4);
+        c[9] = flags;
+        cl->SetComputeRoot32BitConstants(1, 10, c, 0);
+        cl->Dispatch(((UINT)cd.Width + 7u) / 8u, (cd.Height + 7u) / 8u, 1);
+        barrier(cl, mask_in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // The written mask is read next time; the mask only carries meaning
+        // once the HUD fix has run at least once.
+        s.fg_mask_i ^= 1u;
+        s.fg_mask_valid = (flags & 8u) != 0u;
+    }
+
+    // Returns true when it has put the HUD back onto nr_final itself (HL1),
+    // so the caller must not do it a second time.
+    static bool fg_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
+                          bool mv_ok, bool depth_ok, float mv_el, unsigned long long f,
+                          bool hud)
+    {
+        ID3D12Resource *cur = s.nr_final;
+        if (cur == nullptr || cl == nullptr) return false;
+        if (!s.fg_built)
+        {
+            s.fg_built = fg_build(s, s.ndev_b, cur);
+            if (!s.fg_built) { s.fg_failed = true; return false; }
+        }
+        const unsigned k = (s.fg_k + 1u) % stream_state::FG_SETS;   // the set this frame writes
+        ID3D12Resource *const prev = s.fg_real[s.fg_k];               // the previous real frame
+        ID3D12Resource *const real = s.fg_real[k];
+        ID3D12Resource *const outk = s.fg_out[k];
+        const D3D12_RESOURCE_DESC cd = cur->GetDesc();
+        const D3D12_RESOURCE_DESC pd = real->GetDesc();
+        if (cd.Width != pd.Width || cd.Height != pd.Height || cd.Format != pd.Format) return false;
+        static_assert(stream_state::FG_SETS == 3, "FIX7 tracks three sets");
+
+        // FIX7: set k may still be read by the present queue. Skip this frame
+        // (nothing written, shown without an in-between frame) and break the
+        // pair, so the next frame does not generate across the gap.
+        if (!fg_set_writable(k))
+        {
+            g_fg_set_skips.fetch_add(1, std::memory_order_relaxed);
+            s.fg_prev_valid = false;
+            if (s.fsr_up) s.fsr_frame_id += 2ull;
+            return false;
+        }
+
+        const bool use_fsr = (s.fg_on == 3u) && !s.fsr_failed;
+        bool gen = false;
+
+        // ---- HL1: generation on the HUD-less frames, HUD added afterwards ----
+        //
+        // nr_final is the scene without the HUD here. It is copied to fg_hl[k]
+        // and BOTH generators work from fg_hl only: our warp from fg_hl[prev]
+        // to fg_hl[k], AMD with fg_hl[k] as its presentColor (it keeps its own
+        // history of those). The HUD is then added to the generated frame and
+        // to nr_final, and nr_final - now with the HUD - becomes fg_real[k],
+        // the real frame the presenter shows. A switch between HUD-less and
+        // ordinary frames (a menu) breaks the pair, so nothing is generated
+        // across it.
+        const bool hl_ok = hud && s.fg_hl[0] != nullptr;
+        s.fg_hud_now = hl_ok;
+        if (hl_ok)
+        {
+            ID3D12Resource *const hlk = s.fg_hl[k];
+            ID3D12Resource *const hlp = s.fg_hl[s.fg_k];
+            const bool prev_ok = s.fg_prev_valid && s.fg_hl_k[s.fg_k];
+            barrier(cl, cur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier(cl, hlk, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+            cl->CopyResource(hlk, cur);
+            barrier(cl, hlk, D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (use_fsr)
+            {
+                const bool want = prev_ok && mv_ok && depth_ok && s.fsr_out != nullptr;
+                gen = want && fsr_record(s, cl, ii, hlk, mv_el);
+                if (!want && s.fsr_up) ++s.fsr_frame_id;
+                if (gen)
+                {
+                    barrier(cl, s.fsr_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    fg_dispatch_pass(s, cl, hlp, hlk, ii, depth_ok, s.fsr_out, outk, mv_el, 16u);
+                    barrier(cl, s.fsr_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                }
+            }
+            else
+            {
+                gen = prev_ok && mv_ok;
+                if (gen) fg_dispatch_pass(s, cl, hlp, hlk, ii, depth_ok, nullptr, outk, mv_el, 0u);
+            }
+            if (gen) (void)ui_apply(s, cl, outk, ii, 1u);
+            barrier(cl, cur, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            (void)ui_apply(s, cl, cur, ii, 0u);
+            barrier(cl, cur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier(cl, real, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+            cl->CopyResource(real, cur);
+            barrier(cl, real, D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            barrier(cl, cur, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            s.fg_hl_k[k] = true;
+            s.fg_prev_valid = true;
+            s.fg_k = k;
+            s.fg_ready = f; s.fg_ready_k = k; s.fg_ready_gen = gen;
+            if (gen) ++s.fg_made;
+            else if (!mv_ok) ++s.fg_nomv;
+            return true;
+        }
+        // Not HUD-less this frame. If it is HUD-less but the fg_hl buffers are
+        // missing, put the HUD back first and generate as before.
+        bool ui_done = false;
+        if (hud) ui_done = ui_apply(s, cl, cur, ii, 0u);
+        // A previous HUD-less set must not pair with this ordinary frame.
+        if (s.fg_hl_k[s.fg_k]) { s.fg_prev_valid = false; if (s.fsr_up) ++s.fsr_frame_id; }
+        s.fg_hl_k[k] = false;
+
+        // FIX7: the generators read the previous frame from fg_hl (NR-queue
+        // only, never presented), not from fg_real, which the present queue
+        // may be copying at that moment. fg_real is written here and read
+        // only by the presenter.
+        ID3D12Resource *const hprev = (s.fg_hl[0] != nullptr) ? s.fg_hl[s.fg_k] : prev;
+        ID3D12Resource *const hk    = (s.fg_hl[0] != nullptr) ? s.fg_hl[k] : nullptr;
+        // FIX8: without the private history (its allocation failed), hprev IS
+        // fg_real[fg_k], which the present queue may be copying right now.
+        // Only read it when that set is idle; otherwise no in-between frame.
+        const bool prev_readable = (s.fg_hl[0] != nullptr) || fg_set_writable(s.fg_k);
+        if (use_fsr)
+        {
+            // AMD reads THIS frame as presentColor, so the copy comes first.
+            barrier(cl, cur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier(cl, real, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+            cl->CopyResource(real, cur);
+            barrier(cl, real, D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (hk != nullptr)
+            {
+                barrier(cl, hk, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+                cl->CopyResource(hk, cur);
+                barrier(cl, hk, D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            }
+            barrier(cl, cur, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            // AMD needs depth too. Without vectors or depth this frame is a
+            // gap: the next frame ID is then not consecutive and AMD resets
+            // its history by itself.
+            const bool want = s.fg_prev_valid && mv_ok && depth_ok && s.fsr_out != nullptr &&
+                              prev_readable;
+            gen = want && fsr_record(s, cl, ii, real, mv_el);
+            // A frame AMD did not see must break its frame-ID sequence, or the
+            // next in-between frame would be built from a real frame two or
+            // more presents back. Skipping an ID makes AMD reset its history.
+            if (!want && s.fsr_up) ++s.fsr_frame_id;
+            if (gen)
+            {
+                barrier(cl, s.fsr_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                fg_dispatch_pass(s, cl, hprev, real, ii, depth_ok, s.fsr_out, outk, mv_el, 16u);
+                barrier(cl, s.fsr_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+        }
+        else
+        {
+            gen = s.fg_prev_valid && mv_ok && prev_readable;
+            if (gen)
+            {
+                barrier(cl, cur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                fg_dispatch_pass(s, cl, hprev, cur, ii, depth_ok, nullptr, outk, mv_el, 0u);
+                barrier(cl, cur, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+            }
+            else
+            {
+                barrier(cl, cur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+            }
+            barrier(cl, real, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+            cl->CopyResource(real, cur);
+            barrier(cl, real, D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (hk != nullptr)   // FIX7: private history copy
+            {
+                barrier(cl, hk, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+                cl->CopyResource(hk, cur);
+                barrier(cl, hk, D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            }
+            barrier(cl, cur, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        s.fg_prev_valid = true;
+        s.fg_k = k;
+        s.fg_ready = f; s.fg_ready_k = k; s.fg_ready_gen = gen;
+        if (gen) ++s.fg_made;
+        else if (!mv_ok) ++s.fg_nomv;
+        return ui_done;
+    }
+
     static void sr_write_descriptors(stream_state &s, ID3D12Device *ndev, unsigned ii,
                                      ID3D12Resource *src_color, ID3D12Resource *src_depth)
     {
@@ -11621,6 +12838,22 @@ namespace
                          D3D12_RESOURCE_FLAG_NONE,
                          s.tex_in_rest, &s.tex_in[1]);
         if (SUCCEEDED(h)) s.tex_in_show = s.tex_in[0];
+        if (SUCCEEDED(h) && s.hud_off != 0)   // HL1: the frame-with-HUD pair
+        {
+            for (unsigned ui = 0; ui < 2u && SUCCEEDED(h); ++ui)
+                if (ui == 0u || s.copy_queue)
+                    h = make_tex(ndev, s.width, s.height, infmt, D3D12_RESOURCE_FLAG_NONE,
+                                 s.tex_in_rest, &s.tex_ui[ui]);
+            if (FAILED(h))
+            {
+                mgpu::diag::warn("[MGPU][HL1] could not create the HUD textures - HUD-less mode "
+                                 "is off for this run.");
+                for (unsigned ui = 0; ui < 2u; ++ui)
+                    if (s.tex_ui[ui] != nullptr) { s.tex_ui[ui]->Release(); s.tex_ui[ui] = nullptr; }
+                s.hud_live.store(false);
+                h = S_OK;
+            }
+        }
         if (SUCCEEDED(h))
             h = make_tex(ndev, s.width, s.height, nrfmt,
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
@@ -14362,6 +15595,383 @@ void ui_set_late_latch_age(unsigned age)
     mgpu::diag::info(l);
 }
 
+// ---- FG2: THE PRESENT THREAD ----
+//
+// FG1 presented the generated frame, slept half an interval and presented the
+// real one ON THE BRIDGE THREAD - the thread that also runs NR. While it slept
+// no NR work could start, so the interval grew by the sleep, the sleep grew
+// with the interval, and NR settled at half its rate (measured: 65 -> 30 fps).
+//
+// Now the bridge thread only hands the finished pair over and goes straight
+// back to NR. This thread shows the generated frame at once, waits until half
+// an NR interval after the hand-over, and shows the real frame. Both come from
+// set k of the double-buffered FG resources, which the next NR list does not
+// touch (it writes set 1-k), and both are AddRef'd for the duration.
+struct fg_job
+{
+    ID3D12Resource *gen = nullptr;    // fg_out[k], or null when no in-between frame
+    ID3D12Resource *real = nullptr;   // fg_real[k]
+    unsigned set = 0;                 // FIX7: k, for the busy/fence bookkeeping
+    float r = 0.0f, g = 0.0f, b = 0.0f;   // FIX7: clear colour, carried with the job
+    LARGE_INTEGER t0{};
+    double half_ms = 0.0;
+};
+static std::mutex g_fgp_mx;
+static std::condition_variable g_fgp_cv;
+static fg_job g_fgp_job;
+static bool g_fgp_has = false, g_fgp_stop = false;
+static std::atomic<bool> g_fgp_failed{false};
+// A pointer, never a static std::thread: a joinable static thread object
+// destroyed at DLL unload calls std::terminate.
+static std::thread *g_fgp_thread = nullptr;
+static LARGE_INTEGER g_fg_last{};
+static double g_fg_ema_ms = 0.0;
+static HANDLE g_fg_timer = nullptr;
+
+// FIX7: references the present thread still holds after submitting, released
+// only once the present fence says the GPU copy that read them is done. An
+// AddRef dropped right after submit could be the LAST reference (stream_release
+// already let go) while the present queue is still reading the buffer.
+struct fg_retired { ID3D12Resource *res; unsigned long long fence; };
+static std::vector<fg_retired> g_fg_retire;   // under g_fgp_mx
+
+static void fg_retire_completed()
+{
+    ID3D12Fence *f = g_fg_pfence.load(std::memory_order_acquire);
+    if (f == nullptr) return;
+    const unsigned long long done = f->GetCompletedValue();
+    std::lock_guard<std::mutex> lk(g_fgp_mx);
+    size_t w = 0;
+    for (size_t i = 0; i < g_fg_retire.size(); ++i)
+    {
+        if (g_fg_retire[i].fence <= done) g_fg_retire[i].res->Release();
+        else g_fg_retire[w++] = g_fg_retire[i];
+    }
+    g_fg_retire.resize(w);
+}
+
+// A job that will never be presented: drop its references and its busy mark.
+static void fg_job_drop(fg_job &j)
+{
+    if (j.gen != nullptr) j.gen->Release();
+    if (j.real != nullptr) j.real->Release();
+    if (j.gen != nullptr || j.real != nullptr)
+        g_fg_set_busy[j.set % 3u].fetch_sub(1u, std::memory_order_acq_rel);
+    j.gen = j.real = nullptr;
+}
+
+static void fg_wait_until(const LARGE_INTEGER &t0, double ms)
+{
+    LARGE_INTEGER now{}, fq{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&fq);
+    if (fq.QuadPart == 0) return;
+    double wait_ms = ms - (double)(now.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart;
+    if (wait_ms <= 0.2) return;
+    if (wait_ms > 30.0) wait_ms = 30.0;
+    if (g_fg_timer == nullptr)
+    {
+        g_fg_timer = CreateWaitableTimerExW(nullptr, nullptr,
+                                            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+        if (g_fg_timer == nullptr) g_fg_timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+    }
+    if (g_fg_timer != nullptr)
+    {
+        LARGE_INTEGER due{};
+        due.QuadPart = -(LONGLONG)(wait_ms * 10000.0);
+        if (SetWaitableTimer(g_fg_timer, &due, 0, nullptr, nullptr, FALSE))
+        {
+            (void)WaitForSingleObject(g_fg_timer, 40);
+            return;
+        }
+    }
+    Sleep((DWORD)wait_ms);
+}
+
+static void fg_present_thread_main()
+{
+    for (;;)
+    {
+        fg_job job;
+        {
+            std::unique_lock<std::mutex> lk(g_fgp_mx);
+            g_fgp_cv.wait(lk, [] { return g_fgp_has || g_fgp_stop; });
+            if (g_fgp_stop) return;   // a pending job is dropped by fg_present_stop
+            job = g_fgp_job;
+            g_fgp_has = false;
+        }
+        fg_retire_completed();
+        bool ok = true;
+        unsigned long long fv = 0;   // FIX8: highest value covering this job's copies
+        if (job.gen != nullptr)
+        {
+            t_fg_src = job.gen; t_fg_rest = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            ok = present_frame(job.r, job.g, job.b);
+            t_fg_src = nullptr;
+            if (t_present_fv > fv) fv = t_present_fv;
+            if (ok)
+            {
+                g_hud_gen_count.fetch_add(1ull, std::memory_order_relaxed);
+                // FIX7: atomic, so this thread never takes the stream lock here.
+                g_fg_presented.fetch_add(1ull, std::memory_order_relaxed);
+            }
+            if (ok) fg_wait_until(job.t0, job.half_ms);
+        }
+        if (ok && job.real != nullptr)
+        {
+            t_fg_src = job.real; t_fg_rest = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            ok = present_frame(job.r, job.g, job.b);
+            t_fg_src = nullptr;
+            if (t_present_fv > fv) fv = t_present_fv;
+        }
+        // FIX7/FIX8: until the present queue reaches fv, set job.set stays
+        // unwritable and the references stay held. fv is exactly what
+        // present_frame reported: 0 when nothing reached the GPU (released at
+        // once), UINT64_MAX when a copy is on the queue with no fence (held
+        // until fg_present_stop has drained the queue).
+        g_fg_set_fence[job.set % 3u].store(fv, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(g_fgp_mx);
+            if (job.gen != nullptr) g_fg_retire.push_back({ job.gen, fv });
+            if (job.real != nullptr) g_fg_retire.push_back({ job.real, fv });
+        }
+        if (job.gen != nullptr || job.real != nullptr)
+            g_fg_set_busy[job.set % 3u].fetch_sub(1u, std::memory_order_acq_rel);
+        if (!ok) { g_fgp_failed.store(true, std::memory_order_relaxed); return; }
+    }
+}
+
+// Bridge thread, after the present gate opens. Returns true when this NR frame
+// was handed to the present thread (the caller must then NOT present it).
+bool fg_handoff(float r, float g, float b, bool &failed)
+{
+    failed = g_fgp_failed.load(std::memory_order_relaxed);
+    if (failed) return false;
+
+    LARGE_INTEGER now{}, fq{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&fq);
+
+    // FIX7: the present fence the set bookkeeping is measured against. Taken
+    // once, AddRef'd, released by fg_present_stop (also this thread).
+    if (g_fg_pfence.load(std::memory_order_acquire) == nullptr)
+    {
+        auto &S = st();
+        std::lock_guard<std::mutex> lk(S.cs);
+        if (S.fence == nullptr) return false;
+        S.fence->AddRef();
+        g_fg_pfence.store(S.fence, std::memory_order_release);
+    }
+
+    fg_job job;
+    {
+        stream_state &s = str();
+        std::lock_guard<std::mutex> lk(s.cs);
+        if (s.fg_on == 0u || !s.fg_built || !s.armed || s.summarised) return false;
+        if (s.fg_ready == 0ull || s.fg_ready <= s.fg_shown) return false;
+        s.fg_shown = s.fg_ready;
+        if (s.fg_ready != s.consumed) return false;   // stale: present nr_final normally
+        const unsigned k = s.fg_ready_k;
+        if (s.fg_real[k] == nullptr) return false;
+        job.real = s.fg_real[k];
+        job.gen = s.fg_ready_gen ? s.fg_out[k] : nullptr;
+        job.set = k;
+        job.real->AddRef();
+        if (job.gen != nullptr) job.gen->AddRef();
+        // FIX7: marked busy under the same lock fg_record checks it under.
+        g_fg_set_busy[k % 3u].fetch_add(1u, std::memory_order_acq_rel);
+    }
+    job.r = r; job.g = g; job.b = b;
+    if (g_fg_last.QuadPart != 0 && fq.QuadPart != 0)
+    {
+        const double dt = (double)(now.QuadPart - g_fg_last.QuadPart) * 1000.0 / (double)fq.QuadPart;
+        if (dt > 3.0 && dt < 60.0)
+            g_fg_ema_ms = (g_fg_ema_ms <= 0.0) ? dt : (g_fg_ema_ms * 0.85 + dt * 0.15);
+    }
+    g_fg_last = now;
+    job.t0 = now;
+    job.half_ms = g_fg_ema_ms * 0.5;
+
+    std::unique_lock<std::mutex> lk(g_fgp_mx);
+    if (g_fgp_thread == nullptr)
+    {
+        g_fgp_stop = false;
+        g_fgp_thread = new std::thread(fg_present_thread_main);
+    }
+    if (g_fgp_has)
+    {
+        // The present thread is still busy with the previous pair: drop that
+        // pending one (never submitted, so no fence to wait for), keep the newest.
+        fg_job_drop(g_fgp_job);
+    }
+    g_fgp_job = job;
+    g_fgp_has = true;
+    lk.unlock();
+    g_fgp_cv.notify_one();
+    return true;
+}
+
+// Bridge thread, before the present chain is torn down.
+void fg_present_stop()
+{
+    {
+        std::lock_guard<std::mutex> lk(g_fgp_mx);
+        g_fgp_stop = true;
+    }
+    g_fgp_cv.notify_one();
+    if (g_fgp_thread != nullptr)
+    {
+        if (g_fgp_thread->joinable()) g_fgp_thread->join();
+        delete g_fgp_thread;
+        g_fgp_thread = nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_fgp_mx);
+        if (g_fgp_has) { fg_job_drop(g_fgp_job); g_fgp_has = false; }
+    }
+    // The last present's copy may still be running on the present queue and
+    // reading an FG buffer that stream_release is about to free. Drain it.
+    //
+    // FIX7: a finite wait can expire with the copy still queued. Then the
+    // references in g_fg_retire are deliberately LEAKED: they keep those
+    // buffers alive whatever stream_release does, which is the safe half of
+    // the trade on a path that ends the stream anyway. A removed device runs
+    // nothing more, so its buffers can be released.
+    ID3D12Device *dev = nullptr;
+    ID3D12CommandQueue *q = nullptr;
+    {
+        auto &S = st();
+        std::lock_guard<std::mutex> lk(S.cs);
+        dev = S.device; q = S.queue;
+    }
+    bool drained = (dev == nullptr || q == nullptr);   // no present queue: nothing in flight
+    if (!drained)
+    {
+        ID3D12Fence *df = nullptr;
+        if (SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&df))) &&
+            SUCCEEDED(q->Signal(df, 1)))
+        {
+            if (df->GetCompletedValue() >= 1) drained = true;
+            else
+            {
+                HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (ev != nullptr)
+                {
+                    if (SUCCEEDED(df->SetEventOnCompletion(1, ev)))
+                    {
+                        // 2 s as before, then up to 8 s more unless the device is gone.
+                        DWORD wr = WaitForSingleObject(ev, 2000);
+                        if (wr != WAIT_OBJECT_0 && SUCCEEDED(dev->GetDeviceRemovedReason()))
+                            wr = WaitForSingleObject(ev, 8000);
+                        drained = (wr == WAIT_OBJECT_0);
+                    }
+                    CloseHandle(ev);
+                }
+            }
+        }
+        if (df != nullptr) df->Release();
+        if (!drained && FAILED(dev->GetDeviceRemovedReason())) drained = true;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_fgp_mx);
+        if (drained)
+            for (auto &e : g_fg_retire) e.res->Release();
+        else
+        {
+            char line[300];
+            snprintf(line, sizeof line,
+                     "[MGPU][FIX7] the present queue did not finish within 10 s at shutdown - %zu "
+                     "frame-generation buffer reference(s) are kept (leaked) so nothing the GPU may "
+                     "still read is freed.", g_fg_retire.size());
+            mgpu::diag::error(line);
+        }
+        g_fg_retire.clear();
+    }
+    for (unsigned k = 0; k < 3u; ++k)
+    {
+        g_fg_set_busy[k].store(0u);
+        g_fg_set_fence[k].store(0ull);
+    }
+    if (ID3D12Fence *pf = g_fg_pfence.exchange(nullptr)) pf->Release();
+}
+
+// Generated frames per second for the HUD, sampled at most four times a second.
+double hud_gen_fps()
+{
+    static LARGE_INTEGER last{};
+    static unsigned long long glast = 0;
+    static double gfps = 0.0;
+    LARGE_INTEGER now{}, fq{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&fq);
+    const unsigned long long g = g_hud_gen_count.load(std::memory_order_relaxed);
+    if (last.QuadPart == 0 || fq.QuadPart == 0) { last = now; glast = g; return gfps; }
+    const double dt = (double)(now.QuadPart - last.QuadPart) / (double)fq.QuadPart;
+    if (dt >= 0.25) { gfps = (double)(g - glast) / dt; glast = g; last = now; }
+    return gfps;
+}
+
+bool ui_fg_hudfix()
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    return s.fg_hudfix != 0u;
+}
+
+void ui_set_fg_hudfix(bool on)
+{
+    {
+        stream_state &s = str();
+        std::lock_guard<std::mutex> lk(s.cs);
+        s.fg_hudfix = on ? 1u : 0u;
+    }
+    (void)ui_ini_write("FGHudFix", on ? 1 : 0);
+}
+
+int ui_frame_gen()
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    return (int)s.fg_on;
+}
+
+int ui_frame_gen_last()
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    return (s.fg_last_mode != 0u) ? (int)s.fg_last_mode : 1;
+}
+
+// FSR1: 0 not tried, 1 running, -1 failed (fell back to the mod's own).
+int ui_fsr_state()
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (s.fsr_failed) return -1;
+    return s.fsr_up ? 1 : 0;
+}
+
+void ui_set_frame_gen(int mode)
+{
+    if (mode < 0) mode = 0;
+    if (mode > 3) mode = 3;
+    {
+        stream_state &s = str();
+        std::lock_guard<std::mutex> lk(s.cs);
+        if (s.fg_on == 0u && mode != 0) { s.fg_prev_valid = false; s.fg_mask_valid = false; }   // fresh pair, fresh mask
+        if (mode == 3 && s.fg_on != 3u)
+        {
+            s.fsr_failed = false;        // FSR1: allow a retry
+            s.fsr_errors = 0;            // FIX7: a real retry, not one more strike
+            s.fsr_frame_id += 2ull;      // and make AMD reset: its previous frame is stale
+        }
+        s.fg_on = (unsigned)mode;
+        if (mode != 0) s.fg_last_mode = (unsigned)mode;
+    }
+    (void)ui_ini_write("FrameGen", mode);
+}
+
 bool ui_present_vsync()
 {
     return g_present_vsync.load(std::memory_order_relaxed) != 0u;
@@ -14587,6 +16197,29 @@ void stream_request()
             s.ll_on         = (unsigned)ini_read_sr_int("LateLatch", 0, 0, 1);
             s.ll_age        = (unsigned)ini_read_sr_int("LateLatchAge", 2, 0, 4);
             s.stage_on      = (unsigned)ini_read_sr_int("StageCopy", 0, 0, 1);   // OPT5
+            s.fg_on         = (unsigned)ini_read_sr_int("FrameGen", 0, 0, 3);    // FG1: 2 = motion view, 3 = AMD FSR 3
+            s.fg_invert     = (unsigned)ini_read_sr_int("FGInvertMV", 0, 0, 1);  // FG1
+            s.fg_hudfix     = (unsigned)ini_read_sr_int("FGHudFix", 1, 0, 1);    // FG3
+            s.hud_mode      = (unsigned)ini_read_sr_int("HudLess", 0, 0, 1);     // HL1
+            s.hud_eval = 0; s.hud_plain = 0; s.hud_report_at = 0;
+            s.cq_hud_ok[0] = s.cq_hud_ok[1] = 0u;
+            if (s.fg_on != 0u) s.fg_last_mode = s.fg_on;
+            {   // FSR1
+                const float fv = ini_read_named_float("FSRFov", 90.0f);
+                s.fsr_fov_h = (fv >= 30.0f && fv <= 150.0f) ? fv : 90.0f;
+                const float fn = ini_read_named_float("FSRNear", 10.0f);
+                s.fsr_near = (fn > 0.0f) ? fn : 10.0f;
+                const float ff = ini_read_named_float("FSRFar", 100000.0f);
+                s.fsr_far = (ff > s.fsr_near) ? ff : 100000.0f;
+                const float fm = ini_read_named_float("FSRUnitsToMeters", 0.01f);
+                s.fsr_units_m = (fm > 0.0f) ? fm : 0.01f;
+                s.fsr_transfer = (unsigned)ini_read_sr_int("FSRTransfer", 0, 0, 2);
+                s.fsr_failed = false; s.fsr_frame_id = 0; s.fsr_made = 0; s.fsr_errors = 0;
+                s.fsr_last.QuadPart = 0;
+            }
+            s.fg_prev_valid = false; s.fg_ready = 0; s.fg_shown = 0;
+            s.fg_made = 0; s.fg_nomv = 0; s.fg_presented = 0; s.fg_failed = false;
+            g_fg_presented.store(0); g_fg_set_skips.store(0);   // FIX7
             s.stage_last = 0; s.stage_submits = 0; s.stage_fail = 0;
             s.g0_in_sum = s.g0_mv_sum = s.g0_dma_sum = 0.0;
             s.g0_in_n = s.g0_mv_n = s.g0_dma_n = 0;
@@ -16139,6 +17772,15 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             slot_end = s.mvec_off + s.mvec_bytes2;
         }
 
+        // HL1: the HUD-less region - same size and footprint as the colour
+        // payload, because it is the same kind of image (checked per copy).
+        s.hud_off = 0;
+        if (s.hud_mode != 0u)
+        {
+            s.hud_off = ((slot_end + SEAL_STRIDE - 1) / SEAL_STRIDE) * SEAL_STRIDE;
+            slot_end = s.hud_off + s.payload_bytes;
+        }
+
         // One slot = seal (padded to the placement alignment) + payload, plus
         // the depth region when it is on, rounded up so that every slot offset
         // is itself 512-aligned. Whole slots only: sub-slot arithmetic is how
@@ -16455,6 +18097,23 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         {
             s.mvec_slot_valid[q].store(0u, std::memory_order_relaxed);
             s.mvec_slot_frame[q].store(0ull, std::memory_order_relaxed);   // FIX5
+            s.hud_slot_valid[q].store(0u, std::memory_order_relaxed);      // HL1
+            s.hud_slot_frame[q].store(0ull, std::memory_order_relaxed);
+        }
+        s.hud_copies.store(0); s.hud_rejects.store(0); s.hud_lock_skips.store(0);
+        s.hud_sealed.store(0); s.hud_missing.store(0);
+        s.hud_live.store(s.hud_off != 0, std::memory_order_release);
+        if (s.hud_off != 0)
+        {
+            char hl[400];
+            snprintf(hl, sizeof hl,
+                     "[MGPU][HL1] HUD-less transport ON (HudLess=1): region %llu bytes at slot offset "
+                     "%llu, slot now %llu bytes. NR and frame generation run on the scene without the "
+                     "HUD; the HUD is added back unwarped. Needs the probe to find the texture first "
+                     "(watch for [MGPU][HL1] LOCKED).",
+                     (unsigned long long)s.payload_bytes, (unsigned long long)s.hud_off,
+                     (unsigned long long)s.slot_bytes);
+            mgpu::diag::info(hl);
         }
         s.mvec_live.store(s.mvec_mode == 3 && s.mvec_bytes2 != 0,
                           std::memory_order_release);
@@ -16634,6 +18293,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // `produced`'s list, and the Signal issued a few lines above covers it.
         // That is what makes the drain in stream_release sufficient.
         s.mvec_live.store(false, std::memory_order_release);
+        s.hud_live.store(false, std::memory_order_release);   // HL1
         return;
     }
 
@@ -16787,6 +18447,13 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         else ++s.mvec_missing;
     }
     s.mvec_slot_frame[slot].store(seal.mvec_valid ? fi : 0ull, std::memory_order_release);   // FIX5
+    if (s.hud_off != 0)   // HL1: same tagging rule as FIX5
+    {
+        const bool hv = s.hud_slot_valid[slot].load(std::memory_order_acquire) != 0u;
+        s.hud_slot_frame[slot].store(hv ? fi : 0ull, std::memory_order_release);
+        if (hv) s.hud_sealed.fetch_add(1, std::memory_order_relaxed);
+        else    s.hud_missing.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // ---- THE DEPTH DECISION IS MADE HERE, BEFORE THE SEAL IS STAGED ----
     //
@@ -16922,6 +18589,48 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // Frame fi used slot (fi-1) % RING, so frame fi+1 uses fi % RING. Cleared
     // here, under this mutex, BEFORE the next frame's scene can be drawn.
     s.mvec_slot_valid[(unsigned)(fi % stream_state::RING)].store(0u, std::memory_order_release);
+    s.hud_slot_valid[(unsigned)(fi % stream_state::RING)].store(0u, std::memory_order_release);   // HL1
+}
+
+// ---- HL1: the mid-frame HUD-less copy ----
+//
+// Same contract as stream_mvec_copy, from the same kind of caller: the probe
+// has just seen the engine finish writing its scene texture (render target ->
+// shader resource) and has put it into COPY_SOURCE around this call. Copied
+// into the slot this frame is about to seal, at hud_off, with the colour
+// payload's footprint - so the texture must match the back buffer's size and
+// format exactly, or the copy is refused.
+void stream_hud_copy(void *cmd_list_v, unsigned long long handle)
+{
+    stream_state &s = str();
+    if (!s.hud_live.load(std::memory_order_acquire)) return;
+    std::unique_lock<std::mutex> lk(s.mvec_cs, std::try_to_lock);
+    if (!lk.owns_lock()) { s.hud_lock_skips.fetch_add(1, std::memory_order_relaxed); return; }
+    if (!s.hud_live.load(std::memory_order_relaxed)) return;
+    if (s.gxfer == nullptr || s.hud_off == 0) return;
+
+    ID3D12GraphicsCommandList *gl = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list_v);
+    ID3D12Resource *src = reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)handle);
+    if (gl == nullptr || src == nullptr) return;
+    if (gl->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+    const D3D12_RESOURCE_DESC d = src->GetDesc();
+    if ((UINT)d.Width != s.width || d.Height != s.height || d.Format != s.format ||
+        d.SampleDesc.Count != 1)
+    {
+        s.hud_rejects.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const unsigned slot =
+        (unsigned)(s.produced_a.load(std::memory_order_acquire) % stream_state::RING);
+    D3D12_TEXTURE_COPY_LOCATION cs{}, cd{};
+    cs.pResource = src; cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; cs.SubresourceIndex = 0;
+    cd.pResource = g0_dst(s); cd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    cd.PlacedFootprint = s.fp;
+    cd.PlacedFootprint.Offset = (UINT64)slot * s.slot_bytes + s.hud_off;
+    gl->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
+    if (s.hud_slot_valid[slot].load(std::memory_order_relaxed) == 0u)
+        s.hud_copies.fetch_add(1, std::memory_order_relaxed);
+    s.hud_slot_valid[slot].store(1u, std::memory_order_release);
 }
 
 // ---- R78: THE MID-FRAME MOTION VECTOR COPY ----
@@ -17065,6 +18774,21 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
 //    in COMMON in this mode, is read as NON_PIXEL_SHADER_RESOURCE on the
 //    direct queue, and is put back to COMMON at the end of that list, ready
 //    for the copy queue to take it again two frames later.
+// HL1: does slot `slot` hold frame f's HUD-less copy, and can GPU 1 use it?
+// The HUD can only be put back when the NR output is the same size as the
+// input; otherwise the frame runs as before (HUD in the NR input).
+static bool hl_frame_ok(stream_state &s, unsigned slot, unsigned long long f, unsigned ii)
+{
+    if (s.hud_off == 0 || s.tex_ui[ii] == nullptr || s.ui_failed) return false;
+    if (s.hud_slot_frame[slot].load(std::memory_order_acquire) != f) return false;
+    if (s.nr_final != nullptr)
+    {
+        const D3D12_RESOURCE_DESC od = s.nr_final->GetDesc();
+        if ((UINT)od.Width != s.width || od.Height != s.height) return false;
+    }
+    return true;
+}
+
 static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)   // FIX6: half explicit
 {
     if (s.cq == nullptr || s.cqf == nullptr || s.cqa[ii] == nullptr ||
@@ -17089,15 +18813,24 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)
     if (s.cq_ts_ok)
         s.cql[ii]->EndQuery(s.cq_tsheap, D3D12_QUERY_TYPE_TIMESTAMP, ii * 2u);
 
+    // HL1: with a HUD-less copy in the slot, IT is the NR input and the frame
+    // with the HUD goes to tex_ui. Same footprint, so only the offsets move.
+    const bool hud_copied = hl_frame_ok(s, slot, f, ii);
     D3D12_TEXTURE_COPY_LOCATION us{}, ud{};
     us.pResource = s.nxfer;
     us.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     us.PlacedFootprint = s.fp;
-    us.PlacedFootprint.Offset = slot_off + SEAL_STRIDE;
+    us.PlacedFootprint.Offset = slot_off + (hud_copied ? s.hud_off : SEAL_STRIDE);
     ud.pResource = s.tex_in[ii];
     ud.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     ud.SubresourceIndex = 0;
     s.cql[ii]->CopyTextureRegion(&ud, 0, 0, 0, &us, nullptr);
+    if (hud_copied)
+    {
+        us.PlacedFootprint.Offset = slot_off + SEAL_STRIDE;
+        ud.pResource = s.tex_ui[ii];
+        s.cql[ii]->CopyTextureRegion(&ud, 0, 0, 0, &us, nullptr);
+    }
     bool depth_copied = false, mvec_copied = false;   // OPT4
 
     // ---- WHERE THE ACQUISITION PAYLOAD LANDS (R26a step 2) ----
@@ -17185,6 +18918,7 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)
     s.cqa_value[ii] = (UINT64)f;
     s.cq_depth_ok[ii] = depth_copied ? 1u : 0u;   // OPT4
     s.cq_mvec_ok[ii]  = mvec_copied  ? 1u : 0u;
+    s.cq_hud_ok[ii]   = hud_copied   ? 1u : 0u;   // HL1
     s.half_frame[ii]  = f;   // FIX6
     return true;
 }
@@ -19125,6 +20859,8 @@ void stream_poll()
                                      : (s.depth_slot_valid[slot] != 0u);
         const bool fr_mvec  = use_cq ? (s.cq_mvec_ok[ii] != 0u)
                                      : (s.mvec_slot_frame[slot].load(std::memory_order_acquire) == f);   // FIX5
+        const bool fr_hud   = use_cq ? (s.cq_hud_ok[ii] != 0u)
+                                     : hl_frame_ok(s, slot, f, ii);   // HL1
 
         HRESULT h = s.na->Reset();
         if (SUCCEEDED(h)) h = s.nl->Reset(s.na, nullptr);
@@ -19156,11 +20892,17 @@ void stream_poll()
                     us.pResource = s.nxfer;
                     us.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                     us.PlacedFootprint = s.fp;
-                    us.PlacedFootprint.Offset = slot_off + SEAL_STRIDE;
+                    us.PlacedFootprint.Offset = slot_off + (fr_hud ? s.hud_off : SEAL_STRIDE);
                     ud.pResource = s.tex_in[ii];
                     ud.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                     ud.SubresourceIndex = 0;
                     s.nl->CopyTextureRegion(&ud, 0, 0, 0, &us, nullptr);
+                    if (fr_hud)   // HL1: the frame with the HUD
+                    {
+                        us.PlacedFootprint.Offset = slot_off + SEAL_STRIDE;
+                        ud.pResource = s.tex_ui[ii];
+                        s.nl->CopyTextureRegion(&ud, 0, 0, 0, &us, nullptr);
+                    }
                 }
                 // THE BEFORE-STATE, AND WHY IT IS NOT ONE CONSTANT.
                 //   use_cq        : COMMON. The copy queue's submission decayed
@@ -19175,6 +20917,11 @@ void stream_poll()
                         use_cq ? D3D12_RESOURCE_STATE_COMMON
                                : D3D12_RESOURCE_STATE_COPY_DEST,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (fr_hud)   // HL1: same lifecycle as tex_in
+                    barrier(s.nl, s.tex_ui[ii],
+                            use_cq ? D3D12_RESOURCE_STATE_COMMON
+                                   : D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
                 // ---- T1b: depth, and it follows tex_in exactly ----
                 //
@@ -19778,11 +21525,40 @@ void stream_poll()
                 barrier(s.nl, fin, D3D12_RESOURCE_STATE_COPY_SOURCE,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
+                // FG1: the in-between frame, while this frame's vectors and
+                // depth are still readable. Only when the final pass wrote.
+                bool ui_done = false;   // HL1
+                if (s.fg_on != 0u && !s.fg_failed && final_pass_ok && !s.profile &&
+                    s.present_mode == 0)
+                    ui_done = fg_record(s, s.nl, ii,
+                              s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
+                                  s.mvec_bytes2 != 0 && fr_mvec,
+                              s.depth_mode != 0 && s.tex_depth[ii] != nullptr && fr_depth,
+                              mv_el, f, fr_hud);
+                else if (s.fg_on != 0u)
+                {
+                    // FIX7: an evaluate the generator did not see (final pass
+                    // failed, profile, present mode) - the next one must not
+                    // pair with the frame before it, and AMD must reset.
+                    s.fg_prev_valid = false;
+                    if (s.fsr_up) s.fsr_frame_id += 2ull;
+                }
+                // HL1: no frame generation this frame - the HUD still goes back
+                // onto the real frame. Only when the final pass wrote: adding it
+                // to a held, older output would draw it twice.
+                if (fr_hud && !ui_done && final_pass_ok && s.nr_final != nullptr)
+                    ui_done = ui_apply(s, s.nl, s.nr_final, ii, 0u);
+                if (fr_hud) ++s.hud_eval;
+                else if (s.hud_off != 0) ++s.hud_plain;
+
                 // Back to the mode's resting state - COPY_DEST on the shipped
                 // path, COMMON with the copy queue on, so the copy queue can
                 // take this half again two frames from now.
                 barrier(s.nl, s.tex_in[ii], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         s.tex_in_rest);
+                if (fr_hud)   // HL1: the condition matches the unpack's exactly
+                    barrier(s.nl, s.tex_ui[ii], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            s.tex_in_rest);
 
                 // T1b: depth has the same lifecycle and therefore the same
                 // resting state - tex_in_rest is COPY_DEST on the shipped path
@@ -19914,11 +21690,27 @@ void stream_poll()
                  "flag disagreements (diagnostic, seal vs live flag): %llu | GPU0 (render "
                  "card) StageCopy=%u: in-frame copies %.2f ms + MVec copy %.2f ms on the game's "
                  "queue, staging DMA %.2f ms off it (-1 = not measured), staged slots %llu, "
-                 "staging failures %llu",
+                 "staging failures %llu | FrameGen=%u: generated %llu, presented %llu, "
+                 "skipped for missing MVs %llu, set still being presented %llu | AMD FSR: %s, frames %llu, errors %llu",
                  s.consumed, s.cq_spec_suppressed, s.ll_on, s.ll_age, s.ll_issued, s.ll_hits,
                  s.ll_stale, s.ll_early, s.ll_list_ms, s.ll_copy_ms, s.nr_lost,
                  s.mvec_flag_disagree, s.stage_on, s.g0_in_ms, s.g0_mv_ms, s.g0_dma_ms,
-                 s.stage_submits, s.stage_fail);
+                 s.stage_submits, s.stage_fail, s.fg_on, s.fg_made, g_fg_presented.load(),
+                 s.fg_nomv, g_fg_set_skips.load(),
+                 s.fsr_failed ? "FAILED" : (s.fsr_up ? "up" : "off"), s.fsr_made, s.fsr_errors);
+        mgpu::diag::info(line);
+    }
+    if (s.hud_off != 0 && s.consumed >= s.hud_report_at && s.consumed > 0)   // HL1
+    {
+        s.hud_report_at = s.consumed + 1200ull;
+        snprintf(line, sizeof line,
+                 "[MGPU][HL1] f=%llu HUD-less: GPU0 copies %llu, sealed with it %llu, without %llu, "
+                 "refused (size/format) %llu, lock-skipped %llu | GPU1 frames run HUD-less %llu, "
+                 "ordinary %llu | compositing %s. 'without' counts frames the scene texture was "
+                 "not caught in (menus, loading, before the probe LOCKED).",
+                 s.consumed, s.hud_copies.load(), s.hud_sealed.load(), s.hud_missing.load(),
+                 s.hud_rejects.load(), s.hud_lock_skips.load(), s.hud_eval, s.hud_plain,
+                 s.ui_failed ? "FAILED (off)" : (s.ui_built ? "ready" : "not built yet"));
         mgpu::diag::info(line);
     }
 

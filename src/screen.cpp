@@ -406,7 +406,8 @@ bool translucent_hud_box(ID3D12GraphicsCommandList *cl,
 void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                   unsigned width, unsigned height, int mode,
                   double input_fps, double consumed_fps, double nr_eval_fps,
-                  double nr_skip_fps, double present_fps, double nr_gpu_ms)
+                  double nr_skip_fps, double present_fps, double nr_gpu_ms,
+                  double gen_fps)
 {
     if (cl == nullptr || width == 0 || height == 0 || mode == 0) return;
 
@@ -424,6 +425,7 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
     char line4[48] = {};
     char line5[48] = {};
     char line6[48] = {};
+    char line7[48] = {};   // FG1
     int lines = 1;
     if (mode == 1)
     {
@@ -441,6 +443,11 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
         snprintf(line5, sizeof line5, "PRESENT  %.1f FPS", present_fps);
         snprintf(line6, sizeof line6, "NR GPU   %.2f MS", nr_gpu_ms);
         lines = 6;
+        if (gen_fps >= 0.0)
+        {
+            snprintf(line7, sizeof line7, "GENERATED %.1f FPS", gen_fps);
+            lines = 7;
+        }
     }
 
     int tw = text_width(line1, px, gap);
@@ -454,6 +461,8 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
         tw = text_width(line5, px, gap);
     if (lines >= 6 && text_width(line6, px, gap) > tw)
         tw = text_width(line6, px, gap);
+    if (lines >= 7 && text_width(line7, px, gap) > tw)
+        tw = text_width(line7, px, gap);
     const int box_w = tw + pad * 2;
     const int box_h = line_h * lines + pad * (lines + 1);
     const int x = pad;
@@ -474,6 +483,8 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
         draw_text(cl, rtv, line5, x + pad, y + pad * 5 + line_h * 4, px, gap, fg, W, H);
     if (lines >= 6)
         draw_text(cl, rtv, line6, x + pad, y + pad * 6 + line_h * 5, px, gap, fg, W, H);
+    if (lines >= 7)
+        draw_text(cl, rtv, line7, x + pad, y + pad * 7 + line_h * 6, px, gap, fg, W, H);
 }
 
 } // namespace screen

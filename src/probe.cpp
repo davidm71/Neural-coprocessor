@@ -3043,7 +3043,7 @@ mode mode_from_ini()
         const char *sk = mgpu::config::find(buf, strlen(buf), "SLTags");
         int sv = 0;
         if (sk != nullptr) sv = atoi(sk);
-        g_sltags.store((sv < 0 || sv > 2) ? 0 : sv, std::memory_order_relaxed);
+        g_sltags.store((sv < 0 || sv > 3) ? 0 : sv, std::memory_order_relaxed);   // 3 = SLT3
     }
     {
         // R180/R182. SFPath: the Starfield path. ABSENT IS NOT OFF.
@@ -3710,3 +3710,7 @@ void read(readout &out)
 
 } // namespace probe
 } // namespace mgpu
+
+// HUD1: the HUD-less frame search. Its own file, compiled here so the build
+// files do not change. Off unless HudProbe=1.
+#include "hud_probe.inl"
