@@ -407,7 +407,7 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
                   unsigned width, unsigned height, int mode,
                   double input_fps, double consumed_fps, double nr_eval_fps,
                   double nr_skip_fps, double present_fps, double nr_gpu_ms,
-                  double gen_fps)
+                  double gen_fps, const char (*status)[48], int n_status)
 {
     if (cl == nullptr || width == 0 || height == 0 || mode == 0) return;
 
@@ -419,50 +419,42 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
     const int pad = px * 4;
     const int line_h = 7 * px;
 
-    char line1[48] = {};
-    char line2[48] = {};
-    char line3[48] = {};
-    char line4[48] = {};
-    char line5[48] = {};
-    char line6[48] = {};
-    char line7[48] = {};   // FG1
-    int lines = 1;
+    // Up to 7 FPS lines (FG1) and 6 status lines (ST1).
+    static const int MAXL = 13;
+    char text[MAXL][48] = {};
+    bool is_status[MAXL] = {};
+    int lines = 0;
     if (mode == 1)
     {
         // BASIC shows the final successful MGPU output-present rate.
-        snprintf(line1, sizeof line1, "FPS %.1f", present_fps);
+        snprintf(text[lines++], 48, "FPS %.1f", present_fps);
     }
     else
     {
         // DETAIL exposes both sides of the MGPU pipeline without implying that
         // the producer counter is an independent measurement of game Present.
-        snprintf(line1, sizeof line1, "MGPU IN  %.1f FPS", input_fps);
-        snprintf(line2, sizeof line2, "CONSUMED %.1f FPS", consumed_fps);
-        snprintf(line3, sizeof line3, "NR EVAL  %.1f FPS", nr_eval_fps);
-        snprintf(line4, sizeof line4, "NR SKIP  %.1f FPS", nr_skip_fps);
-        snprintf(line5, sizeof line5, "PRESENT  %.1f FPS", present_fps);
-        snprintf(line6, sizeof line6, "NR GPU   %.2f MS", nr_gpu_ms);
-        lines = 6;
+        snprintf(text[lines++], 48, "MGPU IN  %.1f FPS", input_fps);
+        snprintf(text[lines++], 48, "CONSUMED %.1f FPS", consumed_fps);
+        snprintf(text[lines++], 48, "NR EVAL  %.1f FPS", nr_eval_fps);
+        snprintf(text[lines++], 48, "NR SKIP  %.1f FPS", nr_skip_fps);
+        snprintf(text[lines++], 48, "PRESENT  %.1f FPS", present_fps);
+        snprintf(text[lines++], 48, "NR GPU   %.2f MS", nr_gpu_ms);
         if (gen_fps >= 0.0)
-        {
-            snprintf(line7, sizeof line7, "GENERATED %.1f FPS", gen_fps);
-            lines = 7;
-        }
+            snprintf(text[lines++], 48, "GENERATED %.1f FPS", gen_fps);
+    }
+    for (int i = 0; status != nullptr && i < n_status && lines < MAXL; ++i)
+    {
+        memcpy(text[lines], status[i], 48);
+        text[lines][47] = '\0';
+        is_status[lines++] = true;
     }
 
-    int tw = text_width(line1, px, gap);
-    if (lines >= 2 && text_width(line2, px, gap) > tw)
-        tw = text_width(line2, px, gap);
-    if (lines >= 3 && text_width(line3, px, gap) > tw)
-        tw = text_width(line3, px, gap);
-    if (lines >= 4 && text_width(line4, px, gap) > tw)
-        tw = text_width(line4, px, gap);
-    if (lines >= 5 && text_width(line5, px, gap) > tw)
-        tw = text_width(line5, px, gap);
-    if (lines >= 6 && text_width(line6, px, gap) > tw)
-        tw = text_width(line6, px, gap);
-    if (lines >= 7 && text_width(line7, px, gap) > tw)
-        tw = text_width(line7, px, gap);
+    int tw = 0;
+    for (int i = 0; i < lines; ++i)
+    {
+        const int w = text_width(text[i], px, gap);
+        if (w > tw) tw = w;
+    }
     const int box_w = tw + pad * 2;
     const int box_h = line_h * lines + pad * (lines + 1);
     const int x = pad;
@@ -470,21 +462,12 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
 
     const float bg[4] = { 0.018f, 0.020f, 0.023f, 1.0f };
     const float fg[4] = { 0.88f, 0.90f, 0.94f, 1.0f };
+    const float sf[4] = { 0.55f, 0.85f, 1.00f, 1.0f };   // ST1: status lines, tinted
     if (!translucent_hud_box(cl, rtv, x, y, box_w, box_h, W, H))
         fill(cl, rtv, bg, x, y, box_w, box_h, W, H);
-    draw_text(cl, rtv, line1, x + pad, y + pad, px, gap, fg, W, H);
-    if (lines >= 2)
-        draw_text(cl, rtv, line2, x + pad, y + pad * 2 + line_h, px, gap, fg, W, H);
-    if (lines >= 3)
-        draw_text(cl, rtv, line3, x + pad, y + pad * 3 + line_h * 2, px, gap, fg, W, H);
-    if (lines >= 4)
-        draw_text(cl, rtv, line4, x + pad, y + pad * 4 + line_h * 3, px, gap, fg, W, H);
-    if (lines >= 5)
-        draw_text(cl, rtv, line5, x + pad, y + pad * 5 + line_h * 4, px, gap, fg, W, H);
-    if (lines >= 6)
-        draw_text(cl, rtv, line6, x + pad, y + pad * 6 + line_h * 5, px, gap, fg, W, H);
-    if (lines >= 7)
-        draw_text(cl, rtv, line7, x + pad, y + pad * 7 + line_h * 6, px, gap, fg, W, H);
+    for (int i = 0; i < lines; ++i)
+        draw_text(cl, rtv, text[i], x + pad, y + pad * (i + 1) + line_h * i, px, gap,
+                  is_status[i] ? sf : fg, W, H);
 }
 
 } // namespace screen

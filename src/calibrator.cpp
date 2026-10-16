@@ -43,6 +43,7 @@
 #include "diag.hpp"
 
 #include <tlhelp32.h>
+#include <intrin.h>   // R245: _ReturnAddress for the nvapi trace
 #include <d3d12.h>
 
 #include <atomic>
@@ -118,6 +119,15 @@ const char *const NAME_CREATE = "NVSDK_NGX_D3D12_CreateFeature";
 // calls in one session could be 86 leaks or 86 matched pairs and nothing in any
 // log distinguishes them. Counting releases is what makes "live" a number.
 const char *const NAME_RELEASE = "NVSDK_NGX_D3D12_ReleaseFeature";
+// R232 (DX11 contract, A1). The same three on D3D11: a D3D11 title with a
+// DLSS contract (Rise of the Tomb Raider, nvngx_dlss 2.3.2) resolves these
+// through the same GetProcAddress route. The parameter block is the same
+// object with the same names; the resources behind the names are
+// ID3D11Resource*. The copy goes to the DX11 producer (set_mvec_hook_d3d11),
+// which hops it; the D3D12 copy path is untouched.
+const char *const NAME_EVAL11    = "NVSDK_NGX_D3D11_EvaluateFeature";
+const char *const NAME_CREATE11  = "NVSDK_NGX_D3D11_CreateFeature";
+const char *const NAME_RELEASE11 = "NVSDK_NGX_D3D11_ReleaseFeature";
 
 typedef NVSDK_NGX_Result(NVSDK_CONV *pf_evaluate)(
     ID3D12GraphicsCommandList *InCmdList,
@@ -132,6 +142,18 @@ typedef NVSDK_NGX_Result(NVSDK_CONV *pf_create)(
     NVSDK_NGX_Handle **OutHandle);
 
 typedef NVSDK_NGX_Result(NVSDK_CONV *pf_release)(NVSDK_NGX_Handle *InHandle);
+
+// R232: the D3D11 signatures (nvsdk_ngx.h). Release is the same shape.
+typedef NVSDK_NGX_Result(NVSDK_CONV *pf_evaluate11)(
+    ID3D11DeviceContext *InDevCtx,
+    const NVSDK_NGX_Handle *InFeatureHandle,
+    const NVSDK_NGX_Parameter *InParameters,
+    void *InCallback);
+typedef NVSDK_NGX_Result(NVSDK_CONV *pf_create11)(
+    ID3D11DeviceContext *InDevCtx,
+    NVSDK_NGX_Feature InFeatureID,
+    NVSDK_NGX_Parameter *InParameters,
+    NVSDK_NGX_Handle **OutHandle);
 
 typedef FARPROC(WINAPI *pf_gpa)(HMODULE, LPCSTR);
 
@@ -150,6 +172,10 @@ pf_gpa      g_real_gpa   = nullptr;
 pf_evaluate g_real_eval  = nullptr;
 pf_create   g_real_create= nullptr;
 pf_release  g_real_release = nullptr;   // R183
+pf_evaluate11 g_real_eval11    = nullptr;   // R232
+pf_create11   g_real_create11  = nullptr;   // R232
+pf_release    g_real_release11 = nullptr;   // R232
+std::atomic<unsigned long long> g_evals11{0}, g_copies11{0}, g_skips11{0};   // R232
 
 HMODULE g_self = nullptr;
 
@@ -159,6 +185,9 @@ std::atomic<unsigned long long> g_gpa_calls{0};    // GetProcAddress seen
 std::atomic<unsigned long long> g_resolved{0};     // times NGX eval handed out
 std::atomic<unsigned long long> g_evals{0};        // evaluates intercepted
 std::atomic<unsigned long long> g_captures{0};     // evaluates we read
+// R283: the thread of the evaluates capture() reads (own_reflex's thread guard).
+std::atomic<unsigned long> g_eval_tid_first{0}, g_eval_tid_last{0};
+std::atomic<unsigned>      g_eval_tid_changes{0};
 std::atomic<unsigned long long> g_creates{0};      // CreateFeature seen
 std::atomic<unsigned long long> g_releases{0};     // R183: ReleaseFeature seen
 std::atomic<unsigned long long> g_unlatches{0};    // R180: latched handles freed
@@ -186,6 +215,7 @@ std::atomic<unsigned long long> g_frames{0};
 // errors, all of them ordering.
 typedef void (*pf_mvec_hook)(void *, unsigned long long);
 pf_mvec_hook g_mvec_hook_fn = nullptr;
+pf_mvec_hook g_mvec_hook11_fn = nullptr;   // R232: (ID3D11DeviceContext*, ID3D11Resource*)
 std::atomic<int> g_eval_copy_mode{0};
 std::atomic<unsigned long long> g_eval_copies{0};
 std::atomic<unsigned long long> g_eval_skips{0};
@@ -397,9 +427,22 @@ inline bool ok(NVSDK_NGX_Result r)
 bool get_res(const NVSDK_NGX_Parameter *p, const char *k, unsigned long long &out)
 {
     ID3D12Resource *r = nullptr;
-    if (!ok(p->Get(k, &r)) || r == nullptr) return false;
-    out = (unsigned long long)(uintptr_t)r;
-    return true;
+    if (ok(p->Get(k, &r)) && r != nullptr)
+    {
+        out = (unsigned long long)(uintptr_t)r;
+        return true;
+    }
+    // R233. A value the game set as a D3D11 resource comes back failed through
+    // the ID3D12Resource** overload - a different vtable slot. TR-10: every
+    // resource read null on Rise (D3D11) while the scalars came through. The
+    // D3D12 read above is unchanged; this runs only when it found nothing.
+    ID3D11Resource *r11 = nullptr;
+    if (ok(p->Get(k, &r11)) && r11 != nullptr)
+    {
+        out = (unsigned long long)(uintptr_t)r11;
+        return true;
+    }
+    return false;
 }
 
 bool get_u(const NVSDK_NGX_Parameter *p, const char *k, unsigned int &out)
@@ -486,6 +529,22 @@ void capture(const NVSDK_NGX_Parameter *p)
     g_tbl = t;
     std::atomic_thread_fence(std::memory_order_release);
     g_seq.fetch_add(1u, std::memory_order_release);
+
+    // R283: which thread evaluates the game's scene. One thread-id read and
+    // one load per capture; the stores run only when the thread changes.
+    // The count below is relaxed, so this is no ordering promise; own_reflex
+    // reads the threads a settle (5 s) after the first capture, or every 30
+    // frames, never in the same instant.
+    {
+        const unsigned long tid = (unsigned long)GetCurrentThreadId();
+        const unsigned long was = g_eval_tid_last.load(std::memory_order_relaxed);
+        if (tid != was)
+        {
+            if (was == 0ul) g_eval_tid_first.store(tid, std::memory_order_relaxed);
+            else g_eval_tid_changes.fetch_add(1u, std::memory_order_relaxed);
+            g_eval_tid_last.store(tid, std::memory_order_release);
+        }
+    }
 
     g_captures.fetch_add(1, std::memory_order_relaxed);
     g_cost_ns.fetch_add((unsigned long long)((double)(qpc() - t0) * g_qpc_to_ns),
@@ -664,48 +723,13 @@ NVSDK_NGX_Result NVSDK_CONV hook_release(NVSDK_NGX_Handle *h)
     return g_real_release(h);
 }
 
-NVSDK_NGX_Result NVSDK_CONV hook_create(ID3D12GraphicsCommandList *cl,
-                                        NVSDK_NGX_Feature id,
-                                        NVSDK_NGX_Parameter *p,
-                                        NVSDK_NGX_Handle **out)
+// R232. What hook_create did after the real call, moved here verbatim so the
+// D3D11 create (hook_create11) shares it: fgmap learn, the R134 census line,
+// the R135 scene-handle latch and the create flags. Nothing API-specific.
+static void after_create(NVSDK_NGX_Feature id, NVSDK_NGX_Parameter *p,
+                         NVSDK_NGX_Handle **out, NVSDK_NGX_Result r)
 {
-    g_creates.fetch_add(1, std::memory_order_relaxed);
 
-    // ---- R121: NEVER RETURN WITHOUT ANSWERING THE OUT-HANDLE ----
-    //
-    // The ordering fix above closes the window that made this reachable. This
-    // is the second line of defence, because the failure it produced was a
-    // crash in somebody else's module and the cost of being wrong again is
-    // too high to rely on one fix.
-    //
-    // Two changes. FIRST, try to resolve the real entry point here rather
-    // than giving up - by the time anything calls us the NGX module is loaded
-    // by definition, so a late resolve almost always succeeds. SECOND, if it
-    // genuinely cannot be resolved, ZERO THE OUT-HANDLE before returning
-    // Fail. A caller that ignores the result and dereferences *out then reads
-    // a null it can be blamed for, instead of whatever was on its stack.
-    if (g_real_create == nullptr)
-    {
-        HMODULE ngx = ngx_module();
-        if (ngx != nullptr)
-        {
-            void *late = (void *)(g_real_gpa ? g_real_gpa(ngx, NAME_CREATE)
-                                             : GetProcAddress(ngx, NAME_CREATE));
-            if (late != nullptr && late != (void *)&hook_create)
-                g_real_create = (pf_create)late;
-        }
-    }
-    if (g_real_create == nullptr)
-    {
-        if (out != nullptr) *out = nullptr;
-        mgpu::diag::error(
-            "[MGPU][R121] CreateFeature reached our hook with no real entry point behind it. "
-            "Returning Fail with the out-handle zeroed. THIS SHOULD NOW BE UNREACHABLE: the "
-            "real pointer is published before any slot is patched. If this line appears, the "
-            "ordering fix did not take and the window it closed is open again.");
-        return NVSDK_NGX_Result_Fail;
-    }
-    const NVSDK_NGX_Result r = g_real_create(cl, id, p, out);
 
     // ---- R134: NAME EVERY FEATURE THE GAME CREATES, ONCE PER ID ----
     //
@@ -783,7 +807,446 @@ NVSDK_NGX_Result NVSDK_CONV hook_create(ID3D12GraphicsCommandList *cl,
             g_flags_known.store(true, std::memory_order_relaxed);
         }
     }
+}
+
+NVSDK_NGX_Result NVSDK_CONV hook_create(ID3D12GraphicsCommandList *cl,
+                                        NVSDK_NGX_Feature id,
+                                        NVSDK_NGX_Parameter *p,
+                                        NVSDK_NGX_Handle **out)
+{
+    g_creates.fetch_add(1, std::memory_order_relaxed);
+
+    // ---- R121: NEVER RETURN WITHOUT ANSWERING THE OUT-HANDLE ----
+    //
+    // The ordering fix above closes the window that made this reachable. This
+    // is the second line of defence, because the failure it produced was a
+    // crash in somebody else's module and the cost of being wrong again is
+    // too high to rely on one fix.
+    //
+    // Two changes. FIRST, try to resolve the real entry point here rather
+    // than giving up - by the time anything calls us the NGX module is loaded
+    // by definition, so a late resolve almost always succeeds. SECOND, if it
+    // genuinely cannot be resolved, ZERO THE OUT-HANDLE before returning
+    // Fail. A caller that ignores the result and dereferences *out then reads
+    // a null it can be blamed for, instead of whatever was on its stack.
+    if (g_real_create == nullptr)
+    {
+        HMODULE ngx = ngx_module();
+        if (ngx != nullptr)
+        {
+            void *late = (void *)(g_real_gpa ? g_real_gpa(ngx, NAME_CREATE)
+                                             : GetProcAddress(ngx, NAME_CREATE));
+            if (late != nullptr && late != (void *)&hook_create)
+                g_real_create = (pf_create)late;
+        }
+    }
+    if (g_real_create == nullptr)
+    {
+        if (out != nullptr) *out = nullptr;
+        mgpu::diag::error(
+            "[MGPU][R121] CreateFeature reached our hook with no real entry point behind it. "
+            "Returning Fail with the out-handle zeroed. THIS SHOULD NOW BE UNREACHABLE: the "
+            "real pointer is published before any slot is patched. If this line appears, the "
+            "ordering fix did not take and the window it closed is open again.");
+        return NVSDK_NGX_Result_Fail;
+    }
+    const NVSDK_NGX_Result r = g_real_create(cl, id, p, out);
+    after_create(id, p, out, r);   // R232: the post-call block, moved verbatim to after_create above
     return r;
+}
+
+
+// ---- R232: THE D3D11 THREE ----
+//
+// Same filters as the D3D12 hooks above (scene-feature latch, once per frame,
+// nothing copied from an unidentified handle), same table capture, same
+// counters. The one difference is the copy: there is no barrier on D3D11 and
+// no command list of ours - the resource goes to the DX11 producer through
+// g_mvec_hook11_fn, which copies it on the game's context into a shared
+// texture and hops it. EvalCopy: 1 copies, 2 (auto) ALSO copies here - on
+// D3D11 the evaluate is the only route there is, so auto has nothing to
+// fall back from; 0 copies nothing.
+
+NVSDK_NGX_Result NVSDK_CONV hook_evaluate11(ID3D11DeviceContext *ctx,
+                                            const NVSDK_NGX_Handle *h,
+                                            const NVSDK_NGX_Parameter *p,
+                                            void *cb)
+{
+    g_evals.fetch_add(1, std::memory_order_relaxed);
+    g_evals11.fetch_add(1, std::memory_order_relaxed);
+
+    const int m = g_mode.load(std::memory_order_relaxed);
+    if (m != 0)
+    {
+        bool take = true;
+        if (g_handle_known.load(std::memory_order_relaxed))
+            take = ((unsigned long long)(uintptr_t)h ==
+                    g_sr_handle.load(std::memory_order_relaxed));
+        if (take && m == 1 &&
+            (g_tbl.have & (KEY_MVEC | KEY_MV_SCALE)) == (KEY_MVEC | KEY_MV_SCALE))
+            take = false;
+        if (take)
+        {
+            capture(p);
+            const int ec = g_eval_copy_mode.load(std::memory_order_relaxed);
+            if (ec != 0 && ctx != nullptr && g_mvec_hook11_fn != nullptr)
+            {
+                const unsigned long long fr = g_frames.load(std::memory_order_relaxed);
+                const bool sr_ok =
+                    g_handle_known.load(std::memory_order_relaxed) &&
+                    is_latched_scene_handle((unsigned long long)(uintptr_t)h);
+                if (!sr_ok || g_eval_last_frame == fr)
+                {
+                    g_eval_skips.fetch_add(1, std::memory_order_relaxed);
+                    g_skips11.fetch_add(1, std::memory_order_relaxed);
+                }
+                else
+                {
+                    g_eval_last_frame = fr;
+                    table et;
+                    if (read(et) && (et.have & KEY_MVEC) != 0u && et.mvec != 0ull)
+                    {
+                        g_mvec_hook11_fn((void *)ctx, et.mvec);
+                        g_eval_copies.fetch_add(1, std::memory_order_relaxed);
+                        g_copies11.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    if (g_real_eval11 == nullptr)
+    {
+        HMODULE ngx = ngx_module();
+        if (ngx != nullptr)
+        {
+            void *late = (void *)(g_real_gpa ? g_real_gpa(ngx, NAME_EVAL11)
+                                             : GetProcAddress(ngx, NAME_EVAL11));
+            if (late != nullptr && late != (void *)&hook_evaluate11)
+                g_real_eval11 = (pf_evaluate11)late;
+        }
+    }
+    if (g_real_eval11 == nullptr) return NVSDK_NGX_Result_Fail;
+    return g_real_eval11(ctx, h, p, cb);
+}
+
+NVSDK_NGX_Result NVSDK_CONV hook_release11(NVSDK_NGX_Handle *h)
+{
+    g_releases.fetch_add(1, std::memory_order_relaxed);
+    unlatch_scene_handle((unsigned long long)(uintptr_t)h);
+    if (g_real_release11 == nullptr)
+    {
+        HMODULE ngx = ngx_module();
+        if (ngx != nullptr)
+        {
+            void *late = (void *)(g_real_gpa ? g_real_gpa(ngx, NAME_RELEASE11)
+                                             : GetProcAddress(ngx, NAME_RELEASE11));
+            if (late != nullptr && late != (void *)&hook_release11)
+                g_real_release11 = (pf_release)late;
+        }
+    }
+    if (g_real_release11 == nullptr) return NVSDK_NGX_Result_Fail;
+    return g_real_release11(h);
+}
+
+NVSDK_NGX_Result NVSDK_CONV hook_create11(ID3D11DeviceContext *ctx,
+                                          NVSDK_NGX_Feature id,
+                                          NVSDK_NGX_Parameter *p,
+                                          NVSDK_NGX_Handle **out)
+{
+    g_creates.fetch_add(1, std::memory_order_relaxed);
+    if (g_real_create11 == nullptr)
+    {
+        HMODULE ngx = ngx_module();
+        if (ngx != nullptr)
+        {
+            void *late = (void *)(g_real_gpa ? g_real_gpa(ngx, NAME_CREATE11)
+                                             : GetProcAddress(ngx, NAME_CREATE11));
+            if (late != nullptr && late != (void *)&hook_create11)
+                g_real_create11 = (pf_create11)late;
+        }
+    }
+    if (g_real_create11 == nullptr)
+    {
+        if (out != nullptr) *out = nullptr;
+        mgpu::diag::error("[MGPU][R121] D3D11 CreateFeature reached our hook with no real entry point "
+                          "behind it. Returning Fail with the out-handle zeroed (R232).");
+        return NVSDK_NGX_Result_Fail;
+    }
+    const NVSDK_NGX_Result r = g_real_create11(ctx, id, p, out);
+    {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            mgpu::diag::info("[MGPU][R232] the game creates its DLSS feature on D3D11 "
+                             "(NVSDK_NGX_D3D11_CreateFeature seen): the D3D11 evaluate tap is live.");
+    }
+    after_create(id, p, out, r);
+    return r;
+}
+
+// ---- R236: OBSERVE THE GAME'S NGX INIT ON D3D11 (pass-through) ----
+//
+// Three outcomes by launch timing on Rise (Marcelo, 2026-10-06): NR fine;
+// our NR CreateFeature refused (ERROR 302); a freeze/slowdown shaped like
+// Requiem's. Which of the game's NGX calls races ours is not in any log:
+// the game's Init loads the one NGX core in the process, and nothing
+// timestamps it. These hooks do that and nothing else: every argument is
+// forwarded untouched through a 7-slot x64 forwarder (the exported Init
+// signatures differ by SDK revision in arity; extra slots are ignored by
+// the callee and never read by us beyond logging), the result is returned
+// as received. One line per call, with the real result.
+typedef unsigned long long(NVSDK_CONV *pf_any7)(unsigned long long, unsigned long long, unsigned long long,
+                                                unsigned long long, unsigned long long, unsigned long long,
+                                                unsigned long long);
+const char *const NAME_INIT11     = "NVSDK_NGX_D3D11_Init";
+const char *const NAME_INITEXT11  = "NVSDK_NGX_D3D11_Init_Ext";
+const char *const NAME_INITPID11  = "NVSDK_NGX_D3D11_Init_with_ProjectID";
+const char *const NAME_SHUTDOWN11 = "NVSDK_NGX_D3D11_Shutdown";
+const char *const NAME_SHUTDOWN111= "NVSDK_NGX_D3D11_Shutdown1";
+pf_any7 g_real_init11 = nullptr, g_real_initext11 = nullptr, g_real_initpid11 = nullptr,
+        g_real_shutdown11 = nullptr, g_real_shutdown111 = nullptr;
+std::atomic<unsigned long long> g_game_init11_qpc{0};   // first game NGX init seen (D3D11), qpc
+std::atomic<unsigned long long> g_game_init_entered{0}, g_game_init_returned{0};   // R239
+
+static void say_ngx_call(const char *name, unsigned long long r, bool before)
+{
+    char l[300];
+    snprintf(l, sizeof l, "[MGPU][R236] GAME %s %s%s%s", name,
+             before ? "entered" : "returned",
+             before ? "" : " result=0x",
+             before ? "" : "");
+    if (!before) { const size_t n = strlen(l); snprintf(l + n, sizeof l - n, "%08llX", r); }
+    mgpu::diag::info(l);
+}
+#define MGPU_NGX_OBSERVE(FN, REALPTR, NAME)                                                            \
+    unsigned long long NVSDK_CONV FN(unsigned long long a, unsigned long long b, unsigned long long c,  \
+                                     unsigned long long d, unsigned long long e, unsigned long long f,  \
+                                     unsigned long long g)                                              \
+    {                                                                                                   \
+        unsigned long long zero = 0ull;                                                                 \
+        g_game_init11_qpc.compare_exchange_strong(zero, qpc(), std::memory_order_acq_rel);              \
+        g_game_init_entered.fetch_add(1, std::memory_order_acq_rel);                                    \
+        say_ngx_call(NAME, 0ull, true);                                                                 \
+        if (REALPTR == nullptr) { g_game_init_returned.fetch_add(1, std::memory_order_acq_rel);          \
+                                  return (unsigned long long)NVSDK_NGX_Result_Fail; }                   \
+        const unsigned long long r = REALPTR(a, b, c, d, e, f, g);                                      \
+        g_game_init_returned.fetch_add(1, std::memory_order_acq_rel);                                   \
+        say_ngx_call(NAME, r, false);                                                                   \
+        return r;                                                                                       \
+    }
+MGPU_NGX_OBSERVE(hook_init11,     g_real_init11,     NAME_INIT11)
+MGPU_NGX_OBSERVE(hook_initext11,  g_real_initext11,  NAME_INITEXT11)
+MGPU_NGX_OBSERVE(hook_initpid11,  g_real_initpid11,  NAME_INITPID11)
+MGPU_NGX_OBSERVE(hook_shutdown11, g_real_shutdown11, NAME_SHUTDOWN11)
+MGPU_NGX_OBSERVE(hook_shutdown111,g_real_shutdown111,NAME_SHUTDOWN111)
+#undef MGPU_NGX_OBSERVE
+
+// ---- R245: the nvapi trace (TraceNvapi=1), see calibrator.hpp ----
+std::atomic<int> g_trace_nvapi{0};
+std::atomic<unsigned> g_trace_qi_lines{0}, g_trace_gpa_lines{0};
+std::atomic<unsigned long long> g_trace_qi_calls{0};
+typedef void *(__cdecl *pf_nvapi_qi)(unsigned int);
+pf_nvapi_qi g_real_nvapi_qi = nullptr;
+const unsigned TRACE_QI_CAP = 600u, TRACE_GPA_CAP = 300u;
+
+// Public ids from the NVAPI headers. NGX's own interfaces are not public and
+// print raw; the raw sequence is still the thing to diff between a pass and
+// a fail.
+const char *nvapi_id_name(unsigned int id)
+{
+    switch (id)
+    {
+    case 0x0150E828u: return "NvAPI_Initialize";
+    case 0xD22BDD7Eu: return "NvAPI_Unload";
+    case 0x6C2D048Cu: return "NvAPI_GetErrorMessage";
+    case 0x01053FA5u: return "NvAPI_GetInterfaceVersionString";
+    case 0x2926AAADu: return "NvAPI_SYS_GetDriverAndBranchVersion";
+    case 0xE5AC921Fu: return "NvAPI_EnumPhysicalGPUs";
+    case 0xCEEE8E9Fu: return "NvAPI_GPU_GetFullName";
+    case 0x2DDFB66Eu: return "NvAPI_GPU_GetPCIIdentifiers";
+    case 0x0694D52Eu: return "NvAPI_DRS_CreateSession";
+    case 0x375DBD6Bu: return "NvAPI_DRS_LoadSettings";
+    case 0xFCBC7E14u: return "NvAPI_DRS_SaveSettings";
+    case 0xDAD9CFF8u: return "NvAPI_DRS_DestroySession";
+    case 0xDA8466A0u: return "NvAPI_DRS_GetBaseProfile";
+    case 0xEEE566B2u: return "NvAPI_DRS_FindApplicationByName";
+    case 0x73BF8338u: return "NvAPI_DRS_GetSetting";
+    case 0x577DD202u: return "NvAPI_DRS_SetSetting";
+    case 0x4B708B54u: return "NvAPI_D3D_GetCurrentSLIState";
+    default: return nullptr;
+    }
+}
+
+// Module name for a code address (the caller of a hook, via _ReturnAddress).
+// GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: no reference taken, nothing to
+// free. Base name only.
+void module_of(const void *addr, char *out, size_t n)
+{
+    HMODULE m = nullptr;
+    out[0] = '\0';
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)addr, &m) && m != nullptr)
+    {
+        char full[MAX_PATH] = {};
+        if (GetModuleFileNameA(m, full, sizeof full) != 0)
+        {
+            const char *b = strrchr(full, '\\');
+            snprintf(out, n, "%s", b ? b + 1 : full);
+            return;
+        }
+    }
+    snprintf(out, n, "?@0x%p", addr);
+}
+
+bool is_ngx_module_name(const char *m)
+{
+    return _strnicmp(m, "_nvngx", 6) == 0 || _strnicmp(m, "nvngx_", 6) == 0;
+}
+
+// R245b: three public NVAPI entry points wrapped so their ARGUMENTS and
+// RESULTS are logged, not just the fact of being asked for. Signatures from
+// the public nvapi.h (all __cdecl, status is an int). NVDRS_SETTING_V1 layout
+// (offsets, bytes): version 0 | settingName NvU16[2048] 4 | settingId 4100 |
+// settingType 4104 | settingLocation 4108 | isCurrentPredefined 4112 |
+// isPredefinedValid 4116 | predefinedValue (union, 4100) 4120 | currentValue
+// (union, 4100) 8220. The name is logged so a wrong layout shows as garbage
+// instead of being trusted.
+typedef int (__cdecl *pf_drs_get_setting)(void *session, void *profile, unsigned int id, void *setting);
+typedef int (__cdecl *pf_drs_find_app)(void *session, const unsigned short *name, void **profile, void *app);
+typedef int (__cdecl *pf_sys_drv_ver)(unsigned int *ver, char *branch);
+typedef int (__cdecl *pf_nvapi_status_void)(void);
+typedef int (__cdecl *pf_drs_session)(void *session);
+typedef int (__cdecl *pf_drs_base_profile)(void *session, void **profile);
+pf_nvapi_status_void g_real_nvapi_initialize = nullptr;
+pf_drs_session       g_real_drs_load_settings = nullptr;
+pf_drs_base_profile  g_real_drs_get_base_profile = nullptr;
+pf_drs_get_setting g_real_drs_get_setting = nullptr;
+pf_drs_find_app    g_real_drs_find_app    = nullptr;
+pf_sys_drv_ver     g_real_sys_drv_ver     = nullptr;
+
+void narrow(const unsigned short *w, char *out, size_t n)
+{
+    size_t i = 0;
+    for (; w != nullptr && i + 1 < n && w[i] != 0; ++i) out[i] = (w[i] < 128) ? (char)w[i] : '?';
+    out[i] = '\0';
+}
+
+// R245c: the three results the core holds before the fork. NvAPI_Initialize
+// is the first nvapi call it makes; a status other than 0 there is the
+// simplest reason for it to leave the nvapi route.
+int __cdecl hook_nvapi_initialize(void)
+{
+    const void *caller = _ReturnAddress();
+    const int st = g_real_nvapi_initialize ? g_real_nvapi_initialize() : -1;
+    char from[80]; module_of(caller, from, sizeof from);
+    char l[200];
+    snprintf(l, sizeof l, "[MGPU][R245][NVAPI] NvAPI_Initialize() -> status=%d | from %s tid=%lu",
+             st, from, (unsigned long)GetCurrentThreadId());
+    mgpu::diag::info(l);
+    return st;
+}
+int __cdecl hook_drs_load_settings(void *session)
+{
+    const void *caller = _ReturnAddress();
+    const int st = g_real_drs_load_settings ? g_real_drs_load_settings(session) : -1;
+    char from[80]; module_of(caller, from, sizeof from);
+    char l[200];
+    snprintf(l, sizeof l, "[MGPU][R245][DRS] LoadSettings(session=%p) -> status=%d | from %s tid=%lu",
+             session, st, from, (unsigned long)GetCurrentThreadId());
+    mgpu::diag::info(l);
+    return st;
+}
+int __cdecl hook_drs_get_base_profile(void *session, void **profile)
+{
+    const void *caller = _ReturnAddress();
+    const int st = g_real_drs_get_base_profile ? g_real_drs_get_base_profile(session, profile) : -1;
+    char from[80]; module_of(caller, from, sizeof from);
+    char l[200];
+    snprintf(l, sizeof l, "[MGPU][R245][DRS] GetBaseProfile -> status=%d profile=%p | from %s tid=%lu",
+             st, profile ? *profile : nullptr, from, (unsigned long)GetCurrentThreadId());
+    mgpu::diag::info(l);
+    return st;
+}
+
+int __cdecl hook_drs_get_setting(void *session, void *profile, unsigned int id, void *setting)
+{
+    const void *caller = _ReturnAddress();
+    const int st = g_real_drs_get_setting ? g_real_drs_get_setting(session, profile, id, setting) : -1;
+    char from[80]; module_of(caller, from, sizeof from);
+    char name[120] = "-"; unsigned type = 0xFFFFFFFFu, loc = 0, cur = 0, pre = 0, isp = 0;
+    if (setting != nullptr && st == 0)
+    {
+        const unsigned char *b = (const unsigned char *)setting;
+        narrow((const unsigned short *)(b + 4), name, sizeof name);
+        memcpy(&type, b + 4104, 4); memcpy(&loc, b + 4108, 4); memcpy(&isp, b + 4112, 4);
+        memcpy(&pre, b + 4120, 4); memcpy(&cur, b + 8220, 4);
+    }
+    char l[400];
+    snprintf(l, sizeof l,
+             "[MGPU][R245][DRS] GetSetting id=0x%08X -> status=%d | name=\"%s\" type=%u location=%u "
+             "currentPredefined=%u predefined=0x%08X CURRENT=0x%08X (%u) | from %s tid=%lu",
+             id, st, name, type, loc, isp, pre, cur, cur, from, (unsigned long)GetCurrentThreadId());
+    mgpu::diag::info(l);
+    return st;
+}
+
+int __cdecl hook_drs_find_app(void *session, const unsigned short *appname, void **profile, void *app)
+{
+    const void *caller = _ReturnAddress();
+    const int st = g_real_drs_find_app ? g_real_drs_find_app(session, appname, profile, app) : -1;
+    char from[80]; module_of(caller, from, sizeof from);
+    char nm[260]; narrow(appname, nm, sizeof nm);
+    char l[400];
+    snprintf(l, sizeof l, "[MGPU][R245][DRS] FindApplicationByName \"%s\" -> status=%d profile=%p | from %s tid=%lu",
+             nm, st, profile ? *profile : nullptr, from, (unsigned long)GetCurrentThreadId());
+    mgpu::diag::info(l);
+    return st;
+}
+
+int __cdecl hook_sys_drv_ver(unsigned int *ver, char *branch)
+{
+    const void *caller = _ReturnAddress();
+    const int st = g_real_sys_drv_ver ? g_real_sys_drv_ver(ver, branch) : -1;
+    char from[80]; module_of(caller, from, sizeof from);
+    char l[300];
+    snprintf(l, sizeof l, "[MGPU][R245][SYS] GetDriverAndBranchVersion -> status=%d version=%u branch=\"%.63s\" | from %s tid=%lu",
+             st, ver ? *ver : 0u, (st == 0 && branch) ? branch : "-", from, (unsigned long)GetCurrentThreadId());
+    mgpu::diag::info(l);
+    return st;
+}
+
+void *__cdecl hook_nvapi_qi(unsigned int id)
+{
+    const void *caller = _ReturnAddress();
+    void *p = (g_real_nvapi_qi != nullptr) ? g_real_nvapi_qi(id) : nullptr;
+    // R245b: hand out the wrappers for the three we read arguments of. The
+    // real pointer is the same for every caller, so storing it once is exact.
+    if (p != nullptr)
+    {
+        if (id == 0x0150E828u) { g_real_nvapi_initialize = (pf_nvapi_status_void)p; p = (void *)&hook_nvapi_initialize; }
+        else if (id == 0x375DBD6Bu) { g_real_drs_load_settings = (pf_drs_session)p; p = (void *)&hook_drs_load_settings; }
+        else if (id == 0xDA8466A0u) { g_real_drs_get_base_profile = (pf_drs_base_profile)p; p = (void *)&hook_drs_get_base_profile; }
+        else if (id == 0x73BF8338u) { g_real_drs_get_setting = (pf_drs_get_setting)p; p = (void *)&hook_drs_get_setting; }
+        else if (id == 0xEEE566B2u) { g_real_drs_find_app = (pf_drs_find_app)p; p = (void *)&hook_drs_find_app; }
+        else if (id == 0x2926AAADu) { g_real_sys_drv_ver = (pf_sys_drv_ver)p; p = (void *)&hook_sys_drv_ver; }
+    }
+    g_trace_qi_calls.fetch_add(1, std::memory_order_relaxed);
+    const unsigned n = g_trace_qi_lines.fetch_add(1, std::memory_order_relaxed);
+    if (n < TRACE_QI_CAP)
+    {
+        char from[80]; module_of(caller, from, sizeof from);
+        const char *nm = nvapi_id_name(id);
+        char l[300];
+        snprintf(l, sizeof l,
+                 "[MGPU][R245][NVAPI] QueryInterface id=0x%08X%s%s%s -> %s | from %s tid=%lu",
+                 id, nm ? " (" : "", nm ? nm : "", nm ? ")" : "",
+                 p ? "ok" : "NULL", from, (unsigned long)GetCurrentThreadId());
+        mgpu::diag::info(l);
+    }
+    else if (n == TRACE_QI_CAP)
+        mgpu::diag::info("[MGPU][R245][NVAPI] cap reached: further QueryInterface lines not written (the count continues)");
+    return p;
 }
 
 FARPROC WINAPI hook_gpa(HMODULE mod, LPCSTR name)
@@ -796,6 +1259,32 @@ FARPROC WINAPI hook_gpa(HMODULE mod, LPCSTR name)
     if (real == nullptr || name == nullptr || ((ULONG_PTR)name >> 16) == 0) return real;
 
     g_gpa_calls.fetch_add(1, std::memory_order_relaxed);
+
+    // R245: the trace. Off = these two tests and nothing else.
+    if (g_trace_nvapi.load(std::memory_order_relaxed) != 0)
+    {
+        char from[80]; module_of(_ReturnAddress(), from, sizeof from);
+        if (is_ngx_module_name(from))
+        {
+            const unsigned n = g_trace_gpa_lines.fetch_add(1, std::memory_order_relaxed);
+            if (n < TRACE_GPA_CAP)
+            {
+                char tgt[80]; module_of((const void *)mod, tgt, sizeof tgt);
+                char l[300];
+                snprintf(l, sizeof l, "[MGPU][R245][GPA] %s asks %s for %s | tid=%lu",
+                         from, tgt, name, (unsigned long)GetCurrentThreadId());
+                mgpu::diag::info(l);
+            }
+        }
+        if (std::strcmp(name, "nvapi_QueryInterface") == 0)
+        {
+            g_real_nvapi_qi = (pf_nvapi_qi)real;
+            char l[200];
+            snprintf(l, sizeof l, "[MGPU][R245][NVAPI] nvapi_QueryInterface resolved by %s - forwarder installed", from);
+            mgpu::diag::info(l);
+            return (FARPROC)&hook_nvapi_qi;
+        }
+    }
 
     if (std::strcmp(name, NAME_EVAL) == 0)
     {
@@ -813,6 +1302,29 @@ FARPROC WINAPI hook_gpa(HMODULE mod, LPCSTR name)
         g_real_release = (pf_release)real;
         return (FARPROC)&hook_release;
     }
+    // R232: the D3D11 three.
+    if (std::strcmp(name, NAME_EVAL11) == 0)
+    {
+        g_real_eval11 = (pf_evaluate11)real;
+        g_resolved.fetch_add(1, std::memory_order_relaxed);
+        return (FARPROC)&hook_evaluate11;
+    }
+    if (std::strcmp(name, NAME_CREATE11) == 0)
+    {
+        g_real_create11 = (pf_create11)real;
+        return (FARPROC)&hook_create11;
+    }
+    if (std::strcmp(name, NAME_RELEASE11) == 0)
+    {
+        g_real_release11 = (pf_release)real;
+        return (FARPROC)&hook_release11;
+    }
+    // R236: observe-only.
+    if (std::strcmp(name, NAME_INIT11) == 0)      { g_real_init11 = (pf_any7)real;      return (FARPROC)&hook_init11; }
+    if (std::strcmp(name, NAME_INITEXT11) == 0)   { g_real_initext11 = (pf_any7)real;   return (FARPROC)&hook_initext11; }
+    if (std::strcmp(name, NAME_INITPID11) == 0)   { g_real_initpid11 = (pf_any7)real;   return (FARPROC)&hook_initpid11; }
+    if (std::strcmp(name, NAME_SHUTDOWN11) == 0)  { g_real_shutdown11 = (pf_any7)real;  return (FARPROC)&hook_shutdown11; }
+    if (std::strcmp(name, NAME_SHUTDOWN111) == 0) { g_real_shutdown111 = (pf_any7)real; return (FARPROC)&hook_shutdown111; }
     return real;
 }
 
@@ -1384,6 +1896,29 @@ std::mutex g_install_cs;
 
 // ---------------------------------------------------------------------------
 
+// R245: public, outside the anonymous namespace (the hook and the walker it
+// calls are inside it, declared above).
+void set_trace_nvapi(bool on)
+{
+    const int was = g_trace_nvapi.exchange(on ? 1 : 0, std::memory_order_acq_rel);
+    if (on && was == 0)
+        mgpu::diag::warn("[MGPU][R245] nvapi trace ON (TraceNvapi=1): a debug instrument, not a setting - "
+                         "every nvapi_QueryInterface and every GetProcAddress by the NGX core or the NR snippet "
+                         "is logged. Set TraceNvapi=0 when the question is answered.");
+}
+
+unsigned rescan_now()
+{
+    if (g_trace_nvapi.load(std::memory_order_relaxed) == 0) return 0;
+    if (g_real_gpa == nullptr) return 0;
+    const int rung = g_rung.load(std::memory_order_relaxed);
+    if (rung != 0 && rung != 1) return 0;
+    const unsigned hits = scan_and_patch((void *)g_real_gpa, (void *)&hook_gpa);
+    if (hits != 0) g_slots.fetch_add(hits, std::memory_order_relaxed);
+    return hits;
+}
+
+
 std::atomic<int> g_jmode{0};
 float g_jpx = 0.0f, g_jpy = 0.0f;
 bool  g_jprobed = false;
@@ -1393,12 +1928,45 @@ void set_mvec_hook(void (*fn)(void *, unsigned long long))
     g_mvec_hook_fn = fn;
 }
 
+// R232.
+void set_mvec_hook_d3d11(void (*fn)(void *, unsigned long long))
+{
+    g_mvec_hook11_fn = fn;
+}
+
 // R118. The getter, so gpu1_context can ask what the user set WITHOUT
 // reading mgpu.ini a second time. The ini is parsed in exactly one place and
 // that rule is worth more than the three lines this saves.
+// R239. For gpu1_context's own NGX inits: is one of the game's NGX inits
+// inside the core right now (entered and not yet returned)?
+bool game_ngx_init_in_flight()
+{
+    return g_game_init_entered.load(std::memory_order_acquire) >
+           g_game_init_returned.load(std::memory_order_acquire);
+}
+bool game_ngx_init_seen()
+{
+    return g_game_init_entered.load(std::memory_order_acquire) != 0ull;
+}
+
 int eval_copy_mode()
 {
     return g_eval_copy_mode.load(std::memory_order_relaxed);
+}
+
+unsigned long long eval_copies()   // R280o
+{
+    return g_eval_copies.load(std::memory_order_relaxed);
+}
+
+unsigned long long scene_captures()   // R281
+{
+    return g_captures.load(std::memory_order_relaxed);
+}
+
+bool installed()   // R281
+{
+    return g_installed.load(std::memory_order_relaxed);
 }
 
 void set_eval_copy(int mode)

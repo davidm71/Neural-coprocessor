@@ -51,6 +51,24 @@ add_library(mgpu_bridge SHARED
     # SLTags= is set in mgpu.ini, so this source compiles into every build
     # and touches nothing in any of them until it is asked for.
     src/sl_tags.cpp
+    # 0.3.1 backport (R227). DX11 transport-hop probe, OFF unless Dx11Probe=1.
+    # Holds no ReShade type and no gpu1_context type; nothing on GPU 1.
+    src/dx11_probe.cpp
+    # 0.3.1 backport (R227). The DX11 producer, OFF unless DX11=1 and only
+    # ever called from a D3D11 game device; owns a D3D12 device on the game
+    # adapter and feeds the existing stream producer. No ReShade type.
+    src/dx11_producer.cpp
+    # 0.3.1 backport (R253). Motion-vector census for D3D11 titles.
+    # Observe-only, OFF unless MVecCensus=1; registers its own ReShade events.
+    src/mvec_census.cpp
+    # 0.3.1 backport (R279). TexCensus=1 instrument, off by default.
+    src/tex_census.cpp
+    # 0.3.1 backport (R280). The virtual velocity target for D3D12 titles
+    # without an NGX contract; inert on a title that initialises NGX.
+    src/mvec_extract.cpp
+    # 0.3.1 backport (R208). Optional FP16 input to DLSS-NR, OFF unless
+    # NRInput16=4. Holds no gpu1_context type.
+    src/nr16.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -131,6 +149,12 @@ target_compile_definitions(mgpu_bridge PRIVATE
     _CRT_SECURE_NO_WARNINGS
     UNICODE
     _UNICODE
+    # 0.3.1 backport: some games ship an msvcp140.dll older than 14.40 in
+    # their folder and the process loads that copy. VS 2022 17.10+ made
+    # std::mutex's constructor constexpr; such a build crashes at its first
+    # mutex use (0xC0000005) against the old runtime. Microsoft's documented
+    # switch for exactly that case.
+    _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR
 )
 
 # dxgi: factory + EnumAdapters1 (T2). d3d12: the private device (T3).

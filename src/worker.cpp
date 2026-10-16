@@ -489,6 +489,27 @@ namespace
         bool pump = false;
         bool failed_permanently = false;
         bool have_chain = false;   // T5: the present chain was created
+        // R246: the startup NGX probe, deferred (see gpu1_context.hpp).
+        bool      ngx_probe_pending = false;
+        int       r282_state = 0;   // R282: 0 not decided, 1 holding for the game's scene, 2 no hold, 3 released
+        ULONGLONG ngx_probe_t0 = 0;
+        const unsigned long long NGX_PROBE_DEFER_MAX_MS = 15000;
+        // R247: reload-and-retry after a refused first Init (gpu1_context.hpp).
+        bool               ngx_retry_pending = false;
+        unsigned           ngx_retry_n = 0;
+        const unsigned     NGX_RETRY_MAX = 3;
+        const unsigned long long NGX_RETRY_GAP_FRAMES = 30;    // game frames between tries (R247)
+        const unsigned long long NGX_RETRY_GAP_MAX_MS = 2000;  // bound if the game stops rendering (R247)
+        // R248: tries are spaced by seconds (the R247 run put all three inside
+        // 900 ms, which tested fresh modules, not later time), and the first
+        // Init and each retry wait, bounded, while a previous instance of this
+        // executable is still alive.
+        const unsigned long long NGX_RETRY_GAP_MS = 3000;
+        const unsigned long long NGX_PREV_INSTANCE_WAIT_MAX_MS = 20000;
+        bool               ngx_prev_wait_logged = false;
+        ULONGLONG          ngx_prev_wait_t0 = 0;
+        unsigned long long ngx_retry_at_frames = 0;
+        ULONGLONG          ngx_retry_t0 = 0;
         bool hotkey_ok = false;            // P1.3g: CTRL+ALT+F10 registered
         unsigned manual_runs = 0;          // P1.3g: how many on-demand runs so far
 
@@ -872,7 +893,36 @@ namespace
                         // created against. The return value is deliberately
                         // ignored: the probe logs its own verdict, and a
                         // failure must not change how the bridge behaves.
-                        (void)mgpu::gpu1::ngx_probe(1280, 720);
+                        // R246: not here any more unless NgxProbeAtStart=1.
+                        // Here is ~1 s into the process, while the game is
+                        // still in its own startup, and that is the window
+                        // in which the core answers OutOfDate and the answer
+                        // sticks for the process. Deferred to the present
+                        // loop, after the game's first rendered frame.
+                        if (mgpu::gpu1::ngx_probe_at_start())
+                        {
+                            mgpu::diag::info("[MGPU][R246] NgxProbeAtStart=1: the NGX probe runs now, "
+                                             "before the present loop (the pre-R246 place).");
+                            (void)mgpu::gpu1::ngx_probe(1280, 720);
+                            mgpu::gpu1::note_ngx_probe_ran();   // R290
+                            if (mgpu::gpu1::ngx_probe_init_was_outofdate())
+                            {
+                                ngx_retry_pending = true; ngx_retry_n = 0;
+                                ngx_retry_at_frames = mgpu::gpu1::game_effects_frames() + NGX_RETRY_GAP_FRAMES;
+                                ngx_retry_t0 = GetTickCount64();
+                            }
+                        }
+                        else
+                        {
+                            ngx_probe_pending = true;
+                            ngx_probe_t0 = GetTickCount64();
+                            mgpu::diag::info("[MGPU][R246] NGX probe DEFERRED: it runs from the present "
+                                             "loop once the game has delivered its first frame "
+                                             "(finish_effects), or after 15 s, whichever comes first. "
+                                             "The first NGX Init in this process is then made after "
+                                             "the game's own startup, not during it. NgxProbeAtStart=1 "
+                                             "restores the old place.");
+                        }
 
                         // P1.3: the first milestone that touches the bus.
                         // Runs whatever the NGX probe reported - the two
@@ -1157,6 +1207,152 @@ namespace
                 // whenever nothing new has arrived, which is most iterations
                 // while the game is still loading - exactly the window AutoArm
                 // is counting through.
+                // R246: the deferred startup probe. Runs once, here, on the
+                // bridge thread, the first iteration after the game's first
+                // finish_effects (or at the bound). It stalls this loop for
+                // the probe's duration exactly as the hotkey probe chain does;
+                // the game is not touched.
+                if (ngx_probe_pending)
+                {
+                    const unsigned long long gf = mgpu::gpu1::game_effects_frames();
+                    const unsigned long long waited = GetTickCount64() - ngx_probe_t0;
+                    // R282 (gpu1_context.cpp). The shipped deferral is unchanged. The
+                    // first time it is ready, R282 decides ONCE whether the probe also
+                    // waits for the game's first DLSS evaluate, with no time limit. Not
+                    // applied: "ready" is exactly the shipped condition, in this same
+                    // iteration.
+                    const bool shipped_ready = (gf >= 1ull || waited >= NGX_PROBE_DEFER_MAX_MS);
+                    if (shipped_ready && r282_state == 0)
+                    {
+                        char why[320];
+                        r282_state = mgpu::gpu1::ngx_probe_scene_hold_decide(why, sizeof why) ? 1 : 2;
+                        mgpu::diag::info(why);
+                    }
+                    // R290: the depth hold's fallback also releases it (it fires only once
+                    // the game's DLSS has been seen).
+                    if (r282_state == 1 && (mgpu::gpu1::ngx_probe_scene_seen() || mgpu::gpu1::depth_fallback_requested()))
+                    {
+                        r282_state = 3;
+                        const bool seen = mgpu::gpu1::ngx_probe_scene_seen();
+                        snprintf(line, sizeof line, "[MGPU][R282] probe released %llu ms after the present chain: %s", waited,
+                                 seen ? "the game's first DLSS evaluate was seen."
+                                      : "R290 - the game's DLSS was seen and the depth hold reached DepthHoldMax.");
+                        mgpu::diag::info(line);
+                    }
+                    const bool ready = shipped_ready && r282_state != 1;
+                    unsigned long prev_pid = 0;
+                    const unsigned prev_n = (ready
+                                             ? mgpu::gpu1::other_instances_of_this_exe(&prev_pid) : 0u);
+                    if (ready && prev_n != 0u)
+                    {
+                        // R248: a previous instance of this exe is still alive.
+                        if (ngx_prev_wait_t0 == 0) ngx_prev_wait_t0 = GetTickCount64();
+                        const unsigned long long pw = GetTickCount64() - ngx_prev_wait_t0;
+                        if (!ngx_prev_wait_logged)
+                        {
+                            ngx_prev_wait_logged = true;
+                            snprintf(line, sizeof line,
+                                     "[MGPU][R248] a PREVIOUS INSTANCE of this executable is still running (pid %lu, %u in "
+                                     "all) at the moment of the first NGX Init. Waiting for it to exit before the Init, "
+                                     "up to %llu ms.", prev_pid, prev_n, NGX_PREV_INSTANCE_WAIT_MAX_MS);
+                            mgpu::diag::warn(line);
+                        }
+                        if (pw < NGX_PREV_INSTANCE_WAIT_MAX_MS) { /* keep presenting; try again next iteration */ }
+                        else
+                        {
+                            snprintf(line, sizeof line,
+                                     "[MGPU][R248] the previous instance (pid %lu) is STILL running after %llu ms - going "
+                                     "ahead with the Init anyway.", prev_pid, pw);
+                            mgpu::diag::warn(line);
+                        }
+                    }
+                    if (ready &&
+                        (prev_n == 0u || (GetTickCount64() - ngx_prev_wait_t0) >= NGX_PREV_INSTANCE_WAIT_MAX_MS))
+                    {
+                        ngx_probe_pending = false;
+                        if (ngx_prev_wait_logged && prev_n == 0u)
+                        {
+                            snprintf(line, sizeof line,
+                                     "[MGPU][R248] the previous instance has exited (%llu ms after it was first seen); "
+                                     "making the first NGX Init now.", GetTickCount64() - ngx_prev_wait_t0);
+                            mgpu::diag::info(line);
+                        }
+                        else if (!ngx_prev_wait_logged)
+                            mgpu::diag::info("[MGPU][R248] no other instance of this executable is running at the first NGX Init.");
+                        snprintf(line, sizeof line,
+                                 "[MGPU][R246] running the deferred NGX probe now: game frames seen=%llu, "
+                                 "%llu ms after the present chain%s. Its Init is the first NGX Init in "
+                                 "this process.",
+                                 gf, waited, (gf == 0ull) ? " - BOUND reached, the game has rendered nothing yet" : "");
+                        mgpu::diag::info(line);
+                        (void)mgpu::gpu1::ngx_probe(1280, 720);
+                        mgpu::gpu1::note_ngx_probe_ran();   // R290
+                        if (mgpu::gpu1::ngx_probe_init_was_outofdate())
+                        {
+                            ngx_retry_pending = true; ngx_retry_n = 0;
+                            ngx_retry_at_frames = mgpu::gpu1::game_effects_frames() + NGX_RETRY_GAP_FRAMES;
+                            ngx_retry_t0 = GetTickCount64();
+                            mgpu::diag::warn("[MGPU][R247] the first NGX Init was refused (OutOfDate). On a title with no NGX "
+                                             "contract the core and the snippet are this add-on's own, so they are unloaded, "
+                                             "reloaded and the Init made again - up to 3 tries, spaced by the game's frames.");
+                        }
+                    }
+                }
+
+                // R247: the retry. Same place as the deferred probe, same
+                // thread; the whole probe runs again (locator, loads, Init).
+                if (ngx_retry_pending && !ngx_probe_pending)
+                {
+                    const unsigned long long gf = mgpu::gpu1::game_effects_frames();
+                    const unsigned long long waited = GetTickCount64() - ngx_retry_t0;
+                    (void)gf; (void)NGX_RETRY_GAP_FRAMES; (void)NGX_RETRY_GAP_MAX_MS;
+                    unsigned long rp = 0; unsigned rn = 0; bool held = false;
+                    if (waited >= NGX_RETRY_GAP_MS)
+                    {
+                        rn = mgpu::gpu1::other_instances_of_this_exe(&rp);
+                        held = (rn != 0u && waited < NGX_PREV_INSTANCE_WAIT_MAX_MS);
+                        if (held && !ngx_prev_wait_logged)
+                        {
+                            ngx_prev_wait_logged = true;
+                            snprintf(line, sizeof line, "[MGPU][R248] retry held: a previous instance (pid %lu) is still "
+                                                        "running; retrying once it has exited (bounded).", rp);
+                            mgpu::diag::warn(line);
+                        }
+                    }
+                    if (waited >= NGX_RETRY_GAP_MS && !held)
+                    {
+                        ++ngx_retry_n;
+                        char why[400];
+                        snprintf(line, sizeof line, "[MGPU][R248] retry %u: %u other instance(s) of this executable alive "
+                                                    "(first pid %lu); %llu ms since the last try.",
+                                 ngx_retry_n, rn, rp, waited);
+                        mgpu::diag::info(line);
+                        const bool can = mgpu::gpu1::ngx_reload_for_retry(why, sizeof why);
+                        snprintf(line, sizeof line, "[MGPU][R247] retry %u/%u: %s", ngx_retry_n, NGX_RETRY_MAX, why);
+                        mgpu::diag::info(line);
+                        if (can) (void)mgpu::gpu1::ngx_probe(1280, 720);
+                        if (!can || !mgpu::gpu1::ngx_probe_init_was_outofdate())
+                        {
+                            ngx_retry_pending = false;
+                            mgpu::diag::info(can ? "[MGPU][R247] retry: the Init was ACCEPTED - NR can start on this launch "
+                                                   "after all. The refused state lived in the modules that were reloaded."
+                                                 : "[MGPU][R247] retry: not possible on this title (see the line above).");
+                        }
+                        else if (ngx_retry_n >= NGX_RETRY_MAX)
+                        {
+                            ngx_retry_pending = false;
+                            mgpu::diag::warn("[MGPU][R247] retry: every try was refused (OutOfDate). The refused state is not "
+                                             "inside the modules this add-on loads; it is outside this process. NR will not "
+                                             "start on this launch. Relaunching the game is what clears it.");
+                        }
+                        else
+                        {
+                            ngx_retry_at_frames = mgpu::gpu1::game_effects_frames() + NGX_RETRY_GAP_FRAMES;
+                            ngx_retry_t0 = GetTickCount64();
+                        }
+                    }
+                }
+
                 // V19. THE PANEL ARMS, AND HOLDS AUTOARM WHILE IT IS OPEN.
                 // Taken before the AutoArm block so a manual arm always wins.
                 if (mgpu::gpu1::ui_take_arm_request())

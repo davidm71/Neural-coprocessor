@@ -192,6 +192,9 @@ void on_init_resource_hp(reshade::api::device *device, const reshade::api::resou
                          const reshade::api::subresource_data *, reshade::api::resource_usage,
                          reshade::api::resource resource)
 {
+    // 0.3.1 backport: D3D12 only. A D3D11 game streams through the DX11
+    // producer's own D3D12 copies; its resources never reach this path.
+    if (device == nullptr || device->get_api() != reshade::api::device_api::d3d12) return;
     if (desc.type != reshade::api::resource_type::texture_2d) return;
     if (desc.texture.samples > 1 || desc.texture.depth_or_layers > 1) return;
     const unsigned fmt = static_cast<unsigned>(desc.texture.format);
@@ -308,6 +311,7 @@ void on_barrier_hp(reshade::api::command_list *cl, uint32_t count,
                    const reshade::api::resource_usage *new_states)
 {
     if (res == nullptr || count == 0 || cl == nullptr) return;
+    if (cl->get_device() == nullptr || cl->get_device()->get_api() != reshade::api::device_api::d3d12) return;   // D3D12 only
     // Our own copy barriers must never come back through here holding g_lk.
     static thread_local bool t_in = false;
     if (t_in) return;
@@ -753,6 +757,10 @@ void note_frame(void *effect_runtime_ptr, void *command_list_ptr)
     reshade::api::effect_runtime *rt = static_cast<reshade::api::effect_runtime *>(effect_runtime_ptr);
     reshade::api::command_list *cl = static_cast<reshade::api::command_list *>(command_list_ptr);
     if (rt == nullptr) return;
+    // D3D12 game only: the HUD-less copy is recorded on the game's own D3D12
+    // list. On a D3D11 game (DX11 producer) nothing here runs, so HudLess=1
+    // simply never locks and frame generation uses the frame with the HUD.
+    if (rt->get_device() == nullptr || rt->get_device()->get_api() != reshade::api::device_api::d3d12) return;
     ++g_frame;
 
     // Back buffers and the display size, from the game's own swapchain.

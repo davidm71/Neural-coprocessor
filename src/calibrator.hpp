@@ -199,6 +199,21 @@ bool read(table &out);
 // dllmain needs exactly two lines total: install() and this.
 void note_frame();
 
+// R245 (DEBUG INSTRUMENT, not a shipping feature; TraceNvapi=1 in mgpu.ini,
+// default off, and off means not one line of this runs). Answers "what does
+// the NGX core ask nvapi for during an Init that returns OutOfDate, against
+// one that returns Success" (Skyrim SK-6/6b/8 vs SK-6c/7: identical on our
+// side up to the call, different answer). hook_gpa answers
+// "nvapi_QueryInterface" with a forwarder that logs every interface id asked
+// for (named from a table where the id is public, raw otherwise), the module
+// asking, the thread and the time, then forwards; it also logs every
+// GetProcAddress the NGX core or the NR snippet makes. rescan_now() patches
+// the import tables of modules loaded after install - the core is one, it
+// loads 200 ms before the Init - and is called right before each of our
+// Inits when the trace is on. Both are no-ops with the trace off.
+void set_trace_nvapi(bool on);
+unsigned rescan_now();
+
 // Writes the R101 line: what was hooked, what was read, what was missing, and
 // the measured per-frame cost in nanoseconds. Called on the same cadence as
 // the other periodic reports.
@@ -254,12 +269,34 @@ void override_scale(float &sx, float &sy);
 // transition is what crashed R85, which is why this is OFF by default and
 // behind its own key: MvecFromEval=1.
 void set_mvec_hook(void (*fn)(void *cmd_list, unsigned long long handle));
+// R232 (DX11 contract A1). The same, for the game's D3D11 DLSS evaluate:
+// fn(ID3D11DeviceContext*, ID3D11Resource* motion vectors). Fires at most
+// once per frame, scene feature only, under the same filters as the D3D12
+// copy. The DX11 producer is the only consumer.
+void set_mvec_hook_d3d11(void (*fn)(void *context, unsigned long long resource));
 void set_eval_copy(int mode);
 
 // R118. What the ini asked for: 0 off, 1 on, 2 AUTO. Read by gpu1_context so
 // the auto-fallback can tell "the user wants auto" from "the user said on",
 // without a second parse of mgpu.ini.
 int eval_copy_mode();
+// R280o. How many motion-vector copies the evaluate route has made (the same
+// counter the [R101] line prints as eval-copies). Non-zero = the evaluate
+// route has DELIVERED on this title. Lock-free.
+unsigned long long eval_copies();
+// R281. How many of the game's DLSS evaluates the calibrator has read (the
+// same counter the [R101] line prints as captured). Non-zero = the game's
+// scene has started evaluating. own_reflex's Streamline wait reads it once
+// per present while it waits. Lock-free: one load.
+unsigned long long scene_captures();
+// R281. The calibrator's hooks are in (install ran, uninstall has not), so
+// scene_captures() can move. Lock-free: one load.
+bool installed();
+// R239 (DX11_CONTRACT section 12). The game's NGX Init observed by R236:
+// in_flight = entered and not returned yet; seen = at least one entered.
+// gpu1_context waits (bounded) before its own Init while one is in flight.
+bool game_ngx_init_in_flight();
+bool game_ngx_init_seen();
 
 void set_jitter_mode(int mode);
 

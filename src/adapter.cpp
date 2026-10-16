@@ -701,6 +701,42 @@ void on_swapchain(::reshade::api::swapchain *swapchain, bool resize)
     try_select_locked(S);
 }
 
+// R227. See adapter.hpp. Written the same way as on_swapchain's D3D12 tail
+// so the two cannot drift: record, log, enumerate, select, set the event.
+void note_game_luid_d3d11(unsigned long long luid_low, long luid_high)
+{
+    ensure_init();
+    LUID luid{};
+    luid.LowPart = (DWORD)luid_low;
+    luid.HighPart = (LONG)luid_high;
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+    char line[320];
+    if (S.result.game_luid_from_swapchain)
+    {
+        snprintf(line, sizeof line,
+                 "[MGPU][T2] dx11 producer luid=0x%08X-0x%08X - swapchain-derived game luid "
+                 "0x%08X-0x%08X already established; not re-selecting",
+                 (unsigned)luid.HighPart, (unsigned)luid.LowPart,
+                 (unsigned)S.result.game_luid.HighPart, (unsigned)S.result.game_luid.LowPart);
+        mgpu::diag::info(line);
+        return;
+    }
+    S.result.game_luid = luid;
+    S.result.game_luid_known = true;
+    S.result.game_luid_from_swapchain = true;
+    snprintf(line, sizeof line,
+             "[MGPU][T2] dx11 producer: game luid=0x%08X-0x%08X established from the game's D3D11 "
+             "device's adapter (a D3D11 chain cannot say it)%s",
+             (unsigned)luid.HighPart, (unsigned)luid.LowPart,
+             S.provisional_known ? " - overrides the provisional init_device value"
+                                 : " - no provisional value had been captured");
+    mgpu::diag::info(line);
+    if (!S.table_enumerated)
+        enumerate_table_locked(S);
+    try_select_locked(S);
+}
+
 void shutdown()
 {
     auto &S = st();

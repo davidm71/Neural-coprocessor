@@ -215,7 +215,8 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl,
                   unsigned width, unsigned height, int mode,
                   double input_fps, double consumed_fps, double nr_eval_fps,
                   double nr_skip_fps, double present_fps, double nr_gpu_ms,
-                  double gen_fps = -1.0);   // FG1: < 0 hides the GENERATED line
+                  double gen_fps = -1.0,    // FG1: < 0 hides the GENERATED line
+                  const char (*status)[48] = nullptr, int n_status = 0);   // ST1: StatusHud=1 lines
 
 void draw(ID3D12GraphicsCommandList *cl,
           D3D12_CPU_DESCRIPTOR_HANDLE rtv,

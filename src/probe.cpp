@@ -682,6 +682,18 @@ float half_to_float(unsigned short h)
 
 std::atomic<int> g_mv_mode;                    // ini MVecProbe: 0 off, 1 on
 std::atomic<unsigned> g_mv_index;              // which RTV-ranked candidate
+std::atomic<unsigned> g_mvec_pick_n{0};        // R277d: MVecCandidate, which eligible transport candidate (0 = the rule's pick)
+unsigned long long g_mvec_pick_said = 0;       // R277d: the last pick logged
+std::atomic<unsigned> g_mvec_elig_n{0};         // R278: eligible candidates at the last pick
+std::atomic<bool> g_tap12_active{false};       // R278e: the D3D12 tap has run this session
+std::atomic<bool> g_mvec_defer{false};        // R280: mvec_extract asks the dump not to publish a source yet
+// R278f: the sorted eligible list as of the last pick, and the current pick's
+// neighbours: the next candidate of the SAME size (switchable live - same slot
+// layout) and the first one of the next size down (needs a new launch).
+std::mutex g_snap_cs;
+unsigned long long g_snap_h[16] = {}; unsigned g_snap_w[16] = {}, g_snap_hh[16] = {}, g_snap_fmt[16] = {}; unsigned g_snap_n = 0;
+std::atomic<int> g_pick_idx{0}, g_next_same{-1}, g_next_class{-1};
+std::atomic<bool> g_pick_locked{false};   // R278f-r: the stream is producing - the dump keeps its current source
 std::atomic<unsigned long long> g_mv_target;   // its resource handle
 std::atomic<unsigned> g_mv_w, g_mv_h, g_mv_fmt;
 
@@ -2208,6 +2220,9 @@ void dump()
             // knows nothing about e.
             unsigned long long pick = 0, best = 0;
             double best_area = 0.0;
+            // R277d: every eligible candidate, for MVecCandidate=N.
+            struct elig { unsigned long long h; double area; unsigned long long e; unsigned w, hh, fmt; };   // R278f-r: format too
+            elig el[16]; unsigned en = 0;
             {
                 const unsigned cn3 = g_mvec.n.load(std::memory_order_acquire);
                 for (unsigned i = 0; i < cn3; ++i)
@@ -2215,7 +2230,12 @@ void dump()
                     const cand &c = g_mvec.t[i];
                     if (c.handle == 0) continue;                   // evicted
                     const unsigned long long ee = c.e.load(std::memory_order_relaxed);
-                    if (ee == 0) continue;
+                    // R278e: with the D3D12 tap running, a candidate the engine never
+                    // barriers is still a candidate - the tap copies at finish_effects and
+                    // does not need a barrier to name it (RE4: 3 of 4 census candidates had
+                    // none and were never tried). Contract titles never run the tap, so
+                    // their pick is exactly as before.
+                    if (ee == 0 && !g_tap12_active.load(std::memory_order_relaxed)) continue;
                     // ---- R98: A UNIFORM FRACTION, NOT AN EQUALITY ----
                     //
                     // Requiring c.width == g_scene_w assumed the velocity
@@ -2255,10 +2275,62 @@ void dump()
                     //
                     // Count survives only to break a tie between equals.
                     const double area = (double)c.width * (double)c.height;
+                    if (en < 16u) { el[en].h = c.handle; el[en].area = area; el[en].e = ee; el[en].w = c.width; el[en].hh = c.height; el[en].fmt = c.format; ++en; }
                     if (area > best_area || (area == best_area && ee > best))
                     { best_area = area; best = ee; pick = c.handle; }
                 }
             }
+            // R277d: MVecCandidate=N. The same order the rule uses (area, then
+            // barrier count), and the N-th one instead of the first. Absent or
+            // out of range = the rule's pick, unchanged.
+            const unsigned pn = g_mvec_pick_n.load(std::memory_order_relaxed);
+            for (unsigned a = 0; a < en; ++a)          // sorted for the log line too
+                for (unsigned b = a + 1; b < en; ++b)
+                    if (el[b].area > el[a].area || (el[b].area == el[a].area && el[b].e > el[a].e))
+                    { const elig t = el[a]; el[a] = el[b]; el[b] = t; }
+            if (pn != 0u && pn < en) pick = el[pn].h;
+            // R278f-r: once the stream is producing (the ring is laid out for the
+            // current source), the dump may not move the source on its own: if the
+            // current one is still eligible it stays; only gpu1's live switch
+            // (mvec_pick_live) or an eviction changes it. Before that, re-picking
+            // is as before (the arm's 240-frame stability hold covers it).
+            if (g_pick_locked.load(std::memory_order_relaxed))
+            {
+                const unsigned long long cur_src = g_mvec_src.load(std::memory_order_relaxed);
+                for (unsigned a = 0; a < en; ++a) if (el[a].h == cur_src) { pick = cur_src; break; }
+            }
+            g_mvec_elig_n.store(en, std::memory_order_relaxed);   // R278
+            {   // R278f: snapshot + neighbours of the current pick
+                std::lock_guard<std::mutex> lk(g_snap_cs);
+                g_snap_n = en;
+                int cur = -1;
+                for (unsigned a = 0; a < en; ++a) { g_snap_h[a] = el[a].h; g_snap_w[a] = el[a].w; g_snap_hh[a] = el[a].hh; g_snap_fmt[a] = el[a].fmt; if (el[a].h == pick) cur = (int)a; }
+                int ns = -1, nc = -1;
+                if (cur >= 0)
+                    for (unsigned a = (unsigned)cur + 1; a < en; ++a)
+                    {
+                        // R278f-r: same slot layout = same size AND same format (the ring's vector
+                        // region is sized in bytes from both; a different format would be size-rejected).
+                        const bool same = (el[a].w == el[cur].w && el[a].hh == el[cur].hh && el[a].fmt == el[cur].fmt);
+                        if (same && ns < 0) ns = (int)a;
+                        if (!same && nc < 0) nc = (int)a;
+                    }
+                g_pick_idx.store(cur < 0 ? 0 : cur, std::memory_order_relaxed);
+                g_next_same.store(ns, std::memory_order_relaxed);
+                g_next_class.store(nc, std::memory_order_relaxed);
+            }
+            if (pick != g_mvec_pick_said && pick != 0)
+            {
+                g_mvec_pick_said = pick;
+                char pl[520]; int o = snprintf(pl, sizeof pl, "[MGPU][R277d] transport candidate 0x%llx (MVecCandidate=%u) of %u eligible:", pick, pn, en);
+                for (unsigned a = 0; a < en && o > 0 && o < (int)sizeof pl - 60; ++a)
+                    o += snprintf(pl + o, sizeof pl - o, " [%u] 0x%llx %ux%u barriers=%llu", a, el[a].h, el[a].w, el[a].hh, el[a].e);
+                mgpu::diag::info(pl);
+            }
+            // R280: while mvec_extract is still manufacturing its target, the dump
+            // publishes nothing (bounded by that module), so the arm does not settle
+            // on a smaller buffer first. Once the stream produces, the pick is its own.
+            if (g_mvec_defer.load(std::memory_order_relaxed) && !g_pick_locked.load(std::memory_order_relaxed)) pick = 0;
             g_mvec_src.store(pick, std::memory_order_relaxed);
         }
         int w = snprintf(line, sizeof line,
@@ -3091,6 +3163,11 @@ mode mode_from_ini()
         const int mi = (k3 != nullptr) ? atoi(k3) : 0;
         g_mv_index.store((mi >= 0 && mi < 8) ? (unsigned)mi : 0u,
                          std::memory_order_relaxed);
+        // R277d: MVecCandidate=N takes the N-th eligible transport candidate
+        // (same filters, same order: largest first, then busiest). 0 = as before.
+        const char *k4 = mgpu::config::find(buf, strlen(buf), "MVecCandidate");
+        const int pn = (k4 != nullptr) ? atoi(k4) : 0;
+        g_mvec_pick_n.store((pn >= 0 && pn < 8) ? (unsigned)pn : 0u, std::memory_order_relaxed);
     }
 
     const char *k = mgpu::config::find(buf, strlen(buf), "MetaProbeLogSeconds");
@@ -3302,9 +3379,69 @@ unsigned long long depth_source()
 // TARGET BINDS that also sits at the DISPLAY extent, which is what the game's
 // own DLSS telemetry reports as MVExtent. Refreshed every dump, so an eviction
 // or a resolution change moves it rather than stranding it.
+unsigned mvec_eligible_count() { return g_mvec_elig_n.load(std::memory_order_relaxed); }   // R278
+
+// R278f: the learning's live switch between candidates of the same size.
+int mvec_pick_index()  { return g_pick_idx.load(std::memory_order_relaxed); }
+int mvec_next_same()   { return g_next_same.load(std::memory_order_relaxed); }
+int mvec_next_class()  { return g_next_class.load(std::memory_order_relaxed); }
+void mvec_pick_lock(bool on) { g_pick_locked.store(on, std::memory_order_relaxed); }   // R278f-r
+
+void mvec_pick_live(int idx)
+{
+    unsigned long long h = 0; unsigned w = 0, hh = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_snap_cs);
+        if (idx < 0 || (unsigned)idx >= g_snap_n) return;
+        h = g_snap_h[idx]; w = g_snap_w[idx]; hh = g_snap_hh[idx];
+    }
+    g_mvec_pick_n.store((unsigned)idx, std::memory_order_relaxed);
+    g_mvec_src.store(h, std::memory_order_relaxed);
+    g_pick_idx.store(idx, std::memory_order_relaxed);
+    // R278f-r: recompute the neighbours now from the snapshot, so a second
+    // rejection before the next dump can still switch (the dump re-derives them).
+    {
+        std::lock_guard<std::mutex> lk(g_snap_cs);
+        int ns = -1, nc = -1;
+        for (unsigned a = (unsigned)idx + 1; a < g_snap_n; ++a)
+        {
+            const bool same = (g_snap_w[a] == w && g_snap_hh[a] == hh && g_snap_fmt[a] == g_snap_fmt[idx]);
+            if (same && ns < 0) ns = (int)a;
+            if (!same && nc < 0) nc = (int)a;
+        }
+        g_next_same.store(ns, std::memory_order_relaxed);
+        g_next_class.store(nc, std::memory_order_relaxed);
+    }
+    char l[200];
+    snprintf(l, sizeof l, "[MGPU][R278f] learning: switched live to candidate %d (0x%llx %ux%u) - same size as the last, same slot layout.", idx, h, w, hh);
+    mgpu::diag::info(l);
+}
+
 unsigned long long mvec_source()
 {
     return g_mvec_src.load(std::memory_order_relaxed);
+}
+
+// R280: mvec_extract's two calls. offer: a two-channel scene-sized candidate an
+// add-on created (ReShade fires no init_resource for those) enters the census
+// by the same test as the event path. defer: see the dump's publish site.
+void mvec_offer(unsigned long long handle, unsigned w, unsigned h, unsigned fmt)
+{
+    if (handle == 0ull || !g_mvec_on.load(std::memory_order_relaxed)) return;
+    if (!is_mvec_format(fmt) || !in_scene_band(w, h)) return;
+    add_candidate(g_mvec, handle, w, h, fmt);
+}
+void mvec_defer(bool on) { g_mvec_defer.store(on, std::memory_order_relaxed); }
+// R280g: the same as on_destroy_resource for the mvec lane, called by mvec_extract
+// when it destroys its own target (a resize): the census must not keep the handle.
+void mvec_withdraw(unsigned long long handle)
+{
+    if (handle == 0ull) return;
+    std::lock_guard<std::mutex> lk(g_table_lock);
+    const unsigned n = g_mvec.n.load(std::memory_order_relaxed);
+    for (unsigned i = 0; i < n; ++i)
+        if (g_mvec.t[i].handle == handle) g_mvec.t[i].handle = 0;
+    if (g_mvec_src.load(std::memory_order_relaxed) == handle) g_mvec_src.store(0ull, std::memory_order_relaxed);
 }
 
 // R78. dllmain installs the forwarder. A function pointer, so this file never
@@ -3312,6 +3449,52 @@ unsigned long long mvec_source()
 void set_mvec_hook(void (*fn)(void *cmd_list_native, unsigned long long resource))
 {
     g_mvec_hook = fn;
+}
+
+// R277: THE D3D12 TAP (MVecTap=1 or 2), OFF BY DEFAULT. On RE Engine (RE4,
+// 2026-10-07) the census found the velocity buffer at arm (REAL, 1280x720)
+// but the per-frame handover never fired in 57,000 frames: ReShade saw no
+// bind event and nine barriers in a whole run, so neither route above ever
+// named the resource. The buffer is still there every frame. This copies it
+// at finish_effects, the same moment the D3D11 tap (R254) feeds the producer,
+// through the same fire_mvec_hook - once per frame, and only when nothing
+// else delivered this frame. What D3D11 never had to answer is the resource's
+// STATE: we do not see this engine's barriers, so the before-state is an
+// assumption, not a reading. MVecTap=1 assumes shader_resource (a velocity
+// buffer the post passes read); MVecTap=2 assumes common. A wrong assumption
+// is undefined behaviour, not an error we can catch - which is why this
+// ships off and the R257 vector probe is the judge of what arrived.
+std::atomic<unsigned long long> g_tap12_copies{0};
+bool g_tap12_said = false;
+void tap_finish_effects(void *command_list_ptr, int mode)
+{
+    reshade::api::command_list *cl = static_cast<reshade::api::command_list *>(command_list_ptr);
+    if (mode == 0 || cl == nullptr) return;
+    g_tap12_active.store(true, std::memory_order_relaxed);   // R278e
+    const unsigned long long want = g_mvec_src.load(std::memory_order_relaxed);
+    if (want == 0ull || g_mvec_hook == nullptr) return;
+    const unsigned long long fr = g_frames.load(std::memory_order_relaxed);
+    if (g_mvec_last_frame == fr) return;   // the barrier route delivered this frame
+    // R277b: ReShade's resource_usage has no 'common'. 'undefined' is 0, and
+    // the D3D12 backend converts usage bits to state bits, so 0 becomes
+    // D3D12_RESOURCE_STATE_COMMON (0). Already used in this file.
+    const reshade::api::resource_usage st = (mode == 2)
+        ? reshade::api::resource_usage::undefined
+        : reshade::api::resource_usage::shader_resource;
+    fire_mvec_hook(cl, want, st);
+    const unsigned long long n = g_tap12_copies.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!g_tap12_said)
+    {
+        g_tap12_said = true;
+        char l[360];
+        snprintf(l, sizeof l,
+                 "[MGPU][R277] D3D12 TAP: copying the census candidate 0x%016llX at finish_effects, before-state "
+                 "ASSUMED %s (MVecTap=%d). Nothing else delivered it this frame. Read the [R257] vector probe for "
+                 "what arrived; a wrong assumption shows there, not here.",
+                 want, mode == 2 ? "common" : "shader_resource", mode);
+        mgpu::diag::warn(l);
+    }
+    (void)n;
 }
 
 void note_frame()

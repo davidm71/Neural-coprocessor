@@ -84,6 +84,14 @@ namespace mgpu::adapter
     // Subsequent swapchain events (resizes) are logged, never re-select.
     void on_swapchain(::reshade::api::swapchain *swapchain, bool resize);
 
+    // R227 (DX11 producer). A D3D11 game chain cannot establish the game
+    // luid the way a D3D12 one does; the D3D11 device's adapter can. Same
+    // effect as on_swapchain's D3D12 path: the luid is recorded as
+    // swapchain-derived and the one-shot selection runs. Called once, from
+    // dx11_producer::init; a later call with the luid already established
+    // is logged and ignored, as a second init_swapchain would be.
+    void note_game_luid_d3d11(unsigned long long luid_low, long luid_high);
+
     // Releases the selected adapter reference. Bridge thread, at shutdown.
     void shutdown();
 

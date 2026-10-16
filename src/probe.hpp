@@ -197,11 +197,27 @@ int tap_state();
 // DISPLAY extent, which is what the game's own DLSS reports as MVExtent.
 // Re-picked every log dump, so an eviction or a resolution change moves it.
 unsigned long long mvec_source();
+unsigned mvec_eligible_count();   // R278: eligible velocity candidates at the last pick
+// R278f: the learning's candidate neighbours and live switch (same size only).
+int mvec_pick_index();
+int mvec_next_same();
+int mvec_next_class();
+void mvec_pick_live(int idx);
+void mvec_pick_lock(bool on);   // R278f-r: the stream is producing; the dump keeps its source
+// R280: mvec_extract's virtual velocity target. offer = one add-on-created
+// candidate into the census (same test as the event path); defer = the dump
+// publishes no source while on (and the pick is not locked).
+void mvec_offer(unsigned long long handle, unsigned w, unsigned h, unsigned fmt);
+void mvec_defer(bool on);
+void mvec_withdraw(unsigned long long handle);   // R280g: an add-on-created candidate is gone (ReShade raises no destroy_resource for it)
 
 // Installed by dllmain. Called at most ONCE PER FRAME, on the game's render
 // thread, with the barrier already issued and restored around it. The callee
 // records a copy and nothing else.
 void set_mvec_hook(void (*fn)(void *cmd_list_native, unsigned long long resource));
+// R277: the D3D12 tap, off unless MVecTap=1 (assume shader_resource) or 2 (assume common).
+// Pass reshade::api::command_list * as void *, as note_effects does.
+void tap_finish_effects(void *command_list_ptr, int mode);
 
 // The presented resolution, from on_init_swapchain. The candidate size band is
 // expressed as a fraction of this rather than as absolute pixel counts, so the
