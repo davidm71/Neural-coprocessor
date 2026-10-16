@@ -48,6 +48,8 @@
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
 #include "dx11_producer.hpp"   // 0.3.1 backport: HudLess is D3D12-only
 #include "nr16.hpp"   // 0.3.1 R208: optional FP16 input to DLSS-NR (NRInput16=4)
+#include "capture.hpp"   // SS1 / VR1 / BM1
+#include "replay.hpp"    // BM2
 // FSR1: AMD FidelityFX API headers (MIT), for FrameGen=3. Types only - the
 // functions come from AMD's signed DLL, loaded at run time from the mgpu folder.
 #include "ffx/ffx_api.h"
@@ -418,6 +420,14 @@ static std::atomic<unsigned long long> g_hud_nr_ok_count{0};
 // thread's own present_frame calls are never redirected. Set for exactly one
 // present_frame call at a time.
 static thread_local ID3D12Resource *t_fg_src = nullptr;
+// SS1/VR1/BM1: what the present thread is showing - an in-between frame, or a
+// real one and the time the game handed that real frame to the mod.
+static thread_local bool t_fg_is_gen = false;
+static thread_local unsigned long long t_fg_cap = 0;
+// BM1: the hand-over time (QPC, from the frame's seal) of the newest frame the
+// neural stage finished. The bridge thread shows it right away; with frame
+// generation it travels with the job to the present thread.
+static std::atomic<unsigned long long> g_lat_cap_qpc{0};
 static thread_local D3D12_RESOURCE_STATES t_fg_rest = D3D12_RESOURCE_STATE_COMMON;
 // FIX8: what the last present_frame call on THIS thread left on the GPU.
 //   0          nothing submitted (failed before ExecuteCommandLists)
@@ -1649,6 +1659,13 @@ bool present_frame(float r, float g, float b)
             cl->ResourceBarrier(1, &lb);
         }
 
+        // SS1/VR1/BM1: screenshots, recording and the benchmark take the frame
+        // here - as shown, split included, before the FPS HUD is drawn.
+        mgpu::capture::on_present_copy(dev, cl, backbuffer[index], bw, bh, bbfmt, t_fg_is_gen,
+                                       t_fg_is_gen ? 0ull
+                                                   : ((t_fg_src != nullptr) ? t_fg_cap
+                                                                            : g_lat_cap_qpc.load(std::memory_order_relaxed)));
+
         // Return to RENDER_TARGET so the seam (when split) and the FPS HUD are
         // painted into the SAME backbuffer that DirectComposition presents.
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -1686,6 +1703,9 @@ bool present_frame(float r, float g, float b)
                                        (ui_frame_gen() != 0) ? hud_gen_fps() : -1.0,   // FG1
                                        hud_st, hud_st_n);
         }
+
+        // SS1/VR1: captures that include the FPS HUD - exactly what is on screen.
+        mgpu::capture::on_present_final(dev, cl, backbuffer[index], bw, bh, bbfmt);
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -1829,6 +1849,7 @@ bool present_frame(float r, float g, float b)
         S.slot_value[slot] = fence_value;   // D6: this slot is busy until here
     }
     t_present_fv = fence_value;
+    mgpu::capture::on_present_submitted(fence, fence_value);   // SS1/VR1
 
     // ---- L5: THE PRESENT INTERVAL IS A LATENCY DECISION, NOT A STYLE ONE ----
     //
@@ -1855,7 +1876,10 @@ bool present_frame(float r, float g, float b)
     // accepted the call but explicitly says the frame will not be shown, so
     // treating it as displayed output would inflate the final FPS score.
     if (hr == S_OK)
+    {
         g_hud_present_count.fetch_add(1ull, std::memory_order_relaxed);
+        mgpu::capture::on_present_shown();   // BM1
+    }
 
     // ---- R111: THE SUCCESS CODES PRESENT RETURNS, WHICH WERE INVISIBLE ----
     //
@@ -8954,8 +8978,12 @@ namespace
         bool fg_ready_gen = false;             // set fg_ready_k holds a generated frame
         // DLSSG2: Multi Frame Generation. fg_outx[k][i] holds in-between frame
         // i+2 of set k (fg_out[k] is frame 1). fg_ready_n = frames in set
-        // fg_ready_k. fg_mult = FGMultiplier (2..4), used by FrameGen=4 only.
-        ID3D12Resource *fg_outx[FG_SETS][2] = {};
+        // fg_ready_k. fg_mult = FGMultiplier (2..6), used by FrameGen=4 only.
+        // MFG6: up to 4 extras (6x). The first two are made with the FG
+        // resources; 3 and 4 only when 5x/6x is actually used (fg_extras_ensure).
+        static const unsigned FG_MAX_EXTRA = 4;
+        ID3D12Resource *fg_outx[FG_SETS][FG_MAX_EXTRA] = {};
+        bool fg_extras_failed = false;   // MFG6: the 5x/6x buffers could not be made
         unsigned fg_ready_n = 0;
         unsigned fg_mult = 2;
         ID3D12RootSignature *fg_rs = nullptr;
@@ -9021,6 +9049,8 @@ namespace
         unsigned long long cs_frames = 0;
         // ST1: the last NGX result of the neural stage, for the status HUD.
         unsigned nr_last_result = 0, nr_last_fail = 0;
+        // BM1: the seal's hand-over time (qpc_submit) of the frame being consumed.
+        unsigned long long cur_cap_qpc = 0;
         void *fsr_ctx = nullptr;               // ffxContext
         bool fsr_up = false, fsr_failed = false;
         unsigned long long fsr_frame_id = 0, fsr_made = 0, fsr_errors = 0;
@@ -9068,6 +9098,7 @@ namespace
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 
         unsigned signal_at = 0;            // ini SignalAt: 0 effects, 1 present
+        unsigned sa_errors = 0;            // SA1: seal faults seen while SignalAt=1
         unsigned present_vsync = 1;        // ini PresentVsync: 1 = Present(1,0)
         unsigned sr_snippet = 1;           // ini SRSnippet: 1 driver, 0 game's
 
@@ -10886,6 +10917,28 @@ namespace
         return (v == 0 || v == 1) ? v : 0;
     }
 
+    // ---- SA1: SignalAt=1 TURNS ITSELF OFF ON SEAL FAULTS ----
+    //
+    // Measured on the rig 2026-10-16 (RoboCop, StageCopy=1): ReShade raises the
+    // present event BEFORE the effects pass where the copy is recorded, so a
+    // signal issued at present announces frames whose copy is not on the queue
+    // yet. 79 SEAL faults (BAD MAGIC / REORDERED) in the first seconds, staging
+    // failures, a flickering, unplayable picture. The seal checker already sees
+    // it; this acts on it: after the third fault the signal goes back to the
+    // effects event (SignalAt=0) for the rest of the session. Nothing is written
+    // to mgpu.ini - the line there stays the user's - so the log says to change it.
+    void signal_at_guard(stream_state &s)
+    {
+        if (s.signal_at != 1u) return;
+        if (++s.sa_errors < 3u) return;
+        s.signal_at = 0u;
+        mgpu::diag::error("[MGPU][SA1] SignalAt=1 SWITCHED OFF for this session: the transfer checks caught frames "
+                          "announced before their copy had landed (SEAL faults). On this setup ReShade raises the "
+                          "present event before the effects pass that records the copy, so signalling at present is "
+                          "too early. The signal is back on the effects event (SignalAt=0) from the next frame. Set "
+                          "SignalAt=0 in mgpu.ini (or remove the line) so the next launch does not start with it.");
+    }
+
     int ini_read_sr_int(const char *key, int dflt, int lo, int hi)
     {
         char buf[INI_BYTES];
@@ -11365,7 +11418,8 @@ bool dg_ensure(stream_state &s, ID3D12GraphicsCommandList *cl, ID3D12Resource *l
                          "[MGPU][%s] Init_Ext 0x%08X (%s) | FrameGeneration.Available=%d NeedsUpdatedDriver=%d "
                          "FeatureInitResult=0x%08X MultiFrameCountMax=%u (%s)", who, (unsigned)ri, ngx_result_name(ri),
                          avail, needs, fir, mfc,
-                         mfc >= 3u ? "4x supported" : mfc == 2u ? "3x supported" : "2x only or not reported");
+                         mfc >= 5u ? "up to 6x supported" : mfc == 4u ? "up to 5x supported" :
+                         mfc == 3u ? "up to 4x supported" : mfc == 2u ? "up to 3x supported" : "2x only or not reported");
                 mgpu::diag::info(line);
             }
         }
@@ -11498,6 +11552,47 @@ void dg_fg_fail()
                       "the mod's own generator for this run (see the [MGPU][DLSSG1] lines above).");
 }
 
+// MFG6: makes sure in-between frame buffers 2..want+1 exist in every set and
+// returns how many extras are usable (0..FG_MAX_EXTRA). Extras 1 and 2 come
+// from fg_build; 3 and 4 (5x/6x) are made here the first time they are asked
+// for, so a 2x-4x user never pays their memory. Failure is not fatal: the
+// multiplier just stays at what the buffers allow, logged once.
+unsigned fg_extras_ensure(stream_state &s, unsigned want)
+{
+    if (want > stream_state::FG_MAX_EXTRA) want = stream_state::FG_MAX_EXTRA;
+    unsigned have = 0;
+    while (have < stream_state::FG_MAX_EXTRA && s.fg_outx[0][have] != nullptr &&
+           s.fg_outx[1][have] != nullptr && s.fg_outx[2][have] != nullptr) ++have;
+    if (have >= want || s.fg_extras_failed || s.ndev_b == nullptr || s.fg_out[0] == nullptr) return have;
+    D3D12_RESOURCE_DESC rd = s.fg_out[0]->GetDesc();
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    HRESULT hr = S_OK;
+    unsigned e = have;
+    for (; e < want && SUCCEEDED(hr); ++e)
+        for (unsigned q = 0; q < stream_state::FG_SETS && SUCCEEDED(hr); ++q)
+            if (s.fg_outx[q][e] == nullptr)
+                hr = s.ndev_b->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                       nullptr, IID_PPV_ARGS(&s.fg_outx[q][e]));
+    char line[300];
+    if (FAILED(hr))
+    {
+        --e;   // the extra that failed: drop whatever part of it was made
+        for (unsigned q = 0; q < stream_state::FG_SETS; ++q)
+            if (s.fg_outx[q][e] != nullptr) { s.fg_outx[q][e]->Release(); s.fg_outx[q][e] = nullptr; }
+        s.fg_extras_failed = true;
+        snprintf(line, sizeof line, "[MGPU][MFG6] the buffers for %ux could not be made (0x%08X, out of video "
+                 "memory?) - NVIDIA frame generation stays at %ux.", want + 2u, (unsigned)hr, e + 2u);
+        mgpu::diag::warn(line);
+        return e;
+    }
+    snprintf(line, sizeof line, "[MGPU][MFG6] in-between frame buffers for %ux made (%u per set).", want + 2u, want);
+    mgpu::diag::info(line);
+    return want;
+}
+
 bool dg_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
                ID3D12Resource *real, float mv_el)
 {
@@ -11518,7 +11613,11 @@ bool dg_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
     unsigned mfc = (s.fg_mult >= 2u) ? s.fg_mult - 1u : 1u;
     const unsigned cap = (g_dg.mfc_max >= 1u) ? g_dg.mfc_max : 1u;
     if (mfc > cap) mfc = cap;
-    if (mfc > 1u && s.fg_outx[0][0] == nullptr) mfc = 1u;
+    if (mfc > 1u)   // MFG6: only as many as there are buffers for
+    {
+        const unsigned have = fg_extras_ensure(s, mfc - 1u);
+        if (mfc > have + 1u) mfc = have + 1u;
+    }
     if (mfc != g_dg.cur_mfc)
     {
         snprintf(line, sizeof line, "[MGPU][DLSSG2] NVIDIA frame generation at %ux (%u in-between frame%s per real frame)%s.",
@@ -12176,9 +12275,10 @@ static void g0_stage_release(stream_state &s)
         {
             if (s.fg_real[q] != nullptr) { s.fg_real[q]->Release(); s.fg_real[q] = nullptr; }
             if (s.fg_out[q]  != nullptr) { s.fg_out[q]->Release();  s.fg_out[q]  = nullptr; }
-            for (unsigned e = 0; e < 2u; ++e)   // DLSSG2
+            for (unsigned e = 0; e < stream_state::FG_MAX_EXTRA; ++e)   // DLSSG2/MFG6
                 if (s.fg_outx[q][e] != nullptr) { s.fg_outx[q][e]->Release(); s.fg_outx[q][e] = nullptr; }
         }
+        s.fg_extras_failed = false;
         s.fg_ready_n = 0;
         fsr_destroy(s);   // FSR1: the AMD context goes before the resources it saw
         dgp_release();    // DGP1: the probe's feature and textures, same point
@@ -12705,7 +12805,7 @@ namespace
         "  oOut[id.xy] = o;\n"
         "}\n";
 
-    static const unsigned FG_DESC_SLOTS = 4u;   // MFG1: passes per list (1 + up to 2 NVIDIA extras, +1 spare)
+    static const unsigned FG_DESC_SLOTS = 2u + stream_state::FG_MAX_EXTRA;   // MFG1/MFG6: passes per list (1 + up to 4 NVIDIA extras, +1 spare)
     static bool fg_build(stream_state &s, ID3D12Device *ndev, ID3D12Resource *like)
     {
         char line[700];
@@ -12784,7 +12884,7 @@ namespace
             D3D12_DESCRIPTOR_HEAP_DESC hd{};
             hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
             // MFG1: one set of 8 per pass that can sit in the same list - the
-            // in-between frame, plus up to two more at NVIDIA 3x/4x. One set
+            // in-between frame, plus up to four more at NVIDIA 3x-6x. One set
             // for all of them made every pass write the LAST pass's target.
             hd.NumDescriptors = 8u * FG_DESC_SLOTS;
             hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
@@ -12821,7 +12921,7 @@ namespace
             if (FAILED(hx))
             {
                 for (unsigned q = 0; q < stream_state::FG_SETS; ++q)
-                    for (unsigned e = 0; e < 2u; ++e)
+                    for (unsigned e = 0; e < stream_state::FG_MAX_EXTRA; ++e)
                         if (s.fg_outx[q][e] != nullptr) { s.fg_outx[q][e]->Release(); s.fg_outx[q][e] = nullptr; }
                 mgpu::diag::warn("[MGPU][DLSSG2] the extra in-between frame buffers could not be made - "
                                  "frame generation stays at 2x.");
@@ -12981,9 +13081,9 @@ namespace
             // and one for the real frame can sit in the same list.
             D3D12_DESCRIPTOR_HEAP_DESC hd{};
             hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            // MFG1: four sets - the real frame (0), the in-between frame (1)
-            // and NVIDIA's extra in-between frames at 3x/4x (2, 3).
-            hd.NumDescriptors = 3u * 4u;
+            // MFG1/MFG6: the real frame (0), the in-between frame (1) and
+            // NVIDIA's extra in-between frames at 3x-6x (2..5).
+            hd.NumDescriptors = 3u * (2u + stream_state::FG_MAX_EXTRA);
             hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             hr = dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.ui_heap));
             s.ui_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -13323,7 +13423,7 @@ namespace
     }
 
     // DLSSG2: in-between frames 2..N of this pair (FrameGen=4 with FGMultiplier
-    // 3 or 4), each evaluated into fsr_out and passed into fg_outx[k][i-2] the
+    // 3 to 6), each evaluated into fsr_out and passed into fg_outx[k][i-2] the
     // same way frame 1 went into fg_out[k]. Returns the frames this set holds.
     static unsigned fg_extra_frames(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned k,
                                     unsigned ii, ID3D12Resource *prevp, ID3D12Resource *currp,
@@ -13331,14 +13431,14 @@ namespace
     {
         unsigned n = 1;
         if (s.fg_on != 4u || g_dg.cur_mfc < 2u) return n;
-        for (unsigned idx = 2; idx <= g_dg.cur_mfc && idx <= 3u; ++idx)
+        for (unsigned idx = 2; idx <= g_dg.cur_mfc && idx <= 1u + stream_state::FG_MAX_EXTRA; ++idx)
         {
             ID3D12Resource *const o = s.fg_outx[k][idx - 2u];
             if (o == nullptr) break;
             if (!dg_record_extra(s, cl, ii, currp, mv_el, idx)) break;
             barrier(cl, s.fsr_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            fg_dispatch_pass(s, cl, prevp, currp, ii, depth_ok, s.fsr_out, o, mv_el, 16u, idx - 1u);   // MFG1: slot 1, 2
+            fg_dispatch_pass(s, cl, prevp, currp, ii, depth_ok, s.fsr_out, o, mv_el, 16u, idx - 1u);   // MFG1: slot 1..4
             barrier(cl, s.fsr_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             ++n;
@@ -13430,7 +13530,7 @@ namespace
             if (gen)
             {
                 (void)ui_apply(s, cl, outk, ii, 1u);
-                for (unsigned e = 0; e + 1u < gen_n && e < 2u; ++e)   // DLSSG2
+                for (unsigned e = 0; e + 1u < gen_n && e < stream_state::FG_MAX_EXTRA; ++e)   // DLSSG2
                     (void)ui_apply(s, cl, s.fg_outx[k][e], ii, 2u + e);   // MFG1: its own set
             }
             barrier(cl, cur, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -16767,7 +16867,18 @@ void ui_set_status_hud(bool on)
 // Present path only (under g_present_mx, so the statics need no lock).
 int hud_status_lines(char (*out)[48], int max)
 {
-    if (out == nullptr || max <= 0 || !ui_status_hud()) return 0;
+    if (out == nullptr || max <= 0) return 0;
+    // SS1/VR1/BM1/BM2: recording, benchmark and path state show whatever
+    // StatusHud says - a recording you cannot see is running is a surprise.
+    char capl[48] = {};
+    mgpu::replay::hud_line(capl, sizeof capl);
+    if (capl[0] == '\0') mgpu::capture::hud_line(capl, sizeof capl);
+    if (!ui_status_hud())
+    {
+        if (capl[0] == '\0') return 0;
+        memcpy(out[0], capl, 48);
+        return 1;
+    }
     static char cache[6][48] = {};
     static int n = 0;
     static ULONGLONG at = 0, ok_at = 0;
@@ -16828,8 +16939,9 @@ int hud_status_lines(char (*out)[48], int max)
         if (g_hook_present.load(std::memory_order_relaxed) && n < 6)
             snprintf(cache[n++], 48, "HOOK PRESENT");
     }
-    const int c = (n < max) ? n : max;
+    int c = (n < max) ? n : max;
     for (int i = 0; i < c; ++i) memcpy(out[i], cache[i], 48);
+    if (capl[0] != '\0' && c < max) memcpy(out[c++], capl, 48);
     return c;
 }
 
@@ -17558,12 +17670,13 @@ void ui_set_late_latch_age(unsigned age)
 struct fg_job
 {
     ID3D12Resource *gen = nullptr;    // fg_out[k], or null when no in-between frame
-    ID3D12Resource *genx[2] = {};     // DLSSG2: in-between frames 2 and 3 (fg_outx[k][..]) or null
+    ID3D12Resource *genx[stream_state::FG_MAX_EXTRA] = {};   // DLSSG2/MFG6: in-between frames 2..5 (fg_outx[k][..]) or null
     ID3D12Resource *real = nullptr;   // fg_real[k]
     unsigned set = 0;                 // FIX7: k, for the busy/fence bookkeeping
     float r = 0.0f, g = 0.0f, b = 0.0f;   // FIX7: clear colour, carried with the job
     LARGE_INTEGER t0{};
     double half_ms = 0.0;
+    unsigned long long cap_qpc = 0;   // BM1: hand-over time of the real frame
 };
 static std::mutex g_fgp_mx;
 static std::condition_variable g_fgp_cv;
@@ -17602,7 +17715,7 @@ static void fg_retire_completed()
 // A job that will never be presented: drop its references and its busy mark.
 static void fg_job_drop(fg_job &j)
 {
-    for (unsigned e = 0; e < 2u; ++e)   // DLSSG2
+    for (unsigned e = 0; e < stream_state::FG_MAX_EXTRA; ++e)   // DLSSG2
         if (j.genx[e] != nullptr) { j.genx[e]->Release(); j.genx[e] = nullptr; }
     if (j.gen != nullptr) j.gen->Release();
     if (j.real != nullptr) j.real->Release();
@@ -17660,15 +17773,18 @@ static void fg_present_thread_main()
             // DLSSG2: N in-between frames, evenly spaced across the NR interval:
             // frame i at t0 + i*step, the real one at t0 + N*step, where
             // step = interval/(N+1). With N = 1 this is the FG2 half-interval.
-            ID3D12Resource *const seq[3] = { job.gen, job.genx[0], job.genx[1] };
+            ID3D12Resource *seq[1u + stream_state::FG_MAX_EXTRA] = { job.gen };
+            for (unsigned e = 0; e < stream_state::FG_MAX_EXTRA; ++e) seq[1u + e] = job.genx[e];
             unsigned ng = 1;
-            while (ng < 3u && seq[ng] != nullptr) ++ng;
+            while (ng < 1u + stream_state::FG_MAX_EXTRA && seq[ng] != nullptr) ++ng;
             const double step = job.half_ms * 2.0 / (double)(ng + 1u);
             for (unsigned i = 0; i < ng && ok; ++i)
             {
                 if (i > 0u) fg_wait_until(job.t0, step * (double)i);
                 t_fg_src = seq[i]; t_fg_rest = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                t_fg_is_gen = true;
                 ok = present_frame(job.r, job.g, job.b);
+                t_fg_is_gen = false;
                 t_fg_src = nullptr;
                 if (t_present_fv > fv) fv = t_present_fv;
                 if (ok)
@@ -17683,7 +17799,9 @@ static void fg_present_thread_main()
         if (ok && job.real != nullptr)
         {
             t_fg_src = job.real; t_fg_rest = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            t_fg_cap = job.cap_qpc;
             ok = present_frame(job.r, job.g, job.b);
+            t_fg_cap = 0;
             t_fg_src = nullptr;
             if (t_present_fv > fv) fv = t_present_fv;
         }
@@ -17696,7 +17814,7 @@ static void fg_present_thread_main()
         {
             std::lock_guard<std::mutex> lk(g_fgp_mx);
             if (job.gen != nullptr) g_fg_retire.push_back({ job.gen, fv });
-            for (unsigned e = 0; e < 2u; ++e)   // DLSSG2
+            for (unsigned e = 0; e < stream_state::FG_MAX_EXTRA; ++e)   // DLSSG2
                 if (job.genx[e] != nullptr) g_fg_retire.push_back({ job.genx[e], fv });
             if (job.real != nullptr) g_fg_retire.push_back({ job.real, fv });
         }
@@ -17743,14 +17861,15 @@ bool fg_handoff(float r, float g, float b, bool &failed)
         job.set = k;
         job.real->AddRef();
         if (job.gen != nullptr) job.gen->AddRef();
-        // DLSSG2: in-between frames 2..N of the same set (FrameGen=4, 3x/4x).
+        // DLSSG2: in-between frames 2..N of the same set (FrameGen=4, 3x-6x).
         if (job.gen != nullptr)
-            for (unsigned e = 0; e < 2u && e + 2u <= s.fg_ready_n; ++e)
+            for (unsigned e = 0; e < stream_state::FG_MAX_EXTRA && e + 2u <= s.fg_ready_n; ++e)
                 if (s.fg_outx[k][e] != nullptr) { job.genx[e] = s.fg_outx[k][e]; job.genx[e]->AddRef(); }
         // FIX7: marked busy under the same lock fg_record checks it under.
         g_fg_set_busy[k % 3u].fetch_add(1u, std::memory_order_acq_rel);
     }
     job.r = r; job.g = g; job.b = b;
+    job.cap_qpc = g_lat_cap_qpc.load(std::memory_order_relaxed);   // BM1
     if (g_fg_last.QuadPart != 0 && fq.QuadPart != 0)
     {
         const double dt = (double)(now.QuadPart - g_fg_last.QuadPart) * 1000.0 / (double)fq.QuadPart;
@@ -17897,18 +18016,46 @@ void ui_set_fg_hudfix(bool on)
     (void)ui_ini_write("FGHudFix", on ? 1 : 0);
 }
 
-// DLSSG2: FGMultiplier, 2..4 (2x/3x/4x), live. Used by FrameGen=4 only.
+// DLSSG2: FGMultiplier, 2..6 (2x-6x), live. Used by FrameGen=4 only.
+// Before the bridge has armed (and read the ini) the panel shows the ini value.
 int ui_fg_mult()
 {
-    stream_state &s = str();
-    std::lock_guard<std::mutex> lk(s.cs);
-    return (int)s.fg_mult;
+    unsigned m = 0;
+    bool armed = false;
+    {
+        stream_state &s = str();
+        std::lock_guard<std::mutex> lk(s.cs);
+        m = s.fg_mult; armed = s.armed;
+    }
+    if (!armed)   // the ini, re-read at most once a second (the panel asks every frame)
+    {
+        static unsigned long long t_read = 0;
+        static unsigned cached = 2u;
+        const unsigned long long now = GetTickCount64();
+        if (t_read == 0ull || now - t_read > 1000ull)
+        {
+            cached = (unsigned)ini_read_sr_int("FGMultiplier", 2, 2, 6);
+            t_read = now;
+        }
+        m = cached;
+    }
+    if (m < 2u) m = 2u;
+    if (m > 6u) m = 6u;
+    return (int)m;
+}
+
+// DLSSG2/MFG6: what this run is actually producing (2..6), 0 when NVIDIA FG
+// is not generating. Can be lower than ui_fg_mult() when the driver or the
+// buffers do not allow the asked-for multiplier.
+int ui_fg_mult_running()
+{
+    return (g_dg.up && !g_dg.fg_failed && g_dg.cur_mfc >= 1u) ? (int)g_dg.cur_mfc + 1 : 0;
 }
 
 void ui_set_fg_mult(int m)
 {
     if (m < 2) m = 2;
-    if (m > 4) m = 4;
+    if (m > 6) m = 6;
     {
         stream_state &s = str();
         std::lock_guard<std::mutex> lk(s.cs);
@@ -18252,6 +18399,7 @@ void stream_request()
                 s.sr_on = 0u;
             }
             s.signal_at    = (unsigned)ini_read_signal_at();
+            s.sa_errors    = 0;   // SA1
             s.present_vsync = (unsigned)ini_read_sr_int("PresentVsync", 1, 0, 1);
             s.sr_snippet    = (unsigned)ini_read_sr_int("SRSnippet", 1, 0, 1);
             s.rw_on         = (unsigned)ini_read_sr_int("RingWindow", 0, 0, 1);
@@ -18261,7 +18409,7 @@ void stream_request()
             s.fg_on         = (unsigned)ini_read_sr_int("FrameGen", 0, 0, 4);    // FG1: 2 = motion view, 3 = AMD FSR 3, 4 = NVIDIA DLSS FG
             s.fg_invert     = (unsigned)ini_read_sr_int("FGInvertMV", 0, 0, 1);  // FG1
             s.fg_hudfix     = (unsigned)ini_read_sr_int("FGHudFix", 1, 0, 1);    // FG3
-            s.fg_mult       = (unsigned)ini_read_sr_int("FGMultiplier", 2, 2, 4); // DLSSG2: FrameGen=4 only
+            s.fg_mult       = (unsigned)ini_read_sr_int("FGMultiplier", 2, 2, 6); // DLSSG2/MFG6: FrameGen=4 only
             {
                 float k = ini_read_float("ColorStrength", 1.0f);                   // CS1
                 if (!(k >= 0.0f)) k = 0.0f;
@@ -21676,6 +21824,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
         if (got.magic != SEAL_MAGIC || got.seal_version != SEAL_VERSION)
         {
             ++s.bad_magic;
+            signal_at_guard(s);   // SA1
             snprintf(line, sizeof line,
                      "[MGPU][SEAL] BAD MAGIC f=%llu slot=%u: magic=0x%08X version=%u. Nothing "
                      "arrived at this offset, or the two ends disagree about the layout.",
@@ -22243,6 +22392,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
             else if (got.frame_index < s.last_seen)
             {
                 ++s.reordered;
+                signal_at_guard(s);   // SA1
                 if (fault_log(s, s.logged_reord))
                 {
                     snprintf(line, sizeof line,
@@ -22277,6 +22427,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 if (lat > s.lat_max) { s.lat_max = lat; s.lat_max_frame = got.frame_index; }
                 if (s.lat_n == 0) s.first_lat = lat;
                 s.lat_sum += lat; ++s.lat_n;
+                s.cur_cap_qpc = got.qpc_submit;   // BM1
 
                 // L2: from the fence sighting, not from the record.
                 if (s.seen_fence_at != 0 && s.freq.QuadPart > 0)
@@ -24296,6 +24447,7 @@ void stream_poll()
                     // Count FRAMES, not passes, and do not advance this counter
                     // for P6.4 backlog frames that were consumed without NR.
                     g_hud_nr_ok_count.fetch_add(1, std::memory_order_relaxed);
+                    g_lat_cap_qpc.store(s.cur_cap_qpc, std::memory_order_relaxed);   // BM1
                     // C2-SR writes the display-extent result into tex_out
                     // whatever the pass parity did at R, so the presenter takes
                     // tex_out directly rather than the ping-pong winner.

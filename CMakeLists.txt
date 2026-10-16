@@ -69,6 +69,12 @@ add_library(mgpu_bridge SHARED
     # 0.3.1 backport (R208). Optional FP16 input to DLSS-NR, OFF unless
     # NRInput16=4. Holds no gpu1_context type.
     src/nr16.cpp
+    # HK1: hotkeys by polling (no RegisterHotKey), rebindable in the panel.
+    src/hotkeys.cpp
+    # SS1/VR1/BM1: screenshots, video recording (Media Foundation, loaded at
+    # run time), frame-time benchmark. BM2: input replay for the benchmark.
+    src/capture.cpp
+    src/replay.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -167,6 +173,12 @@ target_link_libraries(mgpu_bridge PRIVATE
     # a build made from src/* without this file still links.
     dcomp
     d3d11
+    # SS1/VR1: WIC for PNG, the Media Foundation GUIDs (a static library -
+    # mfplat/mfreadwrite themselves are loaded at run time).
+    windowscodecs
+    mfuuid
+    ole32
+    shell32
 )
 
 # P0: warnings visible, not fatal. A compile error costs the same round

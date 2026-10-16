@@ -543,14 +543,15 @@ void ui_set_frame_gen(int mode);   // 0 off, 1 ours, 2 motion view, 3 AMD FSR 3
 int  ui_frame_gen_last();          // FSR1: the mode CTRL+ALT+G turns back on
 int  ui_fsr_state();               // FSR1: 0 not tried, 1 up, -1 failed
 int  ui_dlssg_state();             // DLSSG1: 0 not tried, 1 up, -1 failed
-int  ui_fg_mult();                 // DLSSG2: 2..4
+int  ui_fg_mult();                 // DLSSG2: 2..6, what FGMultiplier asks for
+int  ui_fg_mult_running();         // MFG6: what NVIDIA FG is producing now, 0 = not generating
 void ui_set_fg_mult(int m);
 float ui_color_strength();          // CS1: 0..1, 1 = neural output untouched
 void  ui_set_color_strength(float k);
 bool ui_status_hud();               // ST1: StatusHud=1 adds the status lines to the FPS HUD
 void ui_set_status_hud(bool on);
 void set_hook_present_active(bool on);   // HP1: dllmain says the present-time feed is running
-int  ui_dlssg_max_mult();          // DLSSG2: 0 unknown yet
+int  ui_dlssg_max_mult();          // DLSSG2: driver's MultiFrameCountMax+1, 0 unknown yet
 bool ui_fg_hudfix();             // FG3
 void ui_set_fg_hudfix(bool on);
 void ui_set_late_latch_age(unsigned age);

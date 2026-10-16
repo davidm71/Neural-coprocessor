@@ -114,6 +114,10 @@
 #include "tex_census.hpp"     // R279: TexCensus=1 instrument, off by default
 #include "sl_probe.hpp"   // SL1
 #include "worker.hpp"
+#include "hotkeys.hpp"   // HK1
+#include "capture.hpp"   // SS1 / VR1 / BM1
+#include "replay.hpp"    // BM2
+#include <shellapi.h>     // SS1: open the captures folder
 
 extern "C" __declspec(dllexport) const char *NAME = "MGPU Bridge";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -1085,20 +1089,35 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 ImGui::TextDisabled("NVIDIA DLSS frame generation running.");
             else
                 ImGui::TextDisabled("NVIDIA DLSS frame generation starts on the next frame.");
-            // DLSSG2: Multi Frame Generation.
+            // DLSSG2/MFG6: Multi Frame Generation, 2x-6x. The neural card's
+            // driver says how far it goes (DLSSG.MultiFrameCountMax): RTX 40 =
+            // 2x only, RTX 50 = 4x, 6x with newer drivers. Until NVIDIA FG has
+            // started that is unknown, so every choice is offered; anything
+            // above the card's limit then runs at the limit (shown below).
             int mult = mgpu::gpu1::ui_fg_mult();
             const int maxm = mgpu::gpu1::ui_dlssg_max_mult();
+            const int run  = mgpu::gpu1::ui_fg_mult_running();
             ImGui::TextUnformatted("multiplier");
-            ImGui::SameLine();
-            if (ImGui::RadioButton("2x##fgm", &mult, 2)) mgpu::gpu1::ui_set_fg_mult(2);
-            ImGui::SameLine();
-            ImGui::BeginDisabled(maxm != 0 && maxm < 3);
-            if (ImGui::RadioButton("3x##fgm", &mult, 3)) mgpu::gpu1::ui_set_fg_mult(3);
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::BeginDisabled(maxm != 0 && maxm < 4);
-            if (ImGui::RadioButton("4x##fgm", &mult, 4)) mgpu::gpu1::ui_set_fg_mult(4);
-            ImGui::EndDisabled();
+            static const char *const kMultLabel[5] = { "2x##fgm", "3x##fgm", "4x##fgm", "5x##fgm", "6x##fgm" };
+            for (int m = 2; m <= 6; ++m)
+            {
+                ImGui::SameLine();
+                const bool over = (maxm != 0 && m > maxm);
+                ImGui::BeginDisabled(over);
+                if (ImGui::RadioButton(kMultLabel[m - 2], &mult, m)) mgpu::gpu1::ui_set_fg_mult(m);
+                ImGui::EndDisabled();
+                if (over && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("This card's driver allows up to %dx.", maxm);
+            }
+            if (maxm == 0)
+                ImGui::TextDisabled("The card's limit is read when NVIDIA frame generation starts.");
+            else if (run != 0 && run < mult)
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
+                                   "Running at %dx: %s", run,
+                                   mult > maxm ? "the card's driver allows no more."
+                                               : "no video memory for more (see ReShade.log [MGPU][MFG6]).");
+            else if (run != 0)
+                ImGui::TextDisabled("Running at %dx (this card allows up to %dx).", run, maxm);
             ImGui::TextDisabled("Keep NR fps x multiplier at or under the monitor's refresh rate.");
         }
         if (fgm == 3)
@@ -1330,13 +1349,107 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     if (ImGui::SliderFloat("seam", &sp, 0.0f, 1.0f, "%.2f"))
         mgpu::gpu1::ui_set_split_pos(sp);
     ImGui::TextDisabled("Split: input left of the seam, output right, same frame.");
-    ImGui::TextDisabled("CTRL+ALT+LEFT/RIGHT move it with no overlay open (SHIFT = coarse).");
+    ImGui::TextDisabled("CTRL+ALT+, and . move it with no overlay open (SHIFT = coarse); see Hotkeys.");
     // ST1: the status lines on the FPS HUD (StatusHud in mgpu.ini). Live.
     {
         bool sh = mgpu::gpu1::ui_status_hud();
         if (ImGui::Checkbox("status on the FPS HUD", &sh)) mgpu::gpu1::ui_set_status_hud(sh);
         ImGui::TextDisabled("Neural state, neural frames, last NGX result, frame generator, hook.");
         ImGui::TextDisabled("Shown under the FPS lines; CTRL+ALT+H hides the whole HUD.");
+    }
+
+    // ---- SS1 / VR1 / BM1 / BM2: screenshots, video, benchmark ----
+    ImGui::SeparatorText("Screenshots, video and benchmark");
+    {
+        if (ImGui::Button("Screenshot")) mgpu::capture::request_screenshot();
+        ImGui::SameLine();
+        const int rs = mgpu::capture::recording_state();
+        if (ImGui::Button(rs != 0 ? "Stop recording" : "Record video")) mgpu::capture::toggle_recording();
+        ImGui::SameLine();
+        const int bs = mgpu::capture::bench_state();
+        if (ImGui::Button(bs != 0 ? "Stop benchmark" : "Run benchmark")) mgpu::capture::toggle_benchmark();
+        ImGui::SameLine();
+        if (ImGui::Button("Open folder"))
+        {
+            wchar_t d[MAX_PATH * 2] = {};
+            if (mgpu::capture::base_folder(d, MAX_PATH * 2))
+                ShellExecuteW(nullptr, L"open", d, nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        ImGui::TextDisabled("Takes what the bridge shows: neural output and generated frames (FPS HUD optional).");
+
+        int rsec = mgpu::capture::record_seconds();
+        if (ImGui::SliderInt("video length limit (s, 0 = until stopped)", &rsec, 0, 600))
+            mgpu::capture::set_record_seconds(rsec);
+        int rf = mgpu::capture::record_fps();
+        ImGui::TextUnformatted("video frame rate:");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("every frame shown##rf", rf == 0))  mgpu::capture::set_record_fps(0);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("30##rf", rf == 30))   mgpu::capture::set_record_fps(30);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("60##rf", rf == 60))   mgpu::capture::set_record_fps(60);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("120##rf", rf == 120)) mgpu::capture::set_record_fps(120);
+        bool ra = mgpu::capture::record_audio();
+        if (ImGui::Checkbox("record game audio", &ra)) mgpu::capture::set_record_audio(ra);
+        bool sh = mgpu::capture::screenshot_hud();
+        if (ImGui::Checkbox("screenshots include the FPS HUD", &sh)) mgpu::capture::set_screenshot_hud(sh);
+        ImGui::SameLine();
+        bool rh = mgpu::capture::record_hud();
+        if (ImGui::Checkbox("video includes the FPS HUD", &rh)) mgpu::capture::set_record_hud(rh);
+
+        int bsec = mgpu::capture::bench_seconds();
+        if (ImGui::SliderInt("benchmark length (s)", &bsec, 5, 300)) mgpu::capture::set_bench_seconds(bsec);
+        int bd = mgpu::capture::bench_delay();
+        if (ImGui::SliderInt("benchmark countdown (s)", &bd, 0, 10)) mgpu::capture::set_bench_delay(bd);
+        bool br = mgpu::capture::bench_replay();
+        if (ImGui::Checkbox("use input replay (repeatable runs)", &br)) mgpu::capture::set_bench_replay(br);
+        double ps = 0.0; unsigned pe = 0;
+        if (mgpu::replay::has_path(&ps, &pe))
+            ImGui::TextDisabled("Input path for this game: %.1f s, %u events. With replay on, the run lasts as long as the path.", ps, pe);
+        else
+            ImGui::TextDisabled("No input path recorded for this game yet.");
+        if (ImGui::Button(mgpu::replay::recording() ? "Stop recording input path" : "Record input path"))
+            mgpu::replay::toggle_record();
+        ImGui::TextDisabled("Best with the hotkey: start, close this overlay, walk or pan, press it again.");
+        ImGui::TextDisabled("Turn off Windows \"Enhance pointer precision\" so mouse turns repeat exactly.");
+
+        char m1[420] = {}, m2[320] = {};
+        mgpu::capture::last_message(m1, sizeof m1);
+        mgpu::replay::last_message(m2, sizeof m2);
+        if (m1[0]) ImGui::TextWrapped("%s", m1);
+        if (m2[0]) ImGui::TextWrapped("%s", m2);
+    }
+
+    // ---- HK1: hotkeys ----
+    if (ImGui::CollapsingHeader("Hotkeys"))
+    {
+        ImGui::TextDisabled("Click a key, then press the new combination (ESC cancels).");
+        ImGui::TextDisabled("They work only while the game or the bridge window is in front.");
+        const int cap = mgpu::hotkeys::capturing();
+        for (unsigned i = 0; i < mgpu::hotkeys::count(); ++i)
+        {
+            char nm[48], lab[96];
+            mgpu::hotkeys::name(i, nm, sizeof nm);
+            snprintf(lab, sizeof lab, "%s##hk%u", (cap == (int)i) ? "Press keys..." : nm, i);
+            ImGui::TextUnformatted(mgpu::hotkeys::label(i));
+            ImGui::SameLine(260.0f);
+            if (ImGui::Button(lab, ImVec2(180.0f, 0.0f)))
+            {
+                if (cap == (int)i) mgpu::hotkeys::cancel_capture();
+                else mgpu::hotkeys::begin_capture(i);
+            }
+            const int c = mgpu::hotkeys::conflict(i);
+            if (c != 0)
+            {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                                   c == 1 ? "same keys as another action"
+                                   : c == 2 ? "another program also uses these keys"
+                                            : "no CTRL/ALT: the game sees this key too");
+            }
+        }
+        if (ImGui::Button("Reset hotkeys to defaults")) mgpu::hotkeys::reset_defaults();
     }
 
     // ---- Counters ----
@@ -3597,13 +3710,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         reshade::log::message(reshade::log::level::info,
             "[MGPU][P6.4] overlay panel registered - open the ReShade overlay (Home) over the "
             "BRIDGE window to get passes, the neural on/off and the intensity sliders. The "
-            "CTRL+ALT+F8/F9/F11 hotkeys still work and drive the same values.");
+            "intensity hotkeys (CTRL+ALT+END / PAGE UP / PAGE DOWN by default) still work and drive the same values.");
 #else
         reshade::log::message(reshade::log::level::warning,
             "[MGPU][P7.1] NO OVERLAY PANEL IN THIS BUILD - imgui.h was not on the include path "
             "when this compiled, and reshade.hpp only wires up the ImGui function table when "
             "IMGUI_VERSION_NUM is defined ahead of it. Nothing else is affected: use the "
-            "CTRL+ALT+F8 / F9 / F11 hotkeys, which drive exactly the same values. To get the "
+            "intensity hotkeys (CTRL+ALT+END / PAGE UP / PAGE DOWN by default), which drive exactly the same values. To get the "
             "panel, put ImGui 1.92.5's imgui.h and imconfig.h (tag 3912b3d, the commit ReShade "
             "18deaa52 pins at deps/imgui) somewhere on the include path. A target_include_"
             "directories line pointing at a directory that does not exist is silently ignored "

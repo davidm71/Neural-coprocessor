@@ -280,7 +280,7 @@ namespace
         // a ReShade resource handle (what the probe's tap copies) and is destroyed
         // through the same device at shutdown. The census is told about it below.
         reshade::api::resource_desc vd(g_w, g_h, 1, 1, reshade::api::format::r16g16_float, 1,
-                                       reshade::api::memory_heap::gpu_only,
+                                       reshade::api::memory_heap::default_,
                                        reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_source);
         if (!api_dev->create_resource(vd, nullptr, reshade::api::resource_usage::shader_resource, &g_target_api) || g_target_api.handle == 0)
         {

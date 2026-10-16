@@ -44,6 +44,9 @@
 #include "gpu1_context.hpp"
 #include "worker.hpp"
 #include "hud_probe.hpp"   // HUD1
+#include "hotkeys.hpp"     // HK1
+#include "capture.hpp"     // SS1 / VR1 / BM1
+#include "replay.hpp"      // BM2
 
 // T4 (brief section 00, exception 1): the add-on's own module handle,
 // defined in dllmain.cpp and captured at DLL_PROCESS_ATTACH.
@@ -753,126 +756,16 @@ namespace
                     // owns Home, and games claim unmodified F-keys freely.
                     // Failure is logged and non-fatal - the startup run still
                     // happens, we just lose manual triggering.
+                    // HK1: no RegisterHotKey any more. The keys are read by
+                    // polling on this thread, only while a window of this
+                    // process is in front - nothing is taken from (or refused
+                    // by) other programs. See hotkeys.hpp. The old P1.3g/P6.3/
+                    // V52/P7.4/P7.5 key ids and their WM_HOTKEY branches below
+                    // are kept but never fire.
                     if (hwnd != nullptr)
                     {
-                        if (RegisterHotKey(nullptr, MGPU_HOTKEY_ID,
-                                           MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F10) != FALSE)
-                        {
-                            hotkey_ok = true;
-                            // P6.3: the intensity keys. Each is independent -
-                            // one failing does not cost the others, and the log
-                            // names exactly which are available, because a key
-                            // that silently did not register is a knob the
-                            // operator will press and believe.
-                            const bool k_t = RegisterHotKey(nullptr, MGPU_HOTKEY_INT_TARGET,
-                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F8) != FALSE;
-                            const bool k_d = RegisterHotKey(nullptr, MGPU_HOTKEY_INT_DOWN,
-                                                MOD_CONTROL | MOD_ALT, VK_F9) != FALSE;
-                            const bool k_u = RegisterHotKey(nullptr, MGPU_HOTKEY_INT_UP,
-                                                MOD_CONTROL | MOD_ALT, VK_F11) != FALSE;
-                            const bool k_p =
-                                mgpu::gpu1::dcomp_overlay_mode() &&
-                                RegisterHotKey(nullptr, MGPU_HOTKEY_PEEK,
-                                    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F6) != FALSE;
-                            if (mgpu::gpu1::dcomp_overlay_mode())
-                            {
-                                char pk[440];
-                                snprintf(pk, sizeof pk,
-                                         "[MGPU][V52] peek hotkey: CTRL+ALT+F6 hides and restores "
-                                         "the bridge visual = %s. DcompOverlay=1 puts the bridge "
-                                         "ABOVE the game's own ReShade overlay, so this is how "
-                                         "you reach that overlay - and how you dismiss the "
-                                         "run-end screen. It unroots a visual and roots it again; "
-                                         "the stream is never touched.",
-                                         k_p ? "OK" : "FAILED");
-                                if (k_p) mgpu::diag::info(pk);
-                                else     mgpu::diag::warn(pk);
-                            }
-                            const bool k_h = RegisterHotKey(nullptr, MGPU_HOTKEY_FPS_HUD,
-                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'H') != FALSE;
-                            {
-                                char hk[220];
-                                snprintf(hk, sizeof hk,
-                                         "[MGPU][HUD] FPS HUD hotkey: CTRL+ALT+H = %s. HUD starts BASIC; cycles BASIC/DETAIL/OFF.",
-                                         k_h ? "OK" : "FAILED");
-                                if (k_h) mgpu::diag::info(hk);
-                                else     mgpu::diag::warn(hk);
-                            }
-                            const bool k_g = RegisterHotKey(nullptr, MGPU_HOTKEY_FRAMEGEN,
-                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G') != FALSE;
-                            if (k_g)
-                                mgpu::diag::info("[MGPU][FG1] frame generation hotkey: CTRL+ALT+G "
-                                                 "= OK. Toggles off/on live and saves FrameGen "
-                                                 "to mgpu.ini.");
-                            else
-                                mgpu::diag::warn("[MGPU][FG1] frame generation hotkey: CTRL+ALT+G "
-                                                 "= FAILED (another program holds it). Use the "
-                                                 "panel instead.");
-                            {
-                                const bool k_j = RegisterHotKey(nullptr, MGPU_HOTKEY_HUDPROBE,
-                                                    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'J') != FALSE;
-                                if (k_j) mgpu::diag::info("[MGPU][HUD1] capture hotkey: CTRL+ALT+J = OK (does nothing unless HudProbe=1).");
-                                else     mgpu::diag::warn("[MGPU][HUD1] capture hotkey: CTRL+ALT+J = FAILED "
-                                                          "(another program holds it). Use the panel button.");
-                            }
-                            const bool k_v = RegisterHotKey(nullptr, MGPU_HOTKEY_VIEW,
-                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F7) != FALSE;
-                            const bool s_l  = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L,
-                                                MOD_CONTROL | MOD_ALT, VK_LEFT) != FALSE;
-                            const bool s_r  = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_R,
-                                                MOD_CONTROL | MOD_ALT, VK_RIGHT) != FALSE;
-                            const bool s_lc = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_LC,
-                                                MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_LEFT) != FALSE;
-                            const bool s_rc = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_RC,
-                                                MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_RIGHT) != FALSE;
-                            char sk[400];
-                            snprintf(sk, sizeof sk,
-                                     "[MGPU][P7.5] seam hotkeys: CTRL+ALT+LEFT/RIGHT move the split "
-                                     "seam = %s/%s | add SHIFT for a coarse step = %s/%s. They "
-                                     "repeat when held and need NO overlay open, so the seam can be "
-                                     "dragged across a face while the game is the only thing on "
-                                     "screen - which is the point of having them at all.",
-                                     s_l ? "OK" : "FAILED", s_r ? "OK" : "FAILED",
-                                     s_lc ? "OK" : "FAILED", s_rc ? "OK" : "FAILED");
-                            mgpu::diag::info(sk);
-                            char vk[300];
-                            snprintf(vk, sizeof vk,
-                                     "[MGPU][P7.4] view hotkey: CTRL+ALT+F7 cycles output -> input "
-                                     "-> split = %s. Split shows the frame handed TO the model on "
-                                     "the left and what it produced on the right, THE SAME FRAME, "
-                                     "so the two halves cannot disagree about time, camera or "
-                                     "lighting. The neural stage is unchanged in all three.",
-                                     k_v ? "OK" : "FAILED");
-                            mgpu::diag::info(vk);
-                            char ik[420];
-                            snprintf(ik, sizeof ik,
-                                     "[MGPU][P6.3] intensity hotkeys: CTRL+ALT+F8 cycle target "
-                                     "(all/p1/p2/...) = %s | CTRL+ALT+F9 down = %s | CTRL+ALT+F11 "
-                                     "up = %s. Steps of 0.05, clamped 0.00-2.00, live from the "
-                                     "next frame - NGX parameters are set per evaluate, so no "
-                                     "re-arm and no relaunch. DOWN and UP repeat when held; the "
-                                     "target key does not.",
-                                     k_t ? "OK" : "FAILED", k_d ? "OK" : "FAILED",
-                                     k_u ? "OK" : "FAILED");
-                            if (k_t && k_d && k_u) mgpu::diag::info(ik);
-                            else                   mgpu::diag::warn(ik);
-                            mgpu::diag::info("[MGPU][P1.3g] hotkey registered: CTRL+ALT+F10 runs the "
-                                             "transit probe on demand, from any foreground window. "
-                                             "Press it once the game has settled - in gameplay, not "
-                                             "the menu - and again with a different window focused; "
-                                             "each run labels itself and records which window held "
-                                             "the foreground.");
-                        }
-                        else
-                        {
-                            char hk[256];
-                            snprintf(hk, sizeof hk,
-                                     "[MGPU][P1.3g] RegisterHotKey failed (GetLastError=%lu) - "
-                                     "CTRL+ALT+F10 is probably owned by another process. Manual runs "
-                                     "unavailable this launch; the startup run is unaffected.",
-                                     (unsigned long)GetLastError());
-                            mgpu::diag::warn(hk);
-                        }
+                        mgpu::hotkeys::init();
+                        hotkey_ok = true;
                     }
 
                     // T5: the present chain on the GPU 1 device, against
@@ -1090,6 +983,43 @@ namespace
                     }
                     TranslateMessage(&m);
                     DispatchMessageW(&m);
+                }
+
+                // HK1: the polled hotkeys, folded into the same counters the
+                // WM_HOTKEY branches above used to fill, so everything below
+                // is unchanged. SS1/VR1/BM1 are new actions.
+                {
+                    mgpu::hotkeys::presses hp;
+                    if (mgpu::hotkeys::poll(hp))
+                    {
+                        using namespace mgpu::hotkeys;
+                        int_cycles  += hp.n[A_INT_TARGET];
+                        int_delta   += (int)hp.n[A_INT_UP] - (int)hp.n[A_INT_DOWN];
+                        view_cycles += hp.n[A_VIEW];
+                        seam_delta  += (int)hp.n[A_SEAM_R] - (int)hp.n[A_SEAM_L];
+                        seam_coarse += hp.seam_coarse;
+                        if (hp.n[A_TRANSIT]) run_transit = true;
+                        for (unsigned i = 0; i < hp.n[A_FPS_HUD]; ++i) (void)mgpu::gpu1::fps_hud_toggle();
+                        if (hp.n[A_HUDPROBE] && mgpu::hudprobe::enabled())
+                        {
+                            mgpu::hudprobe::request_capture();
+                            mgpu::diag::info("[MGPU][HUD1] hotkey: capture requested");
+                        }
+                        if (hp.n[A_FRAMEGEN] & 1u)
+                        {
+                            const int fgm = (mgpu::gpu1::ui_frame_gen() != 0)
+                                                ? 0 : mgpu::gpu1::ui_frame_gen_last();
+                            mgpu::gpu1::ui_set_frame_gen(fgm);
+                            mgpu::diag::info(fgm ? "[MGPU][FG1] hotkey: frame generation ON"
+                                                 : "[MGPU][FG1] hotkey: frame generation OFF");
+                        }
+                        if ((hp.n[A_PEEK] & 1u) && mgpu::gpu1::dcomp_overlay_mode())
+                            (void)mgpu::gpu1::dcomp_peek_toggle();
+                        if (hp.n[A_SCREENSHOT]) mgpu::capture::request_screenshot();
+                        if (hp.n[A_RECORD] & 1u) mgpu::capture::toggle_recording();
+                        if (hp.n[A_BENCH] & 1u)  mgpu::capture::toggle_benchmark();
+                        if (hp.n[A_PATH] & 1u)   mgpu::replay::toggle_record();
+                    }
                 }
 
                 // P6.3. Target first, then the steps, so pressing F8 and F9 in
@@ -1549,25 +1479,8 @@ namespace
         // created against and would outlive it. gpu1::shutdown() drains
         // the GPU before releasing the chain, and is a no-op for the chain
         // when none was created (the no-window path is unaffected).
-        if (hotkey_ok)
-        {
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_ID);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_TARGET);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_DOWN);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_UP);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_VIEW);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_FPS_HUD);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_FRAMEGEN);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_HUDPROBE);
-            // V52: only ever registered in ghost mode.
-            if (mgpu::gpu1::dcomp_overlay_mode())
-                UnregisterHotKey(nullptr, MGPU_HOTKEY_PEEK);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_R);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_LC);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_RC);
-            mgpu::diag::info("[MGPU][P1.3g] hotkeys unregistered (transit + P6.3 intensity)");
-        }
+        (void)hotkey_ok;   // HK1: nothing registered, nothing to unregister
+        mgpu::capture::shutdown();   // VR1/BM1: finish a recording or benchmark in progress
 
         mgpu::diag::info("[MGPU][T5] shutdown - ordered teardown (NGX features -> "
                          "gpu1::shutdown [present chain -> device] -> DestroyWindow -> "

@@ -295,7 +295,7 @@ namespace
         if (g_rb.handle != 0 && g_rb_size < need) { g_api_dev->destroy_resource(g_rb); g_rb = { 0 }; g_rb_size = 0; }
         if (g_rb.handle == 0)
         {
-            if (!g_api_dev->create_resource(reshade::api::resource_desc(need, reshade::api::memory_heap::gpu_to_cpu,
+            if (!g_api_dev->create_resource(reshade::api::resource_desc(need, reshade::api::memory_heap::readback,
                                                                           reshade::api::resource_usage::copy_dest),
                                             nullptr, reshade::api::resource_usage::copy_dest, &g_rb))
             {
