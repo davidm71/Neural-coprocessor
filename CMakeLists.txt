@@ -75,6 +75,8 @@ add_library(mgpu_bridge SHARED
     # run time), frame-time benchmark. BM2: input replay for the benchmark.
     src/capture.cpp
     src/replay.cpp
+    src/framewarp.cpp
+    src/crashlog.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE

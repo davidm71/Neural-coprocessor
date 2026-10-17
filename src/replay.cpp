@@ -435,6 +435,14 @@ void stop_play()
 
 bool aborted() { return g_aborted.load(); }
 
+void emergency_unhook()
+{
+    // REV: DllMain live unload - no joins under the loader lock; just make
+    // sure Windows stops calling into this image.
+    if (g_kb) { UnhookWindowsHookEx(g_kb); g_kb = nullptr; }
+    if (g_ms) { UnhookWindowsHookEx(g_ms); g_ms = nullptr; }
+}
+
 void shutdown()
 {
     g_recording.store(false);
@@ -443,6 +451,7 @@ void shutdown()
     {
         if (g_hook_tid.load()) PostThreadMessageW(g_hook_tid.load(), WM_QUIT, 0, 0);
         g_hook_thread.join();
+        g_hook_tid.store(0);   // REV4: the next ensure_hook_thread must wait for the new thread's id
     }
 }
 

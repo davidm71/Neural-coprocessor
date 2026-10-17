@@ -8,6 +8,7 @@
 #include <cstring>
 #include <mutex>
 #include <atomic>
+#include <thread>
 
 #include "diag.hpp"
 #include "gpu1_context.hpp"
@@ -63,7 +64,18 @@ ULONGLONG  g_next_rep[A_COUNT] = {};
 bool       g_down_coarse[2] = {};
 ULONGLONG  g_next_rep_coarse[2] = {};
 
-bool key(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+// HK2: keys of our combinations that the keyboard hook swallowed. A swallowed
+// key never reaches the game - and never updates GetAsyncKeyState either, so
+// the poll reads these alongside it.
+std::atomic<bool> g_swallowed[256] = {};
+std::atomic<unsigned> g_swallow_n{0};    // HK2: keys kept from the game (logged by the poll)
+std::atomic<unsigned> g_swallow_vk{0};
+
+bool key(int vk)
+{
+    if (vk > 0 && vk < 256 && g_swallowed[vk].load(std::memory_order_relaxed)) return true;
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
 
 unsigned char mods_now()
 {
@@ -217,7 +229,109 @@ bool own_foreground()
     return pid == GetCurrentProcessId();
 }
 
+// ---- HK2: keep our combinations away from the game ----
+// The poll only reads the keyboard, so the game saw every combination too:
+// CTRL+ALT+H also triggered RoboCop's heal (bound to H). A low-level keyboard
+// hook now discards the main key of a combination that is one of ours - the
+// game sees CTRL and ALT, never the H. Only bindings with CTRL or ALT are
+// guarded (a plain key belongs to the game), only while this process is in
+// front, and never injected keys (input replay).
+HHOOK g_kbhook = nullptr;
+std::atomic<DWORD> g_kb_tid{0};
+std::thread *g_kb_thread = nullptr;
+binding g_guard[A_COUNT] = {};        // copy of the bindings the hook reads
+std::atomic<unsigned> g_guard_n{0};
+std::mutex g_guard_mx;
+
+unsigned char hook_mods()
+{
+    unsigned char m = 0;
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) m |= M_CTRL;
+    if (GetAsyncKeyState(VK_MENU) & 0x8000)    m |= M_ALT;
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000)   m |= M_SHIFT;
+    return m;
+}
+
+LRESULT CALLBACK kb_proc(int code, WPARAM wp, LPARAM lp)
+{
+    if (code == HC_ACTION)
+    {
+        const KBDLLHOOKSTRUCT *k = reinterpret_cast<const KBDLLHOOKSTRUCT *>(lp);
+        const DWORD vk = k->vkCode;
+        const bool up = (k->flags & LLKHF_UP) != 0;
+        if (vk < 256 && (k->flags & LLKHF_INJECTED) == 0)
+        {
+            // The release of a key we swallowed is swallowed too, whatever the
+            // modifiers are by then: the game never saw it go down.
+            if (up && g_swallowed[vk].load(std::memory_order_relaxed))
+            {
+                g_swallowed[vk].store(false, std::memory_order_relaxed);
+                return 1;
+            }
+            if (!up && g_cap.load() < 0 && own_foreground())
+            {
+                const unsigned char m = hook_mods();
+                if ((m & (M_CTRL | M_ALT)) != 0)
+                {
+                    std::lock_guard<std::mutex> gl(g_guard_mx);
+                    for (unsigned a = 0; a < A_COUNT; ++a)
+                    {
+                        const binding &b = g_guard[a];
+                        if (b.vk != vk || (b.mods & (M_CTRL | M_ALT)) == 0) continue;
+                        // The seam keys also fire with SHIFT added (coarse step).
+                        const unsigned char have = (a == A_SEAM_L || a == A_SEAM_R) ? (unsigned char)(m & ~M_SHIFT) : m;
+                        const unsigned char want = (a == A_SEAM_L || a == A_SEAM_R) ? (unsigned char)(b.mods & ~M_SHIFT) : b.mods;
+                        if (have == want)
+                        {
+                            if (!g_swallowed[vk].load(std::memory_order_relaxed))
+                            {
+                                g_swallow_vk.store(vk | ((unsigned)m << 8), std::memory_order_relaxed);
+                                g_swallow_n.fetch_add(1, std::memory_order_relaxed);
+                            }
+                            g_swallowed[vk].store(true, std::memory_order_relaxed);
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+void kb_main()
+{
+    MSG msg;
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    g_kb_tid.store(GetCurrentThreadId());
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&kb_proc), &self);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    g_kbhook = SetWindowsHookExW(WH_KEYBOARD_LL, kb_proc, self, 0);
+    if (g_kbhook == nullptr)
+    {
+        char l[200];
+        snprintf(l, sizeof l, "[MGPU][HK2] keyboard hook not installed (error %lu) - the game will also see "
+                 "the hotkeys' keys.", GetLastError());
+        mgpu::diag::warn(l);
+    }
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    if (g_kbhook) { UnhookWindowsHookEx(g_kbhook); g_kbhook = nullptr; }
+}
+
+void guard_refresh_locked()   // under g_mx
+{
+    std::lock_guard<std::mutex> gl(g_guard_mx);
+    memcpy(g_guard, g_bind, sizeof g_guard);
+}
+
 } // namespace
+
+void emergency_unhook()
+{
+    if (g_kbhook) { UnhookWindowsHookEx(g_kbhook); g_kbhook = nullptr; }
+}
 
 void init()
 {
@@ -229,12 +343,37 @@ void init()
     }
     g_inited = true;
     recheck_locked(true);
+    guard_refresh_locked();   // HK2
+    if (g_kb_thread == nullptr)
+    {
+        g_kb_thread = new std::thread(kb_main);   // lives for the process; DllMain unhooks on unload
+        g_kb_thread->detach();
+        mgpu::diag::info("[MGPU][HK2] hotkey keys are kept from the game (a CTRL/ALT combination of ours "
+                         "never reaches it).");
+    }
 }
 
 bool poll(presses &out)
 {
     memset(&out, 0, sizeof out);
     if (!g_inited) return false;
+    {   // HK2: say (the first few times) that a key was kept from the game.
+        static unsigned said = 0, seen = 0;
+        const unsigned n = g_swallow_n.load(std::memory_order_relaxed);
+        if (n != seen)
+        {
+            seen = n;
+            if (said < 5u)
+            {
+                ++said;
+                const unsigned v = g_swallow_vk.load(std::memory_order_relaxed);
+                char nm[48], l[160];
+                bind_name(binding{ (unsigned char)(v >> 8), (unsigned char)(v & 0xFF) }, nm, sizeof nm);
+                snprintf(l, sizeof l, "[MGPU][HK2] kept %s from the game (only CTRL/ALT/SHIFT reached it).", nm);
+                mgpu::diag::info(l);
+            }
+        }
+    }
     if (g_recheck.exchange(false))
     {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -264,6 +403,7 @@ bool poll(presses &out)
             g_bind[cap].mods = mods_now();
             g_bind[cap].vk = (unsigned char)hit;
             save((unsigned)cap);
+            guard_refresh_locked();   // HK2
             bind_name(g_bind[cap], nm, sizeof nm);
             recheck_locked(false);
         }
@@ -344,6 +484,7 @@ void reset_defaults()
     {
         std::lock_guard<std::mutex> lk(g_mx);
         for (unsigned a = 0; a < A_COUNT; ++a) { g_bind[a] = DEFS[a].dflt; save(a); }
+        guard_refresh_locked();   // HK2
     }
     g_recheck.store(true);
     mgpu::diag::info("[MGPU][HK1] hotkeys reset to the defaults.");

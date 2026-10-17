@@ -102,4 +102,10 @@ namespace mgpu::sltags
 
     // Put the import slots back. Idempotent.
     void uninstall();
+
+    // FW1: the game's horizontal field of view in degrees, from the newest
+    // sane cameraViewToClip the constants tap saw (needs the tap installed,
+    // SLTags=3 on titles that resolve Streamline at runtime). false when no
+    // such frame arrived in the last two seconds.
+    bool camera_hfov_deg(float &deg);
 }

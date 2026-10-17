@@ -11,6 +11,7 @@
 //   audio         WASAPI loopback capture while a recording runs.
 // ---------------------------------------------------------------------------
 #include "capture.hpp"
+#include "framewarp.hpp"
 
 #include <windows.h>
 #include <d3d12.h>
@@ -1163,12 +1164,15 @@ bm_snap bm_snapshot(char *settings, unsigned n)
             snprintf(res, sizeof res, "neural rendering %ux%u, upscaled to %ux%u", st.sr_w, st.sr_h, g_last_w, g_last_h);
         else
             snprintf(res, sizeof res, "neural rendering %ux%u (no upscaling)", g_last_w, g_last_h);
+        char fw[64] = "";
+        if (mgpu::framewarp::enabled())
+            snprintf(fw, sizeof fw, " | FrameWarp on (%.3f deg/count)", (double)mgpu::framewarp::scale() / 1000.0);
         snprintf(settings, n,
-                 "FrameGen=%d (%s)%s | Neural=%s Passes=%u Intensity=%.2f ColorStrength=%.2f | %s | %s",
+                 "FrameGen=%d (%s)%s | Neural=%s Passes=%u Intensity=%.2f ColorStrength=%.2f | %s | %s%s",
                  fg, fg_name(fg),
                  (fg == 4) ? (std::string(" ") + std::to_string(mgpu::gpu1::ui_fg_mult()) + "x").c_str() : "",
                  st.neural ? "on" : "off", st.passes, st.intensity[0], mgpu::gpu1::ui_color_strength(), res,
-                 mgpu::gpu1::ui_present_vsync() ? "bridge vsync on" : "bridge vsync off");
+                 mgpu::gpu1::ui_present_vsync() ? "bridge vsync on" : "bridge vsync off", fw);
     }
     return s;
 }
@@ -1327,7 +1331,10 @@ void bench_tick()
 // ===========================================================================
 std::thread g_worker;
 std::atomic<bool> g_wstop{false};
-std::once_flag g_wonce;
+// REV4: start/stop of the worker. It was a once_flag, so after the first
+// shutdown (every bridge rearm) nothing could ever start it again and the
+// present-side taps stayed dead (g_dead) for the rest of the session.
+std::mutex g_wmx;
 
 void worker_main()
 {
@@ -1347,7 +1354,14 @@ void worker_main()
 
 void ensure_worker()
 {
-    std::call_once(g_wonce, [] { g_worker = std::thread(worker_main); });
+    std::lock_guard<std::mutex> wl(g_wmx);
+    if (g_worker.joinable()) return;
+    g_wstop.store(false);
+    {
+        std::lock_guard<std::mutex> plk(g_pmx);
+        g_dead = false;
+    }
+    g_worker = std::thread(worker_main);
 }
 
 } // namespace
@@ -1394,6 +1408,7 @@ void toggle_benchmark()
 void shutdown()
 {
     mgpu::replay::shutdown();
+    std::lock_guard<std::mutex> wl(g_wmx);   // REV4: not while a hotkey is starting it
     if (!g_worker.joinable()) return;
     if (g_rec.load() != 0)
     {

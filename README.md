@@ -55,13 +55,73 @@ Research code, not a product. Run games with anti-cheat and online games at your
   `FrameGen=1` the mod's own warp, `3` AMD FSR 3 frame generation (needs
   `amd_fidelityfx_framegeneration_dx12.dll` in the `mgpu` folder), `4` NVIDIA DLSS Frame
   Generation (RTX 40/50 neural card; uses the driver's own model, nothing to download).
-- NVIDIA mode does 2x, 3x or 4x (`FGMultiplier`, also in the panel). If a generator cannot
+- NVIDIA mode does 2x to 6x (`FGMultiplier`, also in the panel), as far as the neural card's
+  driver allows (RTX 40: 2x; RTX 50: 4x, 6x on newer drivers - the panel greys out the rest). If a generator cannot
   start, or fails three times, the mod's own takes over and the panel says so in red.
 - **HUD-less mode** (`HudLess=1`, D3D12): frame generation runs on the scene without the
   HUD and the HUD is laid back on top, so text and markers never warp.
+  Full-screen menus are recognised (most of the screen differs from the scene) and shown as
+  the game draws them, so they are never see-through.
 - NVIDIA mode's camera data is estimated: set `FSRFov` to the game's horizontal FOV if
   nearby objects wobble in generated frames.
 - **Cap the game's frame rate for 3x/4x** - see Recommended setup.
+
+**Screenshots, video and benchmark** (panel section of the same name)
+- They capture what the bridge shows: neural output and generated frames, no HUD. Tools
+  that hook the game (NVIDIA overlay, Steam, OBS Game Capture) only see the render card's
+  raw frames.
+- **Screenshot** (`CTRL+ALT+P`): a PNG in `mgpu\captures\`.
+- **Video** (`CTRL+ALT+R` start/stop): MP4, H.264 on the neural card's hardware encoder,
+  with the game's own audio. Length limit (`RecordSeconds`) and frame rate (`RecordFps`,
+  default every frame shown) are in the panel.
+- **Benchmark** (`CTRL+ALT+B`): a timed run (countdown, then `BenchSeconds`). It reports:
+  - average fps, 1% and 0.1% lows, frame-time percentiles and stutters;
+  - real-frame pacing, i.e. how evenly the non-generated frames arrive;
+  - the latency the mod adds, from the game handing over its frame to the neural frame
+    on screen;
+  - game and neural-card fps.
+  Each run is saved with its settings and appended to `mgpu\benchmarks\results.csv`,
+  so settings can be compared side by side.
+- **Input replay for repeatable runs** (`BenchReplay=1`): record a path once (`CTRL+ALT+I`
+  start/stop) and every benchmark replays the same keyboard and mouse input. Turn off
+  Windows "Enhance pointer precision" for exact mouse turns; single-player games only.
+
+**Frame Warp** (`FrameWarp=1`, panel section of the same name)
+- **What it does:** the idea of NVIDIA Reflex 2's Frame Warp, with the mod's own code. Right
+  before each frame is shown, the second card shifts the picture by the mouse movement made
+  since that frame was rendered, so camera turns show up in the next displayed frame instead
+  of after the bridge's delay.
+- **Strength** (slider, default 20%): how much of the delay to make up. The bridge's delay is
+  about 100 ms, and making all of it up means sliding the picture far, with a wide stretched
+  edge; a part of it gives quicker-feeling turns with little distortion. Each warp is also
+  limited to 3 degrees.
+- **Limits:** only camera turning gets faster; walking, shooting and animation still take the
+  full delay. The screen edges stretch while turning, and the game's HUD moves with the picture
+  during a turn. It pauses in menus by itself: when the mouse moves but the picture does not
+  turn, it is a menu (this works with games that draw their own cursor).
+- **Auto-calibrate** (checkbox, on by default): while Frame Warp is on, clean camera turns are
+  measured and the field of view and degrees per mouse count update and save themselves. Once
+  they settle, sampling pauses and re-checks every 5 minutes. The last values are kept for the
+  next launch.
+- **Calibrate** (button): measures both now. Click it, close the overlay so the mouse turns the
+  camera, then stand still and turn left and right steadily for about 5 seconds. The values
+  are measured from the game's own motion vectors and saved.
+- **Fine-tuning by hand:** the "degrees per mouse count" slider. Turn and stop: if the view
+  springs back after you stop, lower it; if it still lags behind the mouse, raise it. Moving
+  the slider switches auto-calibrate off so your value stays.
+- The game's own field of view is used instead when it reaches the mod through Streamline
+  (`SLTags=3`). Turn off Windows "Enhance pointer precision" for best results.
+
+**Crash catcher**: if the game ever crashes to the desktop, the add-on writes one line naming
+what crashed (the module, the place inside it and the call chain) to `mgpu\crash.txt` and to
+ReShade.log as `[MGPU][CR1]`, even when Windows and the game record nothing. Send that line with a
+bug report. It never changes how an error is handled.
+
+**Hotkeys**: all of them can be changed in the panel by clicking one and pressing the new
+combination. They only work while the game or the bridge window is in front, so they no
+longer clash with other programs. The game never sees the key of a CTRL/ALT combination of
+ours (CTRL+ALT+H no longer also presses H in the game). The panel flags a combination that another program also
+uses.
 
 **Image, compatibility and status**
 - **Color Strength** (`ColorStrength=0.00-1.00`, panel slider under Intensity): keeps the
@@ -136,8 +196,8 @@ upstream is marked `; FORK`.
    HookPoint=0         ; auto fallback if the game's ReShade never runs an effect
    ```
    Optional, off in the shipped file: `ColorStrength` below 1.00 (restore the game's
-   colours), `StatusHud=1` (status lines for bug reports), `FGMultiplier=3/4` (NVIDIA FG
-   3x/4x), `NRInput16=4` (FP16 input). `DcompOverlay=1` plays on the neural card's monitor
+   colours), `StatusHud=1` (status lines for bug reports), `FGMultiplier=3` to `6` (NVIDIA FG
+   3x-6x), `NRInput16=4` (FP16 input). `DcompOverlay=1` plays on the neural card's monitor
    with no bridge window (the author's setup, with a second display on the iGPU); the
    shipped file has 0, a normal bridge window.
    `SRUpscale=1` with `SRScale=0` is Native Upscaling: the second card runs neural

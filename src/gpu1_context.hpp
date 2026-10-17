@@ -98,7 +98,10 @@ namespace mgpu::gpu1
     int fps_hud_toggle();
     int fps_hud_mode();
 
-    void stream_shutdown();
+    // REV: lock_timeout_ms > 0 (DllMain): give up instead of blocking when the
+    // bridge thread holds the stream lock - it may be inside an NGX call that
+    // needs the loader lock this caller holds.
+    void stream_shutdown(unsigned lock_timeout_ms = 0);
 
     void shutdown();
 
@@ -545,6 +548,7 @@ int  ui_fsr_state();               // FSR1: 0 not tried, 1 up, -1 failed
 int  ui_dlssg_state();             // DLSSG1: 0 not tried, 1 up, -1 failed
 int  ui_fg_mult();                 // DLSSG2: 2..6, what FGMultiplier asks for
 int  ui_fg_mult_running();         // MFG6: what NVIDIA FG is producing now, 0 = not generating
+bool ui_fg_extras_failed();        // MFG7: the 5x/6x buffers could not be made (out of video memory)
 void ui_set_fg_mult(int m);
 float ui_color_strength();          // CS1: 0..1, 1 = neural output untouched
 void  ui_set_color_strength(float k);

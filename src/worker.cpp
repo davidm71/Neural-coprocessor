@@ -46,6 +46,7 @@
 #include "hud_probe.hpp"   // HUD1
 #include "hotkeys.hpp"     // HK1
 #include "capture.hpp"     // SS1 / VR1 / BM1
+#include "framewarp.hpp"   // FW1
 #include "replay.hpp"      // BM2
 
 // T4 (brief section 00, exception 1): the add-on's own module handle,
@@ -1481,6 +1482,7 @@ namespace
         // when none was created (the no-window path is unaffected).
         (void)hotkey_ok;   // HK1: nothing registered, nothing to unregister
         mgpu::capture::shutdown();   // VR1/BM1: finish a recording or benchmark in progress
+        mgpu::framewarp::shutdown(); // FW1: stop the mouse hook
 
         mgpu::diag::info("[MGPU][T5] shutdown - ordered teardown (NGX features -> "
                          "gpu1::shutdown [present chain -> device] -> DestroyWindow -> "
@@ -1497,6 +1499,7 @@ namespace
         mgpu::gpu1::late_latch_shutdown();   // HARDEN2: bridge thread, loop has exited
 
         mgpu::gpu1::shutdown();
+        mgpu::framewarp::release_gpu_now();   // FW1: the present queue is drained now
 
         if (hwnd != nullptr)
         {

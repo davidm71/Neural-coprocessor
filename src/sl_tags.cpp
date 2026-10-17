@@ -18,6 +18,7 @@
 #include <wchar.h>   // _wcsnicmp, for skipping sl.* modules by name
 #include <atomic>
 #include <mutex>
+#include <math.h>
 
 namespace mgpu::sltags
 {
@@ -435,6 +436,8 @@ namespace
     const char *bool_name(unsigned char v)
     { return (v == 0) ? "false" : (v == 1) ? "true" : (v == 2) ? "UNSET" : "?"; }
 
+    std::atomic<float> g_hfov_deg{0.0f};             // FW1
+    std::atomic<unsigned long long> g_hfov_tick{0};
     std::mutex g_sc_cs;
     unsigned long long g_sc_calls = 0, g_sc_bad = 0, g_sc_sane = 0;
     unsigned long long g_sc_zero = 0, g_sc_ident = 0, g_sc_invalid = 0;
@@ -477,6 +480,13 @@ namespace
         else
         {
             ++g_sc_sane;
+            // FW1: P[0][0] of a perspective projection is cot(hfov / 2).
+            const float p00 = fp(s, C_V2C)[0];
+            if (p00 > 0.2f && p00 < 8.0f)
+            {
+                g_hfov_deg.store(2.0f * atanf(1.0f / p00) * 57.2957795f, std::memory_order_relaxed);
+                g_hfov_tick.store(GetTickCount64(), std::memory_order_relaxed);
+            }
             const float e = inverse_error(fp(s, C_C2V), fp(s, C_V2C));
             if (e > g_sc_inv_err_max) g_sc_inv_err_max = e;
         }
@@ -917,4 +927,12 @@ void uninstall()
     mgpu::diag::info("[MGPU][SLT1] TAP REMOVED. Import slots restored.");
 }
 
+
+    bool camera_hfov_deg(float &deg)
+    {
+        const unsigned long long t = g_hfov_tick.load(std::memory_order_relaxed);
+        if (t == 0ull || GetTickCount64() - t > 2000ull) return false;
+        deg = g_hfov_deg.load(std::memory_order_relaxed);
+        return deg > 20.0f && deg < 170.0f;
+    }
 } // namespace mgpu::sltags

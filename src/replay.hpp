@@ -38,6 +38,7 @@ void stop_play();
 bool aborted();                   // the last playback was stopped by the user
 
 void shutdown();
+void emergency_unhook();   // REV: DllMain live unload - remove the hooks, join nothing
 void hud_line(char *out, unsigned n);       // "PATH REC 12" / "" (font-safe)
 void last_message(char *out, unsigned n);   // for the panel
 

@@ -4,7 +4,7 @@ Based on the **0.2.5 release** of [maohgad-web/Neural-coprocessor](https://githu
 (tag `0.2.5`, commit 965a14f). All 0.2.5 features are kept; the changes below are
 additions. This file covers the fork's first round (transport, pacing, overlay, HUD,
 bug fixes) with its measurements. Later additions - the 0.3.1 backports, frame generation
-(own / AMD FSR 3 / NVIDIA DLSS FG 2x-4x), HUD-less mode, Color Strength, the present-time
+(own / AMD FSR 3 / NVIDIA DLSS FG 2x-6x), Frame Warp (late camera reprojection), HUD-less mode, Color Strength, the present-time
 hook and the status readout - are described in [README.md](README.md). Which features are
 on is decided by the shipped `assets/mgpu.ini`.
 

@@ -116,6 +116,8 @@
 #include "worker.hpp"
 #include "hotkeys.hpp"   // HK1
 #include "capture.hpp"   // SS1 / VR1 / BM1
+#include "framewarp.hpp" // FW1
+#include "crashlog.hpp"  // CR1
 #include "replay.hpp"    // BM2
 #include <shellapi.h>     // SS1: open the captures folder
 
@@ -1109,13 +1111,24 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 if (over && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("This card's driver allows up to %dx.", maxm);
             }
+            // MFG7: a change takes a moment to reach the running frame
+            // generation; until then the running value lags the choice. Only
+            // name a reason once the choice has stood for 2 s.
+            static int s_mult_seen = 0;
+            static unsigned long long s_mult_t = 0;
+            const unsigned long long now_ms = GetTickCount64();
+            if (mult != s_mult_seen) { s_mult_seen = mult; s_mult_t = now_ms; }
+            const bool settling = now_ms - s_mult_t < 2000ull;
             if (maxm == 0)
                 ImGui::TextDisabled("The card's limit is read when NVIDIA frame generation starts.");
-            else if (run != 0 && run < mult)
+            else if (run != 0 && run < mult && mult > maxm)
                 ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
-                                   "Running at %dx: %s", run,
-                                   mult > maxm ? "the card's driver allows no more."
-                                               : "no video memory for more (see ReShade.log [MGPU][MFG6]).");
+                                   "Running at %dx: the card's driver allows no more.", run);
+            else if (run != 0 && run < mult && !settling && mgpu::gpu1::ui_fg_extras_failed())
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
+                                   "Running at %dx: no video memory for more (see ReShade.log [MGPU][MFG6]).", run);
+            else if (run != 0 && run != mult && settling)
+                ImGui::TextDisabled("Switching to %dx...", mult);
             else if (run != 0)
                 ImGui::TextDisabled("Running at %dx (this card allows up to %dx).", run, maxm);
             ImGui::TextDisabled("Keep NR fps x multiplier at or under the monitor's refresh rate.");
@@ -1160,6 +1173,70 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::Text("generated: %.1f fps", mgpu::gpu1::hud_gen_fps());
         ImGui::TextDisabled("One in-between frame per NR frame from the game's motion vectors. "
                             "Adds about half a frame of latency.");
+    }
+
+    // ---- FW1: Frame Warp. Live; every control writes mgpu.ini.
+    {
+        ImGui::SeparatorText("Frame Warp");
+        bool fw = mgpu::framewarp::enabled();
+        if (ImGui::Checkbox("Frame Warp - camera turns show up at once##fw", &fw))
+            mgpu::framewarp::set_enabled(fw);
+        ImGui::BeginDisabled(!fw);
+        static int fws = -1;
+        if (fws < 0 || !ImGui::IsAnyItemActive()) fws = mgpu::framewarp::scale();
+        float fwsf = (float)fws / 1000.0f;
+        if (ImGui::SliderFloat("degrees per mouse count##fw", &fwsf, 0.001f, 0.500f, "%.3f",
+                               ImGuiSliderFlags_Logarithmic))
+        {
+            fws = (int)(fwsf * 1000.0f + 0.5f);
+            if (fws < 1) fws = 1;
+            mgpu::framewarp::set_scale(fws);
+        }
+        static int fwp = -1;
+        if (fwp < 0 || !ImGui::IsAnyItemActive()) fwp = mgpu::framewarp::strength();
+        if (ImGui::SliderInt("strength (%)##fw", &fwp, 0, 100))
+            mgpu::framewarp::set_strength(fwp);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("How much of the delay to make up. Higher = snappier turns, more edge stretch.");
+        bool fwi = mgpu::framewarp::invert_y();
+        if (ImGui::Checkbox("game uses inverted vertical look##fw", &fwi))
+            mgpu::framewarp::set_invert_y(fwi);
+        static int fwl = -1;
+        if (fwl < 0 || !ImGui::IsAnyItemActive()) fwl = mgpu::framewarp::lead_ms();
+        if (ImGui::SliderInt("extra lead (ms)##fw", &fwl, 0, 60))
+            mgpu::framewarp::set_lead_ms(fwl);
+        char fwst[200];
+        mgpu::framewarp::status(fwst, sizeof fwst);
+        ImGui::TextDisabled("status: %s", fwst);
+        // FW2/FW3: calibration stays usable with Frame Warp off, so it can be
+        // set up before turning the warp on.
+        ImGui::EndDisabled();
+        // FW2: field of view in use, and the one-click calibration.
+        const char *fsrc = "";
+        const float fov = mgpu::framewarp::fov_in_use((float)mgpu::gpu1::ui_ini_read("FSRFov", 90), &fsrc);
+        ImGui::TextDisabled("field of view %.1f deg (%s)", fov, fsrc);
+        bool fwa = mgpu::framewarp::auto_calibrate();
+        if (ImGui::Checkbox("auto-calibrate##fw", &fwa))
+            mgpu::framewarp::set_auto_calibrate(fwa);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Learns the settings from your camera turns while Frame Warp is on.");
+        const bool cal = mgpu::framewarp::calibrating();
+        if (!cal)
+        {
+            if (ImGui::Button("Calibrate##fw")) mgpu::framewarp::calib_start();
+            ImGui::SameLine();
+            ImGui::TextDisabled("close overlay, turn left/right for 5 s");
+        }
+        else if (ImGui::Button("Stop calibrating##fw")) mgpu::framewarp::calib_cancel();
+        char fwc[320];
+        mgpu::framewarp::calib_status(fwc, sizeof fwc);
+        if (fwc[0])
+        {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(fwc);
+            ImGui::PopTextWrapPos();
+        }
+        ImGui::TextDisabled("Speeds up camera turns only. Pauses in menus.");
     }
 
     // ---- OPT2: late-latch, live. Applied immediately AND written to mgpu.ini
@@ -3659,6 +3736,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // SLT3: must be in place before the engine resolves Streamline, so it
         // runs here. Does nothing unless mgpu.ini says SLTags=3.
         mgpu::sltags::early_install(hModule);
+        // CR1: name whatever crashes the game (no file I/O here; it writes only on a crash).
+        mgpu::crashlog::install(hModule);
+        mgpu::crashlog::announce();
         // T2: per-event logging, provisional LUID capture, one-time table
         // enumeration; the selection itself is deferred to the
         // swapchain-derived game LUID.
@@ -3666,7 +3746,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
             // R141. Before anything else this add-on says, say what it is.
             char v[420];
             snprintf(v, sizeof v,
-                     "[MGPU][R141] MGPU Bridge %s | built %s %s | add-on API 20. IDENTIFY EVERY "
+                     "[MGPU][R141] MGPU Bridge %s | source MFG8 | built %s %s | add-on API 20. IDENTIFY EVERY "
                      "LOG BY THIS LINE. ReShade's own 'Registered add-on' line carries "
                      "v0.0.0.0 because that field has never been filled in, which is why "
                      "reports have had to quote the file size in bytes instead. If this line "
@@ -3770,7 +3850,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
             mgpu::diag::info("[MGPU][T3] FreeLibrary unload - closing the NGX session from "
                              "DllMain, because ReShade does not always raise destroy_device "
                              "and an unclosed session poisons the next launch.");
-            mgpu::gpu1::stream_shutdown();
+            mgpu::gpu1::stream_shutdown(1000);   // REV: bounded under the loader lock
+            // REV: threads cannot be joined here; at least make sure Windows
+            // stops calling our low-level hook callbacks once this image is gone.
+            mgpu::framewarp::emergency_unhook();
+            mgpu::replay::emergency_unhook();
+            mgpu::hotkeys::emergency_unhook();   // HK2
         }
 #if defined(MGPU_HAVE_IMGUI)
         reshade::unregister_overlay("MGPU Bridge", draw_mgpu_overlay);
@@ -3787,6 +3872,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // memory, and the next GetProcAddress anywhere in the process walks
         // into it. This is what stopped Dragon Sword launching.
         mgpu::calibrator::uninstall();
+        mgpu::crashlog::uninstall();   // CR1
         reshade::unregister_addon(hModule);
         break;
     }

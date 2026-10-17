@@ -55,6 +55,8 @@ struct presses
 
 // Bridge thread. Reads the saved bindings, checks them, logs the table.
 void init();
+// HK2: DllMain live unload - remove the keyboard hook, join nothing.
+void emergency_unhook();
 
 // Bridge thread, once per loop iteration. Fills `out`; returns true when any
 // key fired. Does nothing (and reports nothing) unless a window of this
