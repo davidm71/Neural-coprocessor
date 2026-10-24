@@ -33,22 +33,33 @@ struct unload_ev
 typedef VOID (NTAPI *pfn_unload_trace)(PULONG *ElementSize, PULONG *ElementCount, PVOID *EventTrace);
 pfn_unload_trace g_unload_trace = nullptr;
 
+bool read_mem(const void *p, void *out, size_t n);
 bool unloaded_name(const void *addr, char *name, size_t n, unsigned long long &off)
 {
     if (g_unload_trace == nullptr) return false;
     PULONG esz = nullptr, ecnt = nullptr; PVOID tr = nullptr;
     g_unload_trace(&esz, &ecnt, &tr);
     if (esz == nullptr || ecnt == nullptr || tr == nullptr || *esz < sizeof(unload_ev)) return false;
-    const char *base = (const char *)tr;
+    // CR3: EventTrace is the ADDRESS of ntdll's pointer to the array, not the
+    // array - one more dereference (read safely).
+    PVOID arr = nullptr;
+    if (!read_mem(tr, &arr, sizeof arr) || arr == nullptr) return false;
+    const char *base = (const char *)arr;
     for (ULONG i = 0; i < *ecnt && i < 64u; ++i)
     {
-        const unload_ev *e = (const unload_ev *)(base + (size_t)i * *esz);
-        if (e->BaseAddress == nullptr) continue;
+        unload_ev ev{};
+        if (!read_mem(base + (size_t)i * *esz, &ev, sizeof ev)) break;
+        const unload_ev *e = &ev;
+        if (e->BaseAddress == nullptr || e->SizeOfImage == 0 || e->SizeOfImage > 0x40000000) continue;
         const char *b = (const char *)e->BaseAddress;
         if ((const char *)addr >= b && (const char *)addr < b + e->SizeOfImage)
         {
             size_t k = 0;
-            for (; k + 1 < n && k < 32 && e->ImageName[k] != 0; ++k) name[k] = (char)e->ImageName[k];
+            for (; k + 1 < n && k < 32 && e->ImageName[k] != 0; ++k)
+            {
+                const WCHAR c = e->ImageName[k];
+                name[k] = (c >= 0x20 && c < 0x7F) ? (char)c : '?';
+            }
             name[k] = '\0';
             off = (unsigned long long)((const char *)addr - b);
             return true;

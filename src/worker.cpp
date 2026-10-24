@@ -46,6 +46,7 @@
 #include "hud_probe.hpp"   // HUD1
 #include "hotkeys.hpp"     // HK1
 #include "capture.hpp"     // SS1 / VR1 / BM1
+#include "scaler.hpp"
 #include "framewarp.hpp"   // FW1
 #include "replay.hpp"      // BM2
 
@@ -167,6 +168,43 @@ namespace
                              "signalling bridge shutdown (the game is not affected)");
             stop();
             return 0;
+        // PP2: while the MGPU panel is up over the scaled picture, this window
+        // takes the mouse. ReShade blocks the game's input by intercepting
+        // GetCursorPos / GetAsyncKeyState for the whole process, so the panel
+        // reads the pointer from these messages instead, which it does not touch.
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+        {
+            unsigned b = 0;
+            if (wParam & MK_LBUTTON) b |= 1u;
+            if (wParam & MK_RBUTTON) b |= 2u;
+            if (wParam & MK_MBUTTON) b |= 4u;
+            mgpu::gpu1::sc_cover_mouse((int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam), b, 0);
+            if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) SetCapture(hWnd);
+            else if (msg != WM_MOUSEMOVE && (b & 7u) == 0u) ReleaseCapture();
+            return 0;
+        }
+        case WM_MOUSEWHEEL:
+        {
+            POINT p{(int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam)};   // screen coordinates
+            ScreenToClient(hWnd, &p);
+            unsigned b = 0;
+            const WPARAM k = GET_KEYSTATE_WPARAM(wParam);
+            if (k & MK_LBUTTON) b |= 1u;
+            if (k & MK_RBUTTON) b |= 2u;
+            if (k & MK_MBUTTON) b |= 4u;
+            mgpu::gpu1::sc_cover_mouse(p.x, p.y, b, (int)GET_WHEEL_DELTA_WPARAM(wParam));
+            return 0;
+        }
+        case WM_SETCURSOR:
+            if (LOWORD(lParam) == HTCLIENT && mgpu::gpu1::sc_panel_live())
+            {
+                SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));   // IDC_ARROW
+                return TRUE;
+            }
+            return DefWindowProcW(hWnd, msg, wParam, lParam);
         default:
             return DefWindowProcW(hWnd, msg, wParam, lParam);
         }
@@ -875,15 +913,22 @@ namespace
         // REORDERED seals for the rest of the session.
         const unsigned autoarm_at = mgpu::gpu1::autoarm_frames();
         const unsigned long long AUTOARM_QUIET_MS = 3000;
+        // AA1: OR a wall-clock floor. The frame count is this loop's own
+        // presents, and on some setups (a 40 fps cap, composition mode) 600 of
+        // them took 15-25 s. Now the arm fires at 600 frames OR 5 s after the
+        // loop started, whichever is first - still only after 3 s of a quiet
+        // swapchain, which is the condition that protects the arm.
+        const unsigned long long AUTOARM_TIME_MS = 5000;
+        const unsigned long long autoarm_t0 = GetTickCount64();
         bool autoarm_done = (autoarm_at == 0);
         bool autoarm_waiting_logged = false;
         if (autoarm_at != 0)
         {
             snprintf(line, sizeof line,
                      "[MGPU][P7.10] AutoArm is ON: the stream will arm itself after %u presented "
-                     "frames AND %llu ms with no swapchain event. For a MEASUREMENT leave it off "
-                     "and arm by hand in gameplay - that is what every published figure ran under.",
-                     autoarm_at, (unsigned long long)AUTOARM_QUIET_MS);
+                     "frames or %llu ms (whichever comes first) AND %llu ms with no swapchain event. "
+                     "For a MEASUREMENT leave it off and arm by hand in gameplay.",
+                     autoarm_at, (unsigned long long)AUTOARM_TIME_MS, (unsigned long long)AUTOARM_QUIET_MS);
             mgpu::diag::info(line);
         }
 
@@ -1020,6 +1065,8 @@ namespace
                         if (hp.n[A_RECORD] & 1u) mgpu::capture::toggle_recording();
                         if (hp.n[A_BENCH] & 1u)  mgpu::capture::toggle_benchmark();
                         if (hp.n[A_PATH] & 1u)   mgpu::replay::toggle_record();
+                        if (hp.n[A_CLOCK] & 1u)     mgpu::gpu1::ui_set_clock(!mgpu::gpu1::ui_clock());
+                        if (hp.n[A_STOPWATCH] & 1u) mgpu::gpu1::ui_set_stopwatch(!mgpu::gpu1::ui_stopwatch());
                     }
                 }
 
@@ -1301,7 +1348,8 @@ namespace
                 // the line has to be readable on both. Only ever true for a
                 // headless single-display rig that is NOT already using the
                 // mode, so nobody else's arm timing moves by a millisecond.
-                if (!autoarm_done && frame >= autoarm_at &&
+                if (!autoarm_done &&
+                    (frame >= autoarm_at || GetTickCount64() - autoarm_t0 >= AUTOARM_TIME_MS) &&
                     !mgpu::gpu1::ui_panel_is_open() &&
                     !mgpu::gpu1::autoarm_hint_holding())
                 {
@@ -1500,6 +1548,7 @@ namespace
 
         mgpu::gpu1::shutdown();
         mgpu::framewarp::release_gpu_now();   // FW1: the present queue is drained now
+        mgpu::scaler::release();              // SC1: same point
 
         if (hwnd != nullptr)
         {

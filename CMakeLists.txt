@@ -77,6 +77,9 @@ add_library(mgpu_bridge SHARED
     src/replay.cpp
     src/framewarp.cpp
     src/crashlog.cpp
+    src/scaler.cpp
+    src/cursormap.cpp
+    src/live_panel.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE

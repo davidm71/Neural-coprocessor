@@ -554,6 +554,53 @@ float ui_color_strength();          // CS1: 0..1, 1 = neural output untouched
 void  ui_set_color_strength(float k);
 bool ui_status_hud();               // ST1: StatusHud=1 adds the status lines to the FPS HUD
 void ui_set_status_hud(bool on);
+// CK1: clock and stopwatch box, top-right of the picture. The clock's
+// visibility is saved (Clock in mgpu.ini); the stopwatch restarts from 0
+// every time it is shown and is not saved.
+bool ui_clock();       void ui_set_clock(bool on);
+// NM1: NR network: 0 = the DLL's default, 1 = A (original), 2 = B (fast).
+// Read when NR is created, so a change applies from the next launch.
+int  ui_nr_model();    void ui_set_nr_model(int m);
+// FL1: FG Lite (lighter NVIDIA frame generation) and FG DLL source
+// (0 = driver model store first, 1 = mgpu\nvngx_dlssg.dll first). Next launch.
+int  ui_fg_lite();     void ui_set_fg_lite(int on);
+// RS1: reduced-resolution reconstruction (0 DLSS SR, 1 residual) and filters
+// (down: 0 area 1 bilinear 2 nearest; up: 0 bilinear 1 bicubic 2 nearest).
+// UC1: NR UI correction (0 auto, 1 off, 2 on). All live.
+int  ui_rs_recon();    void ui_set_rs_recon(int v);
+int  ui_rs_down();     void ui_set_rs_down(int v);
+int  ui_rs_up();       void ui_set_rs_up(int v);
+int  ui_fov_mode();    void ui_set_fov_mode(int m);       // FV1/FV2: 0 off, 1 centre, 2 lower band
+int  ui_fov_band();    void ui_set_fov_band(int v);
+int  ui_fov_bpos();    void ui_set_fov_bpos(int v);       // FV3: 0 top, 50 middle, 100 bottom
+bool ui_fov_fullw();   void ui_set_fov_fullw(bool on);
+int  ui_fov_pct();     void ui_set_fov_pct(int v);
+int  ui_fov_feather(); void ui_set_fov_feather(int v);
+int  ui_nr_uic();      void ui_set_nr_uic(int v);
+// SC1: enlarge a below-monitor game frame with 0 off / 1 bilinear / 2 FSR 1 /
+// 3 NIS, sharpness 0-100. active = the window was sized to the monitor for it.
+int  ui_scaler();        void ui_set_scaler(int m);
+int  ui_scaler_sharp();  void ui_set_scaler_sharp(int pct);
+bool ui_scaler_active();
+// PP1: PanelOverPicture support (upstream 0.4.0) and the scaled-picture case.
+bool dcomp_visual_rooted();
+void *dcomp_game_hwnd();
+void sc_set_panel_live(bool up);
+bool sc_cover_live_rect(RECT *r);   // the 4K picture's screen rect while it is shown
+// PP2: the pointer from the cover window's own mouse messages (worker.cpp).
+bool sc_panel_live();
+void sc_cover_mouse(int x, int y, unsigned btn, int wheel);
+bool sc_cover_mouse_get(float *u, float *v, unsigned *btn, int *wheel);   // false: no message yet / panel not up
+void ui_driver_notice(char *out, unsigned n);   // DRV1: empty when the driver is fine
+unsigned ui_driver_version();                    // DRV1: 61742 = 617.42, 0 unknown
+void sc_unzoom_now();   // SC9: undo the console zoom (unload path)
+// PF1: detailed log (repeating diagnostic lines) on/off. Live.
+bool ui_detailed_log();  void ui_set_detailed_log(bool on);
+bool ui_perf_log();      void ui_set_perf_log(bool on);      // PF1: the 10 s performance summary
+// DV1: one line naming the NVIDIA DLL versions loaded this session.
+void ui_dll_versions(char *out, unsigned n);
+int  ui_fg_source();   void ui_set_fg_source(int v);
+bool ui_stopwatch();   void ui_set_stopwatch(bool on);
 void set_hook_present_active(bool on);   // HP1: dllmain says the present-time feed is running
 int  ui_dlssg_max_mult();          // DLSSG2: driver's MultiFrameCountMax+1, 0 unknown yet
 bool ui_fg_hudfix();             // FG3

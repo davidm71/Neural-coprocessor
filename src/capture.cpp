@@ -423,6 +423,34 @@ const char *kRecHLSL =
     "    dst[id.xy] = c;\n"
     "}\n";
 
+// REV7: buffers the GPU may still be using when the capture subsystem is torn
+// down (a bridge rearm, or exit) and the last copy has not finished. They are
+// parked here with the fence that covers them and released once that fence
+// completes (or its device is lost), instead of being freed under the GPU or
+// left referenced by the subsystem's globals - which the next arm would then
+// reuse against a NEW device. Drained on every start, stop and worker tick.
+struct grave { ID3D12Fence *fence; unsigned long long value; std::vector<IUnknown *> objs; };
+std::vector<grave> g_grave;   // under g_pmx
+unsigned long long g_grave_freed = 0;
+
+void grave_drain(bool log)   // under g_pmx
+{
+    for (size_t i = 0; i < g_grave.size();)
+    {
+        grave &g = g_grave[i];
+        const UINT64 c = g.fence->GetCompletedValue();
+        if (c == UINT64_MAX || c >= g.value)
+        {
+            for (IUnknown *o : g.objs) o->Release();
+            g.fence->Release();
+            g_grave_freed += 1;
+            g_grave.erase(g_grave.begin() + (long)i);
+            if (log) mgpu::diag::info("[MGPU][REV7] parked capture buffers released (their GPU work finished).");
+        }
+        else ++i;
+    }
+}
+
 void rec_release_d3d12()
 {
     for (unsigned i = 0; i < RING; ++i)
@@ -1344,6 +1372,10 @@ void worker_main()
         shots_tick();
         rec_tick();
         bench_tick();
+        {   // REV7: cheap - normally empty
+            std::lock_guard<std::mutex> plk(g_pmx);
+            if (!g_grave.empty()) grave_drain(true);
+        }
         Sleep(2);
     }
     // Shutting down: finish a recording that is still open.
@@ -1360,6 +1392,7 @@ void ensure_worker()
     {
         std::lock_guard<std::mutex> plk(g_pmx);
         g_dead = false;
+        grave_drain(true);   // REV7
     }
     g_worker = std::thread(worker_main);
 }
@@ -1420,14 +1453,75 @@ void shutdown()
     g_worker.join();
     std::lock_guard<std::mutex> plk(g_pmx);
     g_dead = true;
+    grave_drain(true);   // REV7: anything parked by an earlier stop
     // Our GPU work must be done before its resources go.
+    // REV5: and if it cannot be confirmed done (a stalled GPU, a wait that
+    // times out - a LOST device is the exception, see REV6 below), the
+    // resources are LEFT ALLOCATED rather than
+    // released under the GPU. A leak at shutdown costs nothing; freeing memory
+    // the GPU is still writing can take the driver down with the game.
+    bool gpu_idle = true;
     if (g_last_fence != nullptr)
     {
-        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (ev && !fence_done(g_last_fence, g_last_value) &&
-            SUCCEEDED(g_last_fence->SetEventOnCompletion(g_last_value, ev)))
-            (void)WaitForSingleObject(ev, 2000);
-        if (ev) CloseHandle(ev);
+        if (!fence_done(g_last_fence, g_last_value))
+        {
+            gpu_idle = false;
+            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (ev && SUCCEEDED(g_last_fence->SetEventOnCompletion(g_last_value, ev)))
+                (void)WaitForSingleObject(ev, 5000);
+            if (ev) CloseHandle(ev);
+            // REV6: decided here, not by fence_done(). fence_done() treats
+            // UINT64_MAX as NOT done on purpose - for a screenshot it means
+            // the copied pixels are invalid. For shutdown the question is
+            // different: is the GPU still using these buffers? A removed
+            // device reports UINT64_MAX on every fence and executes nothing
+            // more, so then the answer is no and they are released normally.
+            const UINT64 c = g_last_fence->GetCompletedValue();
+            const bool removed = (c == UINT64_MAX);
+            gpu_idle = removed || c >= g_last_value;
+            if (removed)
+                mgpu::diag::warn("[MGPU][REV6] capture shutdown: the GPU device was lost - nothing is in "
+                                 "flight, buffers released.");
+        }
+        if (!gpu_idle)
+        {
+            // REV7: park everything the GPU may still touch with the fence that
+            // covers it, then reset the globals as a normal shutdown would, so
+            // a rearm starts clean and builds against its own device.
+            grave g{ g_last_fence, g_last_value, {} };   // takes over g_last_fence's reference
+            g_last_fence = nullptr;
+            for (unsigned i = 0; i < RING; ++i)
+            {
+                if (g_slot_h[i]) { CloseHandle(g_slot_h[i]); g_slot_h[i] = nullptr; }
+                if (g_slot_tex[i]) { g.objs.push_back(g_slot_tex[i]); g_slot_tex[i] = nullptr; }
+                g_slot_busy[i].store(0);
+            }
+            if (g_csrc)    { g.objs.push_back(g_csrc);    g_csrc = nullptr; }
+            if (g_scratch) { g.objs.push_back(g_scratch); g_scratch = nullptr; }
+            if (g_pso)     { g.objs.push_back(g_pso);     g_pso = nullptr; }
+            if (g_rs)      { g.objs.push_back(g_rs);      g_rs = nullptr; }
+            if (g_heap)    { g.objs.push_back(g_heap);    g_heap = nullptr; }
+            g_bw = g_bh = g_rw = g_rh = 0;
+            auto park = [&](shot &sh) {
+                if (sh.rb) g.objs.push_back(sh.rb);
+                if (sh.fence) g.objs.push_back(sh.fence);
+                sh.rb = nullptr; sh.fence = nullptr;
+            };
+            for (shot &sh : g_ss_frame) park(sh);
+            g_ss_frame.clear();
+            {
+                std::lock_guard<std::mutex> lk(g_mx);
+                for (shot &sh : g_ss_queue) park(sh);
+                g_ss_queue.clear();
+            }
+            g_grave.push_back(std::move(g));
+            char l[220];
+            snprintf(l, sizeof l, "[MGPU][REV7] capture shutdown: the last GPU copy did not finish within 5 s - "
+                     "its buffers are parked and released once it does (%u parked set(s)).",
+                     (unsigned)g_grave.size());
+            mgpu::diag::warn(l);
+            return;
+        }
         g_last_fence->Release();
         g_last_fence = nullptr;
     }

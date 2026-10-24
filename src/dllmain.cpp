@@ -64,6 +64,9 @@
 // misidentifying a build. Caught by a control run rather than by a reader,
 // which is the only reason it is not in somebody's issue thread.
 #define MGPU_VERSION_STR "0.2.5-dev"
+// VR2: the fork's build tag, shared by the R141 log line and the panel footer
+// so the two can never disagree. Bump it with every shipped change.
+#define MGPU_SOURCE_TAG "FV4"
 
 
 // ---- P6.4: the overlay panel ----
@@ -119,6 +122,8 @@
 #include "framewarp.hpp" // FW1
 #include "crashlog.hpp"  // CR1
 #include "replay.hpp"    // BM2
+#include "cursormap.hpp" // MC2
+#include "live_panel.hpp" // PP1: PanelOverPicture (upstream 0.4.0, NO1950)
 #include <shellapi.h>     // SS1: open the captures folder
 
 extern "C" __declspec(dllexport) const char *NAME = "MGPU Bridge";
@@ -920,6 +925,52 @@ static int mgpu_game_is_native(int *out_quality = nullptr)
     return (t.render_w < t.display_w && t.render_h < t.display_h) ? 0 : 1;
 }
 
+// SC1/SP1: scaling controls. Drawn in the DLSS box under the SR mode choice
+// (both the pre-run and the running view), not in the crowded left box.
+// CS1: Custom scale's free percentage, right under Custom scale. Before this
+// the free slider only existed in the running view's "Change quality or
+// preset" section, so choosing Custom scale before a restart offered only the
+// three DLSS steps. Writes SRScale with SRMvLowRes=1 together, as the mode
+// buttons do. Read at the next start.
+static int g_custom_pct = -1;
+static bool draw_custom_scale_slider(const char *id)
+{
+    if (g_custom_pct < 0)
+    {
+        g_custom_pct = mgpu::gpu1::ui_ini_read("SRScale", 67);
+        if (g_custom_pct < 33 || g_custom_pct > 90) g_custom_pct = 67;
+    }
+    bool wrote = false;
+    if (ImGui::SliderInt(id, &g_custom_pct, 33, 90, "%d%%"))
+    {
+        mgpu::gpu1::ui_ini_write("SRScale", g_custom_pct);
+        mgpu::gpu1::ui_ini_write("SRMvLowRes", 1);
+        wrote = true;
+    }
+    ImGui::TextDisabled("Or any value 33-90%%. 85-90%% keeps nearly all of NR's detail.");
+    return wrote;
+}
+
+static void draw_scaler_controls()
+{
+    ImGui::SeparatorText("Scaling to the monitor");
+    int sc = mgpu::gpu1::ui_scaler();
+    if (ImGui::RadioButton("off##sc", &sc, 0)) mgpu::gpu1::ui_set_scaler(0);
+    ImGui::SameLine();
+    if (ImGui::RadioButton("bilinear##sc", &sc, 1)) mgpu::gpu1::ui_set_scaler(1);
+    ImGui::SameLine();
+    if (ImGui::RadioButton("FSR 1##sc", &sc, 2)) mgpu::gpu1::ui_set_scaler(2);
+    ImGui::SameLine();
+    if (ImGui::RadioButton("NIS##sc", &sc, 3)) mgpu::gpu1::ui_set_scaler(3);
+    int shp = mgpu::gpu1::ui_scaler_sharp();
+    ImGui::BeginDisabled(sc < 2);
+    if (ImGui::SliderInt("sharpness##sc", &shp, 0, 100, "%d%%")) mgpu::gpu1::ui_set_scaler_sharp(shp);
+    ImGui::EndDisabled();
+    ImGui::TextDisabled(mgpu::gpu1::ui_scaler_active()
+                            ? "Enlarging the game to the monitor."
+                            : "For a game set below the monitor's resolution. Turning on/off: restart.");
+}
+
 static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 {
     // P7.10: THE UNSUPPORTED-API MESSAGE HAS TO LIVE HERE, and it is worth
@@ -991,6 +1042,20 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     const float col_h   = (two_col && avail_h - 240.0f > 560.0f) ? (avail_h - 240.0f)
                                                                  : 560.0f;
 
+    // DRV1 / GPU1: why the mod is not running, when it is the hardware or the
+    // driver - above everything else, full width, so it cannot be missed.
+    {
+        char why[256];
+        mgpu::gpu1::ui_driver_notice(why, sizeof why);
+        if (why[0] != 0)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.25f, 1.0f));
+            ImGui::TextWrapped("%s", why);
+            ImGui::PopStyleColor();
+            ImGui::TextDisabled("The game runs normally without the mod. Details in ReShade.log.");
+            ImGui::Separator();
+        }
+    }
     ImGui::BeginChild("mgpu_box_bridge", ImVec2(col_w, col_h), true);
     ImGui::SeparatorText("MGPU BRIDGE  -  neural rendering");
     {
@@ -1002,6 +1067,31 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     // "the image looks wrong" is why most people will open this panel at all.
     // Burying them under four other groups meant nobody found them.
     ImGui::SeparatorText("Model");
+
+    // NM1: which network the NR DLL runs (310.9.16+ carries two).
+    {
+        static int nm = -1;
+        if (nm < 0) nm = mgpu::gpu1::ui_nr_model();
+        ImGui::TextUnformatted("network");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("default##nm", &nm, 0)) mgpu::gpu1::ui_set_nr_model(0);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("original (A)##nm", &nm, 1)) mgpu::gpu1::ui_set_nr_model(1);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("fast (B)##nm", &nm, 2)) mgpu::gpu1::ui_set_nr_model(2);
+        ImGui::TextDisabled("Applies on the next launch.");
+    }
+    // UC1: NR's own HUD/text protection. Live.
+    {
+        int uc = mgpu::gpu1::ui_nr_uic();
+        ImGui::TextUnformatted("UI correction");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("auto##uc", &uc, 0)) mgpu::gpu1::ui_set_nr_uic(0);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("off##uc", &uc, 1)) mgpu::gpu1::ui_set_nr_uic(1);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("on##uc", &uc, 2)) mgpu::gpu1::ui_set_nr_uic(2);
+    }
 
     int style_i = (int)(st.style + 0.5f);
     ImGui::TextUnformatted("Style");
@@ -1132,6 +1222,15 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             else if (run != 0)
                 ImGui::TextDisabled("Running at %dx (this card allows up to %dx).", run, maxm);
             ImGui::TextDisabled("Keep NR fps x multiplier at or under the monitor's refresh rate.");
+            // FL1
+            static int fgl = -1, fgs = -1;
+            if (fgl < 0) { fgl = mgpu::gpu1::ui_fg_lite(); fgs = mgpu::gpu1::ui_fg_source(); }
+            bool lite = fgl != 0;
+            if (ImGui::Checkbox("FG Lite (faster, slightly softer)", &lite)) { fgl = lite ? 1 : 0; mgpu::gpu1::ui_set_fg_lite(fgl); }
+            bool own = fgs != 0;
+            ImGui::SameLine();
+            if (ImGui::Checkbox("use mgpu\\nvngx_dlssg.dll", &own)) { fgs = own ? 1 : 0; mgpu::gpu1::ui_set_fg_source(fgs); }
+            ImGui::TextDisabled("Both apply on the next launch.");
         }
         if (fgm == 3)
         {
@@ -1394,10 +1493,13 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     float all = st.intensity[0];
     if (ImGui::SliderFloat("all passes", &all, 0.0f, 2.0f, "%.2f"))
         mgpu::gpu1::ui_set_intensity(0, all);
-    for (unsigned i = 0; i < st.passes && i < st.max_passes; ++i)
+    // FV4: with foveation "centre 2x" the centre's second pass uses pass 2's
+    // intensity, so its slider shows at x1 too.
+    const bool fv4 = (mgpu::gpu1::ui_fov_mode() == 3);
+    for (unsigned i = 0; i < st.max_passes && (i < st.passes || (fv4 && i == 1)); ++i)
     {
-        char lab[24];
-        snprintf(lab, sizeof lab, "pass %u", i + 1);
+        char lab[32];
+        snprintf(lab, sizeof lab, (i >= st.passes) ? "pass 2 (centre 2x)" : "pass %u", i + 1);
         float v = st.intensity[i];
         if (ImGui::SliderFloat(lab, &v, 0.0f, 2.0f, "%.2f"))
             mgpu::gpu1::ui_set_intensity(i + 1, v);
@@ -1433,6 +1535,15 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (ImGui::Checkbox("status on the FPS HUD", &sh)) mgpu::gpu1::ui_set_status_hud(sh);
         ImGui::TextDisabled("Neural state, neural frames, last NGX result, frame generator, hook.");
         ImGui::TextDisabled("Shown under the FPS lines; CTRL+ALT+H hides the whole HUD.");
+    }
+    // CK1: clock and stopwatch, top-right.
+    {
+        bool ck = mgpu::gpu1::ui_clock();
+        if (ImGui::Checkbox("clock", &ck)) mgpu::gpu1::ui_set_clock(ck);
+        ImGui::SameLine();
+        bool sw = mgpu::gpu1::ui_stopwatch();
+        if (ImGui::Checkbox("stopwatch", &sw)) mgpu::gpu1::ui_set_stopwatch(sw);
+        ImGui::TextDisabled("Top-right. CTRL+ALT+C / CTRL+ALT+S (see Hotkeys). Stopwatch starts at 0.");
     }
 
     // ---- SS1 / VR1 / BM1 / BM2: screenshots, video, benchmark ----
@@ -1811,10 +1922,9 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             { m_match = true;  write_mode(m_mode); }
             ImGui::TextDisabled("Upscales from the game's own render resolution. Higher quality.");
 
-            if (ImGui::RadioButton("Experimental Upscaler", !m_match))
+            if (ImGui::RadioButton("Custom scale", !m_match))
             { m_match = false; write_mode(m_mode); }
-            ImGui::TextDisabled("Works from a downscaled resolution. More performance, possible");
-            ImGui::TextDisabled("cost in quality. Untested.");
+            ImGui::TextDisabled("NR runs at a percentage you choose. Works at DLAA.");
 
             // Greyed rather than hidden, for the same reason as the block
             // above: all three write SRScale, Native Upscaling overrides it,
@@ -1823,15 +1933,16 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::TextUnformatted("mode  ");
             ImGui::SameLine();
             if (ImGui::RadioButton("quality##m", m_mode == 2))
-            { m_mode = 2; write_mode(2); }
+            { m_mode = 2; write_mode(2); g_custom_pct = 67; }
             ImGui::SameLine();
             if (ImGui::RadioButton("balanced##m", m_mode == 1))
-            { m_mode = 1; write_mode(1); }
+            { m_mode = 1; write_mode(1); g_custom_pct = 58; }
             ImGui::SameLine();
             if (ImGui::RadioButton("performance##m", m_mode == 0))
-            { m_mode = 0; write_mode(0); }
+            { m_mode = 0; write_mode(0); g_custom_pct = 50; }
             ImGui::TextDisabled("Sets the resolution neural rendering runs at, the way DLSS does:");
             ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
+            (void)draw_custom_scale_slider("scale##cs_pre");
             ImGui::EndDisabled();
             if (m_match)
                 ImGui::TextDisabled("Greyed: Native Upscaling is on, so the game chooses the resolution.");
@@ -1845,6 +1956,8 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 
             ImGui::EndDisabled();
 
+
+            draw_scaler_controls();
 
             // ---- V26: THERE IS NO "DLAA MODE" ANY MORE, AND THAT IS THE FIX ----
             //
@@ -1939,6 +2052,14 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (mgpu_game_is_native() == 1)
                 ImGui::TextDisabled("The game is at DLAA.");
             ImGui::TextDisabled("Created once, at arm. Restart to retry.");
+            // RS1: at DLAA there is no smaller game extent to use - pick one here.
+            {
+                static int ps = -1;
+                if (ps < 0) ps = (st.sr_scale_pct > 0) ? (int)st.sr_scale_pct : 67;
+                if (ImGui::SliderInt("resolution scale##pre", &ps, 33, 90, "%d%%"))
+                    (void)mgpu::gpu1::ui_ini_write("SRScale", ps);
+                ImGui::TextDisabled("Saved as SRScale; restart to apply. Needed at DLAA.");
+            }
         }
         else
         {
@@ -1973,9 +2094,10 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (st.sr_mv_mode == 1)
                 ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                                    "EXPERIMENTAL. May reduce ghosting - or cause it. Not confirmed on any other rig or game.");
+            // PW1: mode 2 has been the measured-correct default since R180 (0.2.4);
+            // the red "ghosted" warning predated that and was stale.
             else if (st.sr_mv_mode == 2)
-                ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
-                                   "Mode 2 derives the flag WITHOUT correcting the scale - this is the combination that ghosted.");
+                ImGui::TextDisabled("Mode 2 (default): flag follows the vectors' own size.");
         }
 
         // ---- V28: THE REFLEX READOUT IS GONE, AND IT IS NOT COMING BACK ----
@@ -2102,7 +2224,9 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // Native, the ratio for Experimental - and want_match/want_m are
             // what the panel is asking for. Equal means live, and live means
             // nothing to restart for.
-            const unsigned want_pct = (want_m == 2) ? 67u : ((want_m == 1) ? 58u : 50u);
+            // CS1: the free slider's value when it has been set, else the mode's step.
+            const unsigned want_pct = (g_custom_pct >= 33 && g_custom_pct <= 90) ? (unsigned)g_custom_pct
+                                    : ((want_m == 2) ? 67u : ((want_m == 1) ? 58u : 50u));
             const bool sr_live_matches =
                 st.sr_on && want_sr &&
                 (want_match ? (st.sr_scale_pct == 0u) : (st.sr_scale_pct == want_pct));
@@ -2174,27 +2298,23 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 // lines cannot lose their ending.
                 const ImVec4 y(1.0f, 0.92f, 0.23f, 1.0f);
                 // R175. ONE MESSAGE FOR DLAA, and it names the CONTROL instead
-                // of describing the situation. "Experimental Upscaler" is the
-                // feature's name as it appears on the radio just below;
-                // "Experimental Upscaling" named nothing that exists in this
-                // panel. Sentence case, not caps - a shouted clause reads as
+                // of describing the situation. It names the radio just below
+                // ("Custom scale", formerly "Experimental Upscaler"). Sentence case, not caps - a shouted clause reads as
                 // an error even when it is an instruction. No trailing clause
                 // about what will not happen: this says what to do, and the
                 // Experimental picker states its own restart.
                 if (st.sr_on || st.sr_requested)
                 {
-                    ImGui::TextColored(y, "DLAA - Native Upscaling detected. Enable DLSS "
-                                          "in-game settings");
-                    ImGui::TextColored(y, "Activate Experimental Upscaler to enable DLAA "
-                                          "Super Resolution.");
+                    ImGui::TextColored(y, "Game is at DLAA - Native Upscaling needs DLSS on "
+                                          "in the game's settings,");
+                    ImGui::TextColored(y, "or choose Custom scale to use DLAA.");
                 }
                 else
                     ImGui::TextColored(y, "DLAA - Native Upscaling needs DLSS in the game.");
             }
-            if (ImGui::RadioButton("Experimental Upscaler", !want_match))
+            if (ImGui::RadioButton("Custom scale", !want_match))
             { want_match = false; wrote_any |= write_sr_mode(want_m, false); }
-            ImGui::TextDisabled("Works from a downscaled resolution. More performance, possible");
-            ImGui::TextDisabled("cost in quality. Untested.");
+            ImGui::TextDisabled("NR runs at a percentage you choose. Works at DLAA.");
 
             // ---- V74: THE EXPERIMENTAL RATIO IS ITS OWN PRESET ----
             //
@@ -2223,7 +2343,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 {
                     char xl[120];
                     snprintf(xl, sizeof xl,
-                             "Experimental Upscaler running at %u%% - "
+                             "Custom scale running at %u%% - "
                              "no restart needed.", want_pct);
                     ImGui::TextDisabled("%s", xl);
                 }
@@ -2231,7 +2351,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 {
                     char xl[120];
                     snprintf(xl, sizeof xl,
-                             "Experimental Upscaler - restart once to apply %u%%.",
+                             "Custom scale - restart once to apply %u%%.",
                              want_pct);
                     ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f), "%s", xl);
                 }
@@ -2240,14 +2360,15 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 ImGui::TextUnformatted("mode  ");
                 ImGui::SameLine();
                 if (ImGui::RadioButton("quality##xm", want_m == 2))
-                { want_m = 2; wrote_any |= write_sr_mode(2, false); }
+                { want_m = 2; wrote_any |= write_sr_mode(2, false); g_custom_pct = 67; }
                 ImGui::SameLine();
                 if (ImGui::RadioButton("balanced##xm", want_m == 1))
-                { want_m = 1; wrote_any |= write_sr_mode(1, false); }
+                { want_m = 1; wrote_any |= write_sr_mode(1, false); g_custom_pct = 58; }
                 ImGui::SameLine();
                 if (ImGui::RadioButton("performance##xm", want_m == 0))
-                { want_m = 0; wrote_any |= write_sr_mode(0, false); }
+                { want_m = 0; wrote_any |= write_sr_mode(0, false); g_custom_pct = 50; }
                 ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
+                wrote_any |= draw_custom_scale_slider("scale##cs_run");
             }
             ImGui::EndDisabled();
 
@@ -2264,6 +2385,8 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 ImGui::TextDisabled("These two are read when the game starts. Everything below is live.");
         }
 
+
+        draw_scaler_controls();
 
         ImGui::SeparatorText("Change quality or preset");
         if (!st.sr_on)
@@ -2340,7 +2463,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                     // not asked for - the agreed shape for this branch is the
                     // dimmed instruction alone, and it has been agreed more
                     // than once. Do not reintroduce a status line here.
-                    ImGui::TextDisabled("Activate Experimental Upscaler to enable DLAA");
+                    ImGui::TextDisabled("Activate Custom scale to enable DLAA");
                     ImGui::TextDisabled("Super Resolution.");
                 }
                 else if (nat == 0)
@@ -2410,11 +2533,12 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // want_q/want_p are HOISTED ABOVE the state line for this, because
             // `dirty` has to be known before the line is drawn. They are the
             // same statics as before and keep the same first-frame seeding.
-            static int  want_q = -1, want_p = -1;
+            static int  want_q = -1, want_p = -1, want_s = -1;   // RS1: want_s = resolution scale %
             static bool init_done = false;
-            if (!init_done) { want_q = st.sr_quality; want_p = st.sr_preset; init_done = true; }
+            if (!init_done) { want_q = st.sr_quality; want_p = st.sr_preset; want_s = (int)st.sr_scale_pct; init_done = true; }
 
-            const bool dirty = (want_q != st.sr_quality) || (want_p != st.sr_preset);
+            const bool dirty = (want_q != st.sr_quality) || (want_p != st.sr_preset) ||
+                               (want_s > 0 && want_s != (int)st.sr_scale_pct);
 
             {
                 const char *pn3 = (st.sr_preset == 11) ? "K"
@@ -2437,22 +2561,26 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                     ImGui::SameLine();
                     if (ImGui::Button("  APPLY  "))
                     {
-                        const int scale = (want_q == 2) ? 67 : ((want_q == 1) ? 58 : 50);
+                        const int scale = (want_s > 0) ? want_s : ((want_q == 2) ? 67 : ((want_q == 1) ? 58 : 50));
                         mgpu::gpu1::ui_set_sr_request(want_q, want_p, scale);
                     }
                     ImGui::SameLine();
                     if (ImGui::SmallButton("cancel"))
-                    { want_q = st.sr_quality; want_p = st.sr_preset; }
+                    { want_q = st.sr_quality; want_p = st.sr_preset; want_s = (int)st.sr_scale_pct; }
                 }
             }
 
             ImGui::TextUnformatted("Quality");
             ImGui::SameLine();
-            if (ImGui::RadioButton("quality", want_q == 2))     want_q = 2;
+            if (ImGui::RadioButton("quality", want_q == 2))     { want_q = 2; want_s = 67; }
             ImGui::SameLine();
-            if (ImGui::RadioButton("balanced", want_q == 1))    want_q = 1;
+            if (ImGui::RadioButton("balanced", want_q == 1))    { want_q = 1; want_s = 58; }
             ImGui::SameLine();
-            if (ImGui::RadioButton("performance", want_q == 0)) want_q = 0;
+            if (ImGui::RadioButton("performance", want_q == 0)) { want_q = 0; want_s = 50; }
+            {   // RS1: any scale, not only the three DLSS steps
+                int sc = (want_s > 0) ? want_s : 67;
+                if (ImGui::SliderInt("resolution scale", &sc, 33, 90, "%d%%")) want_s = sc;
+            }
             // V18. THE MODE NOW SETS R, WHICH IS WHAT MAKES IT MEAN ANYTHING.
             // Without this the buttons changed only the model's internal mode
             // against an R inherited from the game, and looked broken because
@@ -2471,6 +2599,109 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (ImGui::RadioButton("M", want_p == 13)) want_p = 13;
             ImGui::TextDisabled("A DLL that lacks the preset asked for silently uses its own.");
             ImGui::TextDisabled("Its nvngx_dlss_*.log says which one it HONOURED. That is the answer.");
+
+            // RS1: how the full picture is rebuilt from NR's reduced output. Live.
+            // Defaults work; the choices are tucked away for tinkerers.
+            if (ImGui::TreeNode("Advanced##rs"))
+            {
+                // UI2: label column and option columns at fixed positions, so
+                // the three rows line up whatever the label or option length.
+                const float x0    = ImGui::GetCursorPosX();
+                const float sp    = ImGui::GetStyle().ItemSpacing.x;
+                const float lab_w = ImGui::CalcTextSize("downsample").x + sp * 3.0f;
+                const float opt_w = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x +
+                                    ImGui::CalcTextSize("DLSS SR").x + sp * 3.0f;
+                auto row = [&](const char *label, const char *const *names, int n, int &cur, const char *id,
+                               void (*set)(int))
+                {
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted(label);
+                    for (int i = 0; i < n; ++i)
+                    {
+                        ImGui::SameLine(x0 + lab_w + opt_w * (float)i);
+                        char b[48];
+                        snprintf(b, sizeof b, "%s##%s%d", names[i], id, i);
+                        if (ImGui::RadioButton(b, &cur, i)) set(i);
+                    }
+                };
+                static const char *const rn[] = { "DLSS SR", "residual" };
+                static const char *const dn_[] = { "area", "bilinear", "nearest" };
+                static const char *const un[] = { "bilinear", "bicubic", "nearest" };
+                int rr = mgpu::gpu1::ui_rs_recon();
+                row("rebuild", rn, 2, rr, "rs", [](int v) { mgpu::gpu1::ui_set_rs_recon(v); });
+                int dn = mgpu::gpu1::ui_rs_down();
+                row("downsample", dn_, 3, dn, "dn", [](int v) { mgpu::gpu1::ui_set_rs_down(v); });
+                ImGui::BeginDisabled(rr != 1);
+                int up = mgpu::gpu1::ui_rs_up();
+                row("upsample", un, 3, up, "up", [](int v) { mgpu::gpu1::ui_set_rs_up(v); });
+                ImGui::EndDisabled();
+                ImGui::Spacing();
+                ImGui::SetCursorPosX(x0 + lab_w);
+                if (ImGui::SmallButton("defaults##rs"))
+                { mgpu::gpu1::ui_set_rs_recon(1); mgpu::gpu1::ui_set_rs_down(0); mgpu::gpu1::ui_set_rs_up(0); }
+                ImGui::SameLine();
+                ImGui::TextDisabled("residual, area, bilinear");
+
+                // FV1: foveation. Centre at full resolution over the reduced
+                // picture. Needs Custom scale, rebuild = residual, one pass.
+                ImGui::Spacing();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("foveated");
+                ImGui::SameLine(x0 + lab_w);
+                ImGui::BeginDisabled(rr != 1);
+                // FV2: off / centre box / lower band, in the same option columns.
+                int fm = mgpu::gpu1::ui_fov_mode();
+                {
+                    // FV4: "centre 2x" = the centre gets a second pass over the
+                    // one-pass picture. Second row, under "centre".
+                    static const char *const fn[] = { "off", "centre", "band", "centre 2x" };
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        if (i == 3) ImGui::SetCursorPosX(x0 + lab_w + opt_w);
+                        else if (i > 0) ImGui::SameLine(x0 + lab_w + opt_w * (float)i);
+                        char b[40];
+                        snprintf(b, sizeof b, "%s##fv%d", fn[i], i);
+                        if (ImGui::RadioButton(b, &fm, i)) mgpu::gpu1::ui_set_fov_mode(i);
+                    }
+                }
+                if (fm != 0)
+                {
+                    ImGui::SetCursorPosX(x0 + lab_w);
+                    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
+                    if (fm == 2)
+                    {
+                        int fb = mgpu::gpu1::ui_fov_band();
+                        if (ImGui::SliderInt("height##fv", &fb, 30, 90, "%d%%")) mgpu::gpu1::ui_set_fov_band(fb);
+                        // FV3: where the band sits. 0 top, 50 middle, 100 bottom.
+                        ImGui::SetCursorPosX(x0 + lab_w);
+                        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
+                        int bpv = mgpu::gpu1::ui_fov_bpos();
+                        const char *bpf = bpv == 0 ? "top" : bpv == 50 ? "middle" : bpv == 100 ? "bottom" : "%d";
+                        if (ImGui::SliderInt("position##fv", &bpv, 0, 100, bpf)) mgpu::gpu1::ui_set_fov_bpos(bpv);
+                        ImGui::SetCursorPosX(x0 + lab_w);
+                        bool fw = mgpu::gpu1::ui_fov_fullw();
+                        if (ImGui::Checkbox("full width on ultrawide##fv", &fw)) mgpu::gpu1::ui_set_fov_fullw(fw);
+                    }
+                    else
+                    {
+                        int fp = mgpu::gpu1::ui_fov_pct();
+                        if (ImGui::SliderInt("size##fv", &fp, 30, 90, "%d%%")) mgpu::gpu1::ui_set_fov_pct(fp);
+                    }
+                    ImGui::SetCursorPosX(x0 + lab_w);
+                    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
+                    int ff = mgpu::gpu1::ui_fov_feather();
+                    if (ImGui::SliderInt("soft edge##fv", &ff, 0, 50, "%d%%")) mgpu::gpu1::ui_set_fov_feather(ff);
+                    if (fm == 3)
+                    {
+                        ImGui::SetCursorPosX(x0 + lab_w);
+                        ImGui::TextDisabled("Centre strength: pass 2 intensity.");
+                    }
+                    ImGui::SetCursorPosX(x0 + lab_w);
+                    ImGui::TextDisabled("Needs Custom scale and x1 passes.");
+                }
+                ImGui::EndDisabled();
+                ImGui::TreePop();
+            }
 
             ImGui::Separator();
             if (st.sr_rebuild_pending)
@@ -2639,9 +2870,29 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         {
             ImGui::TextDisabled("Install layout OK - nvngx_dlssnr.dll is in its own folder.");
         }
+        {   // DV1
+            char dv[240];
+            mgpu::gpu1::ui_dll_versions(dv, sizeof dv);
+            const unsigned drv = mgpu::gpu1::ui_driver_version();   // DRV1
+            if (drv != 0) ImGui::TextDisabled("Driver %u.%02u | DLLs: %s", drv / 100u, drv % 100u, dv);
+            else          ImGui::TextDisabled("DLLs: %s", dv);
+        }
+        {   // PF1
+            bool dl = mgpu::gpu1::ui_detailed_log();
+            if (ImGui::Checkbox("detailed log", &dl)) mgpu::gpu1::ui_set_detailed_log(dl);
+            ImGui::SameLine();
+            bool pl = mgpu::gpu1::ui_perf_log();
+            if (ImGui::Checkbox("performance log", &pl)) mgpu::gpu1::ui_set_perf_log(pl);
+            ImGui::TextDisabled("Off by default. Turn on before a run you want to report.");
+        }
         ImGui::Spacing();
     }
 
+    // VR2: what is running, at the foot of the panel - the same text the
+    // log's R141 line carries, so a screenshot identifies the build.
+    ImGui::Separator();
+    ImGui::TextDisabled("MGPU Bridge %s (davidm71 fork) | build %s | %s %s",
+                        MGPU_VERSION_STR, MGPU_SOURCE_TAG, __DATE__, __TIME__);
     ImGui::TextDisabled("Something wrong? Send ReShade.log from the game's exe folder to:");
     ImGui::TextDisabled("github.com/maohgad-web/Neural-coprocessor");
 }
@@ -2759,6 +3010,7 @@ static void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 
     if (is_game) g_rt_game.store(runtime, std::memory_order_relaxed);
     else         g_rt_bridge.store(runtime, std::memory_order_relaxed);
+    mgpu::live_panel::note_runtime(runtime, is_game);   // PP1; off: returns at once
 }
 
 // R158. A runtime is reset on a swapchain resize, not only at shutdown, so a
@@ -2768,6 +3020,7 @@ static void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 static void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
 {
     if (runtime == nullptr) return;
+    mgpu::live_panel::runtime_destroyed(runtime);   // PP1; off: returns at once
     // R160. The POINTER is left alone and only the pending state is dropped.
     //
     // Clearing the pointer here is what killed the mirror at arm: a recreate
@@ -2809,6 +3062,49 @@ static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool 
 {
     if (mgpu::gpu1::dcomp_overlay_mode())
     {
+        // PP1: PanelOverPicture (upstream 0.4.0, NO1950). Off: the two shipped
+        // lines at the end of this block (V65).
+        if (mgpu::live_panel::on())
+        {
+            void *g = g_rt_game.load(std::memory_order_relaxed);
+            void *b = g_rt_bridge.load(std::memory_order_relaxed);
+            void *r = runtime;
+            const bool r_gpu1 = (r == b) || mgpu::live_panel::is_host(r);
+
+            if (r == g && g_ov_echo_game.exchange(false, std::memory_order_relaxed)) return false;
+            if (r_gpu1 && g_ov_echo_bridge.exchange(false, std::memory_order_relaxed))
+            {
+                mgpu::live_panel::set_live(open);
+                return false;
+            }
+            if (r == g)
+            {
+                if (b == nullptr || !mgpu::gpu1::dcomp_visual_rooted())
+                {
+                    // No GPU 1 runtime yet, or the picture is not on screen: the
+                    // shipped behaviour (the picture steps aside; with the
+                    // scaler the console zoom, SC9, takes over).
+                    mgpu::gpu1::dcomp_set_visible(!open);
+                    return false;
+                }
+                if (!open) return false;
+                const bool want = !mgpu::live_panel::live();
+                mgpu::live_panel::set_live(want);
+                g_ov_source.store((int)source, std::memory_order_relaxed);
+                g_ov_pend_bridge.store(want ? 1 : 0, std::memory_order_relaxed);
+                mgpu::diag::info(want
+                    ? "[MGPU][R294] panel open: refused on the game's runtime, opened on the GPU 1 runtime over "
+                      "the neural picture. The game's input is blocked while the panel is drawn (R293)."
+                    : "[MGPU][R294] panel close: the GPU 1 runtime's panel is closed; the game's input is released.");
+                return true;    // ReShade leaves the overlay closed on the game's runtime
+            }
+            if (r_gpu1)
+            {
+                mgpu::live_panel::set_live(open);
+                return false;
+            }
+            return false;
+        }
         mgpu::gpu1::dcomp_set_visible(!open);
         return false;   // dcomp mode has no window to disagree with
     }
@@ -3020,7 +3316,8 @@ static void on_present(reshade::api::command_queue *queue,
     // lands on the runtime's own thread) and drops the dependency that broke
     // it. The runtime POINTER still comes from R160's re-latch and from
     // init_effect_runtime; only the moment of the call moved.
-    if (swapchain != nullptr && mgpu::gpu1::dcomp_explicit_off_single_display())
+    if (swapchain != nullptr && (mgpu::gpu1::dcomp_explicit_off_single_display() ||
+                                 (mgpu::live_panel::on() && mgpu::gpu1::dcomp_overlay_mode())))   // PP1
     {
         reshade::api::device *pd = swapchain->get_device();
         if (pd != nullptr && pd->get_api() == reshade::api::device_api::d3d12)
@@ -3034,16 +3331,27 @@ static void on_present(reshade::api::command_queue *queue,
                 const bool p_is_game = (pl.LowPart == psel.game_luid.LowPart &&
                                         pl.HighPart == psel.game_luid.HighPart);
 
+                // PP1: the game's input is blocked while the panel is drawn over
+                // the picture (R293 guard inside); this is the game chain's Present.
+                if (p_is_game)
+                    mgpu::live_panel::block_game_input(
+                        (reshade::api::effect_runtime *)g_rt_game.load(std::memory_order_relaxed));
+
                 std::atomic<int>  &pend = p_is_game ? g_ov_pend_game : g_ov_pend_bridge;
                 std::atomic<bool> &echo = p_is_game ? g_ov_echo_game : g_ov_echo_bridge;
-                std::atomic<void *> &slot = p_is_game ? g_rt_game : g_rt_bridge;
+                const bool live_mode = mgpu::live_panel::on() && mgpu::gpu1::dcomp_overlay_mode();
+                void *bslot = g_rt_bridge.load(std::memory_order_relaxed);
+                void *target = p_is_game ? g_rt_game.load(std::memory_order_relaxed)
+                                         : (live_mode ? mgpu::live_panel::host_target(bslot) : bslot);
 
-                auto *rt = (reshade::api::effect_runtime *)slot.load(std::memory_order_relaxed);
+                auto *rt = (reshade::api::effect_runtime *)target;
                 if (rt != nullptr)
                 {
                     const int want = pend.exchange(-1, std::memory_order_relaxed);
                     if (want >= 0)
                     {
+                        if (live_mode && !p_is_game)
+                            mgpu::live_panel::note_opened_on((void *)rt, want != 0);
                         echo.store(true, std::memory_order_relaxed);
                         rt->open_overlay(want != 0,
                                          (reshade::api::input_source)g_ov_source.load(
@@ -3746,7 +4054,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
             // R141. Before anything else this add-on says, say what it is.
             char v[420];
             snprintf(v, sizeof v,
-                     "[MGPU][R141] MGPU Bridge %s | source MFG8 | built %s %s | add-on API 20. IDENTIFY EVERY "
+                     "[MGPU][R141] MGPU Bridge %s | source " MGPU_SOURCE_TAG " | built %s %s | add-on API 20. IDENTIFY EVERY "
                      "LOG BY THIS LINE. ReShade's own 'Registered add-on' line carries "
                      "v0.0.0.0 because that field has never been filled in, which is why "
                      "reports have had to quote the file size in bytes instead. If this line "
@@ -3756,6 +4064,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         }
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
+        // PP1: PanelOverPicture reads its key once and registers its
+        // reshade_overlay event only when PanelOverPicture=1 (live_panel.cpp).
+        mgpu::live_panel::attach(hModule);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);   // D1
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);   // R241d observe / R242 refuse
         reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);           // R242
@@ -3872,6 +4183,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // memory, and the next GetProcAddress anywhere in the process walks
         // into it. This is what stopped Dragon Sword launching.
         mgpu::calibrator::uninstall();
+        mgpu::cursormap::uninstall();  // MC2: game's SetCursor import back before we unload
+        mgpu::gpu1::sc_unzoom_now();   // SC9: never leave the desktop zoomed
         mgpu::crashlog::uninstall();   // CR1
         reshade::unregister_addon(hModule);
         break;

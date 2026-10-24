@@ -15,4 +15,10 @@ namespace mgpu::diag
     void info (const char *line);   // reshade::log::level::info
     void warn (const char *line);   // reshade::log::level::warning
     void error(const char *line);   // reshade::log::level::error
+
+    // PF1: detailed log on/off. Off drops the repeating diagnostic lines
+    // (transport, probes, counters every few seconds); setup lines, warnings,
+    // errors, crash lines and the [PF1] performance summary always stay.
+    void set_detailed(bool on);
+    bool detailed();
 }

@@ -218,6 +218,10 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl,
                   double gen_fps = -1.0,    // FG1: < 0 hides the GENERATED line
                   const char (*status)[48] = nullptr, int n_status = 0);   // ST1: StatusHud=1 lines
 
+// CK1: up to two short lines (clock, stopwatch) in a box at the top-right.
+void draw_clock_box(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                    unsigned width, unsigned height, const char (*lines)[24], int n);
+
 void draw(ID3D12GraphicsCommandList *cl,
           D3D12_CPU_DESCRIPTOR_HANDLE rtv,
           unsigned width, unsigned height,

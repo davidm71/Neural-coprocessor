@@ -115,6 +115,14 @@ namespace mgpu::adapter
     // chain, then a continuous run of DROPPED and REORDERED seals a second
     // later. Anything arming by itself waits for this to go quiet.
     unsigned long long ms_since_last_swapchain_event();
+    // DRV1: the NVIDIA driver as NVIDIA numbers it (617.42 -> 61742), read from
+    // the user-mode driver version DXGI reports. 0 = no NVIDIA adapter seen yet.
+    unsigned nv_driver_version();
+    // GPU1: 0 a second card was selected (or not decided yet); 1 no second
+    // NVIDIA card besides the game's; 2 the game's card could not be
+    // identified; 3 several candidates and no safe pick. nv_count: NVIDIA
+    // hardware adapters seen (integrated graphics never counts).
+    int topology_block(unsigned *nv_count);
 
     // R174. The same measurement, restricted to swapchain events whose
     // device LUID is the game's. The one above counts the bridge's own

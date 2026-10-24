@@ -85,6 +85,68 @@ Research code, not a product. Run games with anti-cheat and online games at your
 - **Input replay for repeatable runs** (`BenchReplay=1`): record a path once (`CTRL+ALT+I`
   start/stop) and every benchmark replays the same keyboard and mouse input. Turn off
   Windows "Enhance pointer precision" for exact mouse turns; single-player games only.
+- **NR network choice** (`NRModel`, panel Model section): NR DLL 310.9.16 carries two
+  networks, A (original) and B (smaller, about 2x faster, its default). Pick one, or
+  leave it to the DLL. Applies on the next launch.
+- **FG Lite** (`FGLite`, panel frame generation section): asks NVIDIA frame generation for
+  its lighter blending mode, the one behind NVIDIA's faster frame generation preset. Needs a
+  310.9.16+ frame generation DLL; `FGSource=1` loads `mgpu\nvngx_dlssg.dll` ahead of the
+  driver's copy so a newer DLL can be used. Applies on the next launch.
+- **NR resolution scale with residual rebuild** (`SRScale` 33-90, `SRRecon=1`): NR runs on a
+  smaller copy of the frame and only its change is enlarged back onto the game's full-res
+  frame. The game's native detail (e.g. DLAA) is kept and NR costs a fraction of full
+  resolution. Defaults: residual, area down, bilinear up; the filters and the older DLSS SR
+  rebuild are under Super resolution > Advanced in the panel.
+- **Foveated NR** (`FovNR=1`, off by default): on top of the resolution scale above, a centred
+  rectangle (`FovSize`, 30-90% of each side, default 60) is also neural rendered at full
+  resolution and blended over the reduced picture with a soft edge (`FovFeather`, 0-50% of the
+  centre's half-size, default 15). The centre, where the eye usually is, gets full-resolution
+  NR; the edges get the cheaper reduced pass. It costs a second NR evaluate on the centre's
+  area, so the saving over full-resolution NR depends on both sizes: e.g. 50% scale with a 60%
+  centre evaluates about 25% + 36% = 61% of the full frame's pixels. Needs Custom scale, the
+  residual rebuild and one pass; otherwise it stays off. Live, under Super resolution > Advanced.
+  Two shapes: `FovNR=1` the centred box and `FovNR=2` a horizontal band (`FovBand` 30-90% of
+  the height, default 50; `FovBandPos` 0 top / 50 middle / 100 bottom, default middle). A middle
+  band covers faces and the horizon edge to edge; a 50% middle band over a 67% scale evaluates
+  about 50% + 45% = 72% of the full frame's pixels. A bottom band at full width skips the reduced
+  pass beneath it. The full-resolution area is never wider than 16:9 of the picture's height, so
+  on a 21:9 or 32:9 monitor the extra width (periphery) stays at the reduced scale and costs the
+  same as on 16:9; `FovFullWidth=1` lets a band run the full width (racing games).
+  `FovNR=3` (centre 2x) is the two-pass variant: the whole picture gets one pass, then the
+  centre box gets a second pass over that result and is blended in - the stronger two-pass look
+  where you are looking, at the cost of one extra evaluate on the box's area. Its strength is
+  pass 2's intensity. Note that a second pass changes tone and contrast, not only detail, so a
+  larger soft edge helps hide the boundary.
+- **NR UI correction** (`NRUICorrection`): the NR DLL's own HUD protection, auto/off/on.
+- **Performance summary in the log**: every 10 s a `[MGPU][PF1]` line gives NR GPU time
+  (avg/p95/max, frames over 11 ms), present spacing (avg/sd/p99/max, hitches) and real,
+  generated and presented frame rates. Two panel checkboxes, both off by default: **detailed
+  log** (`DetailedLog`, the repeating diagnostic lines) and **performance log** (`PerfLog`,
+  this summary). Turn them on before a run you want to report.
+- **FSR 1 / NIS scaling** (`Scaler`, panel View section): when a game is set below the
+  monitor's resolution, the picture is enlarged to the monitor with AMD FSR 1 or NVIDIA Image
+  Scaling (with a sharpness slider) instead of Windows' plain stretch. Spatial, so every frame
+  including generated ones is scaled; built in, no DLL.
+  Typical use: a 4K monitor with the game windowed at 2560x1440 (set before launch). Works
+  with `DcompOverlay=1`: the picture is shown on a click-through cover over the monitor, so
+  the game keeps focus and input. As in Lossless Scaling, the mouse pointer is drawn on the
+  enlarged picture at its real position in the game and kept inside the game's window, so menus
+  line up (it moves 1.5x as far on screen at 1440p -> 4K). If the game is not the window in front,
+  the picture steps aside so you can click back in.
+  The MGPU panel (Home) opens on top of the 4K picture, drawn at full resolution with the pointer
+  lined up (`PanelOverPicture`, below). If that is turned off, Windows' full-screen magnifier
+  enlarges the game's window while the overlay is open instead (`ScalerConsole`).
+- **Panel over the picture** (`PanelOverPicture=1`, on by default here; from upstream 0.4.0,
+  contributed there by NO1950): with `DcompOverlay=1` the panel opens on the neural picture
+  itself instead of the picture stepping aside. The game's input is blocked while it is open;
+  ESC or Home closes it.
+- **Startup checks**: if there is no second NVIDIA card (integrated graphics do not count), or the
+  NVIDIA driver is older than 610.47 (the first with DLSS 5 neural rendering) or NVIDIA's NGX
+  reports that it needs updating, the mod stays off and says why in red at the top of the panel
+  and in ReShade.log (`[MGPU][T2]`, `[MGPU][DRV1]`). The panel also shows the driver version.
+- **Clock and stopwatch** (top-right of the picture): `CTRL+ALT+C` shows/hides the time
+  (12-hour, remembered), `CTRL+ALT+S` shows/hides a stopwatch that counts up from 0 each
+  time it is shown. Also checkboxes in the panel's View section; keys can be rebound.
 
 **Frame Warp** (`FrameWarp=1`, panel section of the same name)
 - **What it does:** the idea of NVIDIA Reflex 2's Frame Warp, with the mod's own code. Right
@@ -241,6 +303,15 @@ cmake --build build --config Release
 own commit.
 
 ## License and credit
+
+Third-party code built into the add-on: AMD FidelityFX FSR 1 (MIT, Copyright (c) 2021
+Advanced Micro Devices, Inc.) and NVIDIA Image Scaling SDK (MIT, Copyright (c) 2022 NVIDIA
+CORPORATION & AFFILIATES); their license texts are in `src/third_party/fsr1/LICENSE.txt` and
+`src/third_party/nis/LICENSE.txt`.
+
+
+`src/live_panel.cpp` (the panel over the picture) comes from upstream 0.4.0, where it was
+contributed by [NO1950](https://github.com/NO1950); the fork adds the scaled-picture pointer.
 
 MIT, as upstream. The add-on, its design and its 0.2.5 code are Marcelo Guibout's
 ([maohgad-web](https://github.com/maohgad-web)). This fork's changes are by davidm71.

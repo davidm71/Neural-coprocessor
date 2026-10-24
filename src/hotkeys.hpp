@@ -43,6 +43,8 @@ enum action : unsigned
     A_RECORD,        // VR1
     A_BENCH,         // BM1
     A_PATH,          // BM2: record the input path start/stop
+    A_CLOCK,         // CK1: show/hide the clock
+    A_STOPWATCH,     // CK1: show/hide the stopwatch (starts from 0 when shown)
     A_COUNT
 };
 
@@ -57,6 +59,15 @@ struct presses
 void init();
 // HK2: DllMain live unload - remove the keyboard hook, join nothing.
 void emergency_unhook();
+
+// PP3: the panel's mouse when there is no scaler cover window. A low-level
+// mouse hook runs only while the panel is up (on = panel up). get: screen
+// coordinates, buttons (1 L, 2 R, 4 M), wheel since the last call; false
+// until the hook has seen an event.
+void panel_mouse(bool on);
+bool panel_mouse_get(int *x, int *y, unsigned *btn, int *wheel);
+// PP3: a key's state as the keyboard hook saw it (ReShade freezes GetAsyncKeyState).
+bool key_down(int vk);
 
 // Bridge thread, once per loop iteration. Fills `out`; returns true when any
 // key fired. Does nothing (and reports nothing) unless a window of this

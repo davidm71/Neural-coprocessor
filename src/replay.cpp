@@ -95,14 +95,51 @@ void load_once()
     if (!path_file(p, MAX_PATH * 2)) return;
     FILE *f = nullptr;
     if (_wfopen_s(&f, p, L"rb") != 0 || f == nullptr) return;
+    // REV5: a path file is ours, but it sits in the game folder and can be
+    // truncated or damaged. Everything is checked before it is used: the size
+    // on disk must be exactly header + count events, the count and length are
+    // bounded (an hour of input is far more than any benchmark path), every
+    // event must be a known type with sane fields, and time must not run
+    // backwards. Anything else is refused and the path is simply absent.
+    const unsigned kMaxEvents  = 1000000u;
+    const double   kMaxSeconds = 3600.0;
     file_head h{};
-    if (fread(&h, sizeof h, 1, f) == 1 && memcmp(h.magic, "MGPUPTH1", 8) == 0 && h.count < 5000000u)
+    long long fsize = -1;
+    if (_fseeki64(f, 0, SEEK_END) == 0) { fsize = _ftelli64(f); _fseeki64(f, 0, SEEK_SET); }
+    const char *bad = nullptr;
+    if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, "MGPUPTH1", 8) != 0) bad = "not a path file";
+    else if (h.count > kMaxEvents) bad = "too many events";
+    else if (!(h.seconds >= 0.0 && h.seconds <= kMaxSeconds)) bad = "bad length";
+    else if (fsize != (long long)sizeof h + (long long)h.count * (long long)sizeof(ev)) bad = "size does not match";
+    if (bad == nullptr)
     {
         std::vector<ev> v(h.count);
-        if (h.count == 0 || fread(v.data(), sizeof(ev), h.count, f) == h.count)
-        { g_path.swap(v); g_path_s = h.seconds; }
+        if (h.count != 0 && fread(v.data(), sizeof(ev), h.count, f) != h.count) bad = "short read";
+        double prev = 0.0;
+        for (unsigned i = 0; bad == nullptr && i < h.count; ++i)
+        {
+            const ev &e = v[i];
+            if (!(e.ms >= prev)) { bad = "timestamps out of order"; break; }
+            // REV6: every event lies inside the recorded length (the stop
+            // time is the header's seconds; 50 ms for rounding).
+            if (!(e.ms <= h.seconds * 1000.0 + 50.0)) { bad = "event after the recorded end"; break; }
+            prev = e.ms;
+            if (e.up > 1) bad = "bad event";
+            else if (e.type == E_KEY)   { if (e.x <= 0 || e.x > 255) bad = "bad key"; }
+            else if (e.type == E_MOVE)  { if (e.x < -10000 || e.x > 10000 || e.y < -10000 || e.y > 10000) bad = "bad move"; }
+            else if (e.type == E_BTN)   { if (e.code < 1 || e.code > 5) bad = "bad button"; }
+            else if (e.type == E_WHEEL) { if (e.y < 0 || e.y > 1) bad = "bad wheel"; }
+            else bad = "unknown event";
+        }
+        if (bad == nullptr) { g_path.swap(v); g_path_s = h.seconds; }
     }
     fclose(f);
+    if (bad != nullptr)
+    {
+        char l[200];
+        snprintf(l, sizeof l, "[MGPU][REV5] input path file refused (%s) - record a new path.", bad);
+        mgpu::diag::warn(l);
+    }
 }
 
 bool save_path(const std::vector<ev> &v, double secs)

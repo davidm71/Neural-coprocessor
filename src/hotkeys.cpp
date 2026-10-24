@@ -48,6 +48,8 @@ const def DEFS[A_COUNT] = {
     { "Record video start/stop",   "HotkeyRecord",     { M_CTRL | M_ALT, 'R' },           false },
     { "Benchmark start/stop",      "HotkeyBenchmark",  { M_CTRL | M_ALT, 'B' },           false },
     { "Record input path (replay)", "HotkeyInputPath", { M_CTRL | M_ALT, 'I' },           false },
+    { "Clock show/hide",           "HotkeyClock",      { M_CTRL | M_ALT, 'C' },           false },
+    { "Stopwatch show/hide",       "HotkeyStopwatch",  { M_CTRL | M_ALT, 'S' },           false },
 };
 
 std::mutex g_mx;                       // bindings + conflicts (panel reads them)
@@ -71,9 +73,18 @@ std::atomic<bool> g_swallowed[256] = {};
 std::atomic<unsigned> g_swallow_n{0};    // HK2: keys kept from the game (logged by the poll)
 std::atomic<unsigned> g_swallow_vk{0};
 
+// HK3: every key's up/down state as the low-level keyboard hook sees it.
+// While ReShade blocks the game's input (the MGPU panel over the picture,
+// PanelOverPicture=1) it answers GetAsyncKeyState with "not pressed" for the
+// whole process, so the capture field never saw a key. The hook runs before
+// ReShade and is not affected. Generic VK_CONTROL / VK_MENU / VK_SHIFT are
+// derived from the left/right keys the hook reports.
+std::atomic<bool> g_hk_down[256] = {};
+
 bool key(int vk)
 {
     if (vk > 0 && vk < 256 && g_swallowed[vk].load(std::memory_order_relaxed)) return true;
+    if (vk > 0 && vk < 256 && g_hk_down[vk].load(std::memory_order_relaxed)) return true;
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
@@ -246,9 +257,9 @@ std::mutex g_guard_mx;
 unsigned char hook_mods()
 {
     unsigned char m = 0;
-    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) m |= M_CTRL;
-    if (GetAsyncKeyState(VK_MENU) & 0x8000)    m |= M_ALT;
-    if (GetAsyncKeyState(VK_SHIFT) & 0x8000)   m |= M_SHIFT;
+    if (key(VK_CONTROL)) m |= M_CTRL;   // HK3: hook state first, then GetAsyncKeyState
+    if (key(VK_MENU))    m |= M_ALT;
+    if (key(VK_SHIFT))   m |= M_SHIFT;
     return m;
 }
 
@@ -261,6 +272,16 @@ LRESULT CALLBACK kb_proc(int code, WPARAM wp, LPARAM lp)
         const bool up = (k->flags & LLKHF_UP) != 0;
         if (vk < 256 && (k->flags & LLKHF_INJECTED) == 0)
         {
+            // HK3: record the key's state for key() / the capture field.
+            g_hk_down[vk].store(!up, std::memory_order_relaxed);
+            auto pair = [](int l, int r, int g) {
+                g_hk_down[g].store(g_hk_down[l].load(std::memory_order_relaxed) ||
+                                   g_hk_down[r].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            };
+            if (vk == VK_LCONTROL || vk == VK_RCONTROL || vk == VK_CONTROL) pair(VK_LCONTROL, VK_RCONTROL, VK_CONTROL);
+            if (vk == VK_LMENU || vk == VK_RMENU || vk == VK_MENU)          pair(VK_LMENU, VK_RMENU, VK_MENU);
+            if (vk == VK_LSHIFT || vk == VK_RSHIFT || vk == VK_SHIFT)       pair(VK_LSHIFT, VK_RSHIFT, VK_SHIFT);
+
             // The release of a key we swallowed is swallowed too, whatever the
             // modifiers are by then: the game never saw it go down.
             if (up && g_swallowed[vk].load(std::memory_order_relaxed))
@@ -299,6 +320,44 @@ LRESULT CALLBACK kb_proc(int code, WPARAM wp, LPARAM lp)
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
+// PP3: a low-level MOUSE hook, on this same thread, installed only while the
+// MGPU panel is up over the picture. ReShade answers GetCursorPos and
+// GetAsyncKeyState with frozen values while it blocks the game's input, and
+// filters the game window's mouse messages, so without the scaler's cover
+// window the panel had no working mouse. The hook sees the real events first
+// and passes every one of them on.
+HHOOK g_mshook = nullptr;
+std::atomic<bool> g_ms_valid{false};
+std::atomic<int>  g_ms_x{0}, g_ms_y{0}, g_ms_wheel{0};
+std::atomic<unsigned> g_ms_btn{0};
+const UINT WM_MS_ON  = WM_APP + 0x31;
+const UINT WM_MS_OFF = WM_APP + 0x32;
+
+LRESULT CALLBACK ms_proc(int code, WPARAM wp, LPARAM lp)
+{
+    if (code == HC_ACTION)
+    {
+        const MSLLHOOKSTRUCT *m = reinterpret_cast<const MSLLHOOKSTRUCT *>(lp);
+        g_ms_x.store(m->pt.x, std::memory_order_relaxed);
+        g_ms_y.store(m->pt.y, std::memory_order_relaxed);
+        unsigned b = g_ms_btn.load(std::memory_order_relaxed);
+        switch (wp)
+        {
+        case WM_LBUTTONDOWN: b |= 1u;  break;
+        case WM_LBUTTONUP:   b &= ~1u; break;
+        case WM_RBUTTONDOWN: b |= 2u;  break;
+        case WM_RBUTTONUP:   b &= ~2u; break;
+        case WM_MBUTTONDOWN: b |= 4u;  break;
+        case WM_MBUTTONUP:   b &= ~4u; break;
+        case WM_MOUSEWHEEL:  g_ms_wheel.fetch_add((int)(short)HIWORD(m->mouseData), std::memory_order_relaxed); break;
+        default: break;
+        }
+        g_ms_btn.store(b, std::memory_order_relaxed);
+        g_ms_valid.store(true, std::memory_order_relaxed);
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
 void kb_main()
 {
     MSG msg;
@@ -316,7 +375,32 @@ void kb_main()
                  "the hotkeys' keys.", GetLastError());
         mgpu::diag::warn(l);
     }
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0)
+    {
+        if (msg.hwnd == nullptr && msg.message == WM_MS_ON)   // PP3
+        {
+            if (g_mshook == nullptr)
+            {
+                g_ms_btn.store(0); g_ms_wheel.store(0); g_ms_valid.store(false);
+                g_mshook = SetWindowsHookExW(WH_MOUSE_LL, ms_proc, self, 0);
+                if (g_mshook == nullptr)
+                {
+                    char l[160];
+                    snprintf(l, sizeof l, "[MGPU][PP3] panel mouse hook not installed (error %lu).", GetLastError());
+                    mgpu::diag::warn(l);
+                }
+            }
+            continue;
+        }
+        if (msg.hwnd == nullptr && msg.message == WM_MS_OFF)
+        {
+            if (g_mshook) { UnhookWindowsHookEx(g_mshook); g_mshook = nullptr; }
+            g_ms_valid.store(false); g_ms_btn.store(0);
+            continue;
+        }
+        TranslateMessage(&msg); DispatchMessageW(&msg);
+    }
+    if (g_mshook) { UnhookWindowsHookEx(g_mshook); g_mshook = nullptr; }
     if (g_kbhook) { UnhookWindowsHookEx(g_kbhook); g_kbhook = nullptr; }
 }
 
@@ -331,7 +415,25 @@ void guard_refresh_locked()   // under g_mx
 void emergency_unhook()
 {
     if (g_kbhook) { UnhookWindowsHookEx(g_kbhook); g_kbhook = nullptr; }
+    if (g_mshook) { UnhookWindowsHookEx(g_mshook); g_mshook = nullptr; }
 }
+
+// PP3
+void panel_mouse(bool on)
+{
+    const DWORD t = g_kb_tid.load();
+    if (t != 0) PostThreadMessageW(t, on ? WM_MS_ON : WM_MS_OFF, 0, 0);
+}
+bool panel_mouse_get(int *x, int *y, unsigned *btn, int *wheel)
+{
+    if (g_mshook == nullptr || !g_ms_valid.load(std::memory_order_relaxed)) return false;
+    if (x) *x = g_ms_x.load(std::memory_order_relaxed);
+    if (y) *y = g_ms_y.load(std::memory_order_relaxed);
+    if (btn) *btn = g_ms_btn.load(std::memory_order_relaxed);
+    if (wheel) *wheel = g_ms_wheel.exchange(0, std::memory_order_relaxed);
+    return true;
+}
+bool key_down(int vk) { return key(vk); }
 
 void init()
 {

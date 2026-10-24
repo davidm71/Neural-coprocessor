@@ -141,4 +141,6 @@ namespace mgpu::slprobe
     // `what` is a short label that appears verbatim in the line, so the call
     // site names itself - "bridge DXGI factory", "bridge swapchain".
     void report_object(const char *what, void *iface);
+// NM1: a loaded module's file version as "a.b.c.d" (false = unknown).
+bool file_version(void *hmodule, char *out, unsigned long long out_n);
 }

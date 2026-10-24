@@ -46,6 +46,10 @@
 #include "mgpu_ini_parser.hpp"
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
+#include <dwmapi.h>       // SC7: DWM_TIMING_INFO (function loaded at run time)
+#include "scaler.hpp"     // SC1: FSR 1 / NIS enlargement to the monitor
+#include "hotkeys.hpp"
+#include "cursormap.hpp"  // MC1: the pointer on the enlarged picture
 #include "dx11_producer.hpp"   // 0.3.1 backport: HudLess is D3D12-only
 #include "nr16.hpp"   // 0.3.1 R208: optional FP16 input to DLSS-NR (NRInput16=4)
 #include "capture.hpp"   // SS1 / VR1 / BM1
@@ -406,11 +410,86 @@ static void *g_dcomp_d3d11  = nullptr;
 // V53: whether the visual is currently the target's root. Starts FALSE - the
 // tree is built at chain creation but deliberately left unrooted.
 static bool  g_dcomp_rooted = false;
+static bool g_dcomp_rooted_fwd() { return g_dcomp_rooted; }
 
 // FPS HUD mode. Bridge-thread owned, just like the DComp hotkeys and present
 // path, so no atomic or mutex is needed for the toggle itself.
 // 0 = off, 1 = basic neural-output FPS, 2 = detailed MGPU input + NR FPS.
 static int g_fps_hud_mode = 1;
+static int clock_lines(char (*out)[24]);   // CK1, defined with the clock settings
+// SC1: the present chain was sized to the monitor for the scaler (set once,
+// when the window is fitted to the stream).
+static std::atomic<bool> g_sc_active{false};
+// DRV1: the driver check. 0 fine/unknown, 1 driver below the DLSS 5 floor,
+// 2 NGX itself reports that neural rendering needs a newer driver.
+static const unsigned kNrDriverFloor = 61047;   // 610.47: first driver with any DLSS 5 neural rendering
+static std::atomic<int> g_drv_block{0};
+static std::atomic<int> g_drv_min_major{0}, g_drv_min_minor{0};
+// True (and logs once) when neural rendering must not start on this driver.
+static bool drv_blocked(const char *where)
+{
+    const unsigned v = mgpu::adapter::nv_driver_version();
+    if (v != 0 && v < kNrDriverFloor) g_drv_block.store(1);
+    const int b = g_drv_block.load();
+    if (b == 0) return false;
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+    {
+        char l[420];
+        if (b == 1)
+            snprintf(l, sizeof l, "[MGPU][DRV1] NEURAL RENDERING NOT STARTED (%s): NVIDIA driver %u.%02u is older than "
+                     "%u.%02u, the first driver with DLSS 5 neural rendering. Update the NVIDIA driver; the game runs "
+                     "normally meanwhile.", where, v / 100u, v % 100u, kNrDriverFloor / 100u, kNrDriverFloor % 100u);
+        else
+            snprintf(l, sizeof l, "[MGPU][DRV1] NEURAL RENDERING NOT STARTED (%s): NVIDIA's NGX reports that this "
+                     "driver (%u.%02u) needs updating for neural rendering%s%d.%d. Update the NVIDIA driver; the game "
+                     "runs normally meanwhile.", where, v / 100u, v % 100u,
+                     g_drv_min_major.load() > 0 ? " - minimum " : "", g_drv_min_major.load(), g_drv_min_minor.load());
+        mgpu::diag::error(l);
+    }
+    return true;
+}
+// SC3: composition mode with the scaler. The game's window is smaller than its
+// monitor, and a visual on the game's window is clipped to that window - so
+// the visual moves to the bridge's own window, made a top-most, click-through,
+// never-activated cover over the game's monitor. The game keeps the
+// foreground (keyboard, mouse, pad). Bridge thread only.
+static HWND g_sc_cover = nullptr;
+// RS1: reduced-resolution NR reconstruction and filters; UC1: NR UI correction.
+// Live (read per frame). Seeded from mgpu.ini at arm.
+static std::atomic<int> g_rs_recon{1};   // SRRecon: 0 DLSS SR, 1 residual (default)
+static std::atomic<int> g_rs_down{0};    // SRDownFilter: 0 area (default), 1 bilinear, 2 nearest
+static std::atomic<int> g_rs_up{0};      // SRUpFilter: 0 bilinear, 1 bicubic, 2 nearest
+// FV1: foveated neural rendering. With Custom scale (residual rebuild) and one
+// pass, a centred rectangle is ALSO run through NR at full resolution (on the
+// second NR handle, which is otherwise only used by the 2nd pass) and blended
+// over the reduced-scale picture with a soft edge. Live.
+static std::atomic<int> g_fov_on{0};      // FovNR: 0 off, 1 centre box (FV1), 2 lower band (FV2)
+static std::atomic<int> g_fov_band{50};   // FovBand: FV2 band height, % of the picture
+static std::atomic<int> g_fov_bpos{50};   // FovBandPos: FV3 band position, 0 top .. 50 middle .. 100 bottom
+static std::atomic<int> g_fov_fullw{0};   // FovFullWidth: FV3 1 = band spans an ultrawide's full width
+static std::atomic<int> g_fov_pct{60};    // FovSize: centre width/height, % of the picture
+static std::atomic<int> g_fov_feather{15};// FovFeather: soft edge, % of the centre's smaller side
+static std::atomic<int> g_nr_uic{0};     // NRUICorrection: 0 auto (unset), 1 off, 2 on
+// DV1: versions of the NVIDIA DLLs this session loaded, for the panel.
+static std::mutex g_dv_mx;
+static char g_dv[4][48] = {};   // 0 NR, 1 SR, 2 FG, 3 AMD FSR
+static void dv_record(int k, HMODULE m, const char *src)
+{
+    if (k < 0 || k > 3 || m == nullptr) return;
+    (void)src;
+    char v[32] = "?";
+    (void)mgpu::slprobe::file_version(m, v, sizeof v);
+    // "system" = the driver's own copy (NGX model store, DriverStore,
+    // System32); "local" = a file the user placed (mgpu or game folder).
+    char p[MAX_PATH * 2] = {};
+    (void)GetModuleFileNameA(m, p, sizeof p);
+    for (char *c = p; *c; ++c) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
+    const bool sys = strstr(p, "\\programdata\\nvidia") != nullptr || strstr(p, "\\driverstore\\") != nullptr ||
+                     strstr(p, "\\system32\\") != nullptr;
+    std::lock_guard<std::mutex> lk(g_dv_mx);
+    snprintf(g_dv[k], sizeof g_dv[k], "%s %s", v, sys ? "system" : "local");
+}
 // Successful, non-occluded DXGI presents from the MGPU output swapchain.
 // This is the closest HUD-side measure of frames actually handed to DComp.
 static std::atomic<unsigned long long> g_hud_present_count{0};
@@ -437,6 +516,275 @@ static thread_local unsigned long long t_fg_content = 0;
 static std::atomic<float> g_fw_fov{90.0f};
 // HL2: a full-screen menu is up (from the HUD composite's pixel count).
 static std::atomic<bool> g_ui_menu{false};
+// SC5: the cover is shown ONLY while the visual is rooted, the game has the
+// foreground, and no full-screen menu is up. A menu shows the game's own
+// window instead, where the mouse lines up; losing the foreground (a click
+// that landed outside the game's window, Alt+Tab) uncovers the desktop so you
+// can click back in rather than being stuck behind a picture. Bridge thread.
+// MC2: shown/hidden and the pointer clip are changed ONLY on the bridge thread,
+// which owns the cover window. Other threads (the present thread on the first
+// neural frame, the game's thread when the ReShade overlay opens) only hide it
+// asynchronously or ask for a sync - a synchronous ShowWindow from them would
+// wait on the bridge thread's message pump and could stall the game.
+static std::atomic<bool> g_sc_cover_shown{false};
+// SC7: what Windows says about the panel the picture is on - the display
+// mode's refresh and the rate the desktop is actually being composed at. The
+// cover is a composed (not fullscreen) window, so its presents are paced by
+// desktop composition: if that runs at 60 while the mode says 240, every
+// frame we show is capped at 60. Logged at cover creation and on change.
+static void sc_log_refresh(HWND on, const char *why)
+{
+    static unsigned last_mode = 0, last_comp10 = 0;
+    unsigned mode_hz = 0, mw = 0, mh = 0;
+    HMONITOR mon = MonitorFromWindow(on, MONITOR_DEFAULTTONEAREST);
+    MONITORINFOEXW mi{}; mi.cbSize = sizeof mi;
+    if (mon != nullptr && GetMonitorInfoW(mon, &mi))
+    {
+        DEVMODEW dm{}; dm.dmSize = sizeof dm;
+        if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
+        { mode_hz = dm.dmDisplayFrequency; mw = dm.dmPelsWidth; mh = dm.dmPelsHeight; }
+    }
+    double comp_hz = 0.0;
+    typedef HRESULT (WINAPI *pfn_timing)(HWND, DWM_TIMING_INFO *);
+    static pfn_timing timing = nullptr;
+    static bool tried = false;
+    if (!tried)
+    {
+        tried = true;
+        HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+        if (dwm != nullptr) timing = (pfn_timing)(void *)GetProcAddress(dwm, "DwmGetCompositionTimingInfo");
+    }
+    if (timing != nullptr)
+    {
+        DWM_TIMING_INFO ti{}; ti.cbSize = sizeof ti;
+        if (SUCCEEDED(timing(nullptr, &ti)) && ti.rateRefresh.uiDenominator != 0)
+            comp_hz = (double)ti.rateRefresh.uiNumerator / (double)ti.rateRefresh.uiDenominator;
+    }
+    const unsigned comp10 = (unsigned)(comp_hz * 10.0 + 0.5);
+    if (why == nullptr && mode_hz == last_mode && comp10 == last_comp10) return;
+    last_mode = mode_hz; last_comp10 = comp10;
+    char l[480];
+    snprintf(l, sizeof l, "[MGPU][SC7] %s: display mode %ux%u at %u Hz, desktop composition at %.1f Hz.%s",
+             why ? why : "refresh changed", mw, mh, mode_hz, comp_hz,
+             (comp_hz > 0.0 && comp_hz < 0.8 * (double)mode_hz)
+                 ? " COMPOSITION IS BELOW THE MODE - every picture the mod shows is capped at that rate. Look at "
+                   "Windows' 'Dynamic refresh rate' and NVIDIA G-SYNC 'windowed mode'."
+                 : "");
+    mgpu::diag::info(l);
+}
+static std::atomic<bool> g_sc_sync_req{false};
+// PP1: the MGPU panel is up over the picture (PanelOverPicture). The cover
+// then takes the clicks (no WS_EX_TRANSPARENT) so they never land on the
+// desktop, and the pointer mapping steps back - the panel feeds its own.
+static std::atomic<bool> g_sc_panel{false};
+// PP2: the pointer as the cover window's own messages report it.
+static std::atomic<int> g_pm_x{-1}, g_pm_y{-1}, g_pm_wheel{0};
+static std::atomic<unsigned> g_pm_btn{0};
+static bool g_sc_click_in = false;   // bridge thread
+static void sc_apply_click_mode(bool in)
+{
+    if (g_sc_cover == nullptr || in == g_sc_click_in) return;
+    LONG_PTR ex = GetWindowLongPtrW(g_sc_cover, GWL_EXSTYLE);
+    ex = in ? (ex & ~(LONG_PTR)WS_EX_TRANSPARENT) : (ex | (LONG_PTR)WS_EX_TRANSPARENT);
+    SetWindowLongPtrW(g_sc_cover, GWL_EXSTYLE, ex);
+    SetWindowPos(g_sc_cover, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    g_sc_click_in = in;
+    // UI3: while the panel was up the real pointer moved over the whole
+    // monitor; the game works in its smaller window. Put the pointer at the
+    // matching spot in the game's window as the panel closes, so it does not
+    // jump when the pointer mapping (MC1) confines it again.
+    if (!in && g_game_hwnd != nullptr)
+    {
+        RECT cr{}, gr{};
+        const int px = g_pm_x.load(), py = g_pm_y.load();
+        if (px >= 0 && py >= 0 && GetClientRect(g_sc_cover, &cr) && GetClientRect(g_game_hwnd, &gr) &&
+            cr.right > 0 && cr.bottom > 0 && gr.right > 0 && gr.bottom > 0)
+        {
+            POINT p{ (LONG)((long long)px * gr.right / cr.right), (LONG)((long long)py * gr.bottom / cr.bottom) };
+            if (ClientToScreen(g_game_hwnd, &p)) SetCursorPos(p.x, p.y);
+        }
+    }
+    mgpu::diag::info(in ? "[MGPU][PP1] panel up over the scaled picture: clicks go to the picture (and on to the panel)."
+                        : "[MGPU][PP1] panel closed: the picture is click-through again.");
+}
+// SC9: the ReShade console on the 4K screen. While the game's ReShade overlay
+// is open the scaled picture steps aside (the overlay is drawn in the game's
+// 1440p window), and the Windows full-screen magnifier zooms that window to
+// fill the monitor. Windows maps the pointer itself, so clicks land where they
+// are seen. Undone when the overlay closes, the game loses the foreground, the
+// picture's window goes away, or the add-on stops. ScalerConsole=0 turns it off.
+static std::atomic<bool> g_sc_console{false};   // game overlay open while the cover exists
+static bool g_sc_mag_on = false;
+typedef BOOL (WINAPI *pfn_mag_init)();
+typedef BOOL (WINAPI *pfn_mag_full)(float, int, int);
+static pfn_mag_full sc_mag_api()
+{
+    static pfn_mag_full full = nullptr;
+    static bool tried = false;
+    if (!tried)
+    {
+        tried = true;
+        HMODULE m = LoadLibraryW(L"Magnification.dll");
+        if (m != nullptr) full = (pfn_mag_full)(void *)GetProcAddress(m, "MagSetFullscreenTransform");
+    }
+    if (full != nullptr)
+    {
+        // Per thread: harmless to repeat.
+        static thread_local bool inited = false;
+        if (!inited)
+        {
+            HMODULE m = GetModuleHandleW(L"Magnification.dll");
+            pfn_mag_init init = m ? (pfn_mag_init)(void *)GetProcAddress(m, "MagInitialize") : nullptr;
+            inited = (init != nullptr && init() != FALSE);
+            if (!inited) return nullptr;
+        }
+    }
+    return full;
+}
+static void sc_magnify(bool on)
+{
+    pfn_mag_full full = sc_mag_api();
+    if (full == nullptr)
+    {
+        if (on) mgpu::diag::warn("[MGPU][SC9] the Windows magnifier is not available - the console stays in the "
+                                 "game's own window.");
+        g_sc_mag_on = false;
+        return;
+    }
+    if (!on)
+    {
+        if (g_sc_mag_on) { full(1.0f, 0, 0); mgpu::diag::info("[MGPU][SC9] console zoom off."); }
+        g_sc_mag_on = false;
+        return;
+    }
+    RECT rc{}; POINT o{0, 0};
+    HMONITOR mh = MonitorFromWindow(g_game_hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{}; mi.cbSize = sizeof mi;
+    if (g_game_hwnd == nullptr || !GetClientRect(g_game_hwnd, &rc) || !ClientToScreen(g_game_hwnd, &o) ||
+        mh == nullptr || !GetMonitorInfoW(mh, &mi) || rc.right <= 0 || rc.bottom <= 0)
+        return;
+    const float mw = (float)(mi.rcMonitor.right - mi.rcMonitor.left), mhh = (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+    float zoom = mw / (float)rc.right;
+    if (mhh / (float)rc.bottom < zoom) zoom = mhh / (float)rc.bottom;
+    if (zoom <= 1.01f) return;   // nothing to enlarge
+    // Unmagnified point shown at the monitor's top-left, centring the window
+    // when its shape differs from the monitor's.
+    const float vw = mw / zoom, vh = mhh / zoom;
+    const int xo = (int)((float)o.x - (vw - (float)rc.right) * 0.5f - (float)mi.rcMonitor.left / zoom);
+    const int yo = (int)((float)o.y - (vh - (float)rc.bottom) * 0.5f - (float)mi.rcMonitor.top / zoom);
+    if (full(zoom, xo, yo))
+    {
+        g_sc_mag_on = true;
+        char l[220];
+        snprintf(l, sizeof l, "[MGPU][SC9] console zoom on: the game's %ldx%ld window enlarged %.2fx to fill the "
+                 "monitor while the ReShade overlay is open.", rc.right, rc.bottom, zoom);
+        mgpu::diag::info(l);
+    }
+    else
+        mgpu::diag::warn("[MGPU][SC9] MagSetFullscreenTransform refused - the console stays in the game's window.");
+}
+static bool sc_console_cfg()
+{
+    static int cfg = -1;
+    if (cfg < 0) cfg = (!ini_has_key("ScalerConsole") || ini_read_flag("ScalerConsole")) ? 1 : 0;
+    return cfg == 1;
+}
+static bool g_dcomp_rooted_fwd();   // defined after g_dcomp_rooted
+static void sc_cover_sync(bool force_log)
+{
+    if (g_sc_cover == nullptr) return;
+    bool game_fg = false;
+    if (g_game_hwnd != nullptr)
+    {
+        HWND fg = GetForegroundWindow();
+        DWORD pid = 0;
+        if (fg != nullptr) GetWindowThreadProcessId(fg, &pid);
+        game_fg = (fg == g_game_hwnd) || (pid != 0 && pid == GetCurrentProcessId());
+        // SC8: a foreground change has to LAST 400 ms before the picture steps
+        // aside - menu transitions and notifications can flick the foreground
+        // for a frame or two, and that read as a random drop back to the window.
+        static ULONGLONG lost_since = 0;
+        static char lost_name[64] = {};
+        if (game_fg) lost_since = 0;
+        else
+        {
+            const ULONGLONG now = GetTickCount64();
+            if (lost_since == 0)
+            {
+                lost_since = now;
+                lost_name[0] = 0;
+                if (fg != nullptr) GetClassNameA(fg, lost_name, (int)sizeof lost_name);
+            }
+            if (now - lost_since < 400) game_fg = true;
+            else if (g_sc_cover_shown.load())
+            {
+                char l[200];
+                snprintf(l, sizeof l, "[MGPU][SC8] foreground is another program's window (class \"%s\", pid %lu) "
+                         "for 400 ms - stepping aside.", lost_name, (unsigned long)pid);
+                mgpu::diag::info(l);
+            }
+        }
+    }
+    // MC1: with the pointer mapped onto the picture, menus work on the picture
+    // itself, so it no longer steps aside for them.
+    const bool menu = g_ui_menu.load(std::memory_order_relaxed) && !mgpu::cursormap::installed();
+    const bool want = g_dcomp_rooted_fwd() && game_fg && !menu;
+    {
+        const bool want_mag = g_sc_console.load() && game_fg && sc_console_cfg();
+        if (want_mag != g_sc_mag_on) sc_magnify(want_mag);
+    }
+    // SC6: stay ABOVE the game's window. Both can be top-most (some engines make
+    // their window top-most, and among top-most windows the one activated last
+    // wins), so while shown, check whether the game's window is above the cover
+    // and put the cover back on top if it is. Cheap: a walk up the Z-order.
+    if (want && g_sc_cover_shown.load() && g_game_hwnd != nullptr)
+    {
+        bool game_above = false;
+        for (HWND w = GetWindow(g_sc_cover, GW_HWNDPREV); w != nullptr; w = GetWindow(w, GW_HWNDPREV))
+            if (w == g_game_hwnd) { game_above = true; break; }
+        if (game_above)
+        {
+            SetWindowPos(g_sc_cover, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            static unsigned n = 0;
+            static ULONGLONG last_log = 0;
+            ++n;
+            if (GetTickCount64() - last_log >= 2000)   // SC8: every occurrence, at most one line per 2 s
+            {
+                last_log = GetTickCount64();
+                char z[240];
+                snprintf(z, sizeof z, "[MGPU][SC6] the game's window was above the scaled picture - put back on "
+                         "top (%u time(s)); game window top-most=%d.", n,
+                         (GetWindowLongPtrW(g_game_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) ? 1 : 0);
+                mgpu::diag::info(z);
+            }
+        }
+    }
+    const bool panel = g_sc_panel.load();
+    if (want == g_sc_cover_shown.load() && !force_log)
+    {
+        sc_apply_click_mode(panel && want);
+        mgpu::cursormap::tick(want && !panel);
+        return;
+    }
+    if (want != g_sc_cover_shown.load())
+    {
+        if (want)
+        {
+            ShowWindow(g_sc_cover, SW_SHOWNOACTIVATE);
+            SetWindowPos(g_sc_cover, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        else ShowWindow(g_sc_cover, SW_HIDE);
+        g_sc_cover_shown.store(want);
+        char l[200];
+        snprintf(l, sizeof l, "[MGPU][SC5] scaled picture %s (%s).", want ? "shown" : "hidden",
+                 want ? "game in front, no menu"
+                      : (!game_fg ? "game is not the foreground window" : (menu ? "full-screen menu" : "hidden")));
+        mgpu::diag::info(l);
+    }
+    sc_apply_click_mode(panel && g_sc_cover_shown.load());
+    mgpu::cursormap::tick(g_sc_cover_shown.load() && !panel);
+}
 static thread_local D3D12_RESOURCE_STATES t_fg_rest = D3D12_RESOURCE_STATE_COMMON;
 // FIX8: what the last present_frame call on THIS thread left on the GPU.
 //   0          nothing submitted (failed before ExecuteCommandLists)
@@ -444,6 +792,86 @@ static thread_local D3D12_RESOURCE_STATES t_fg_rest = D3D12_RESOURCE_STATE_COMMO
 //   UINT64_MAX submitted but NOT covered by any fence (Signal failed)
 static thread_local unsigned long long t_present_fv = 0;
 static std::atomic<unsigned long long> g_hud_gen_count{0};
+
+// ---- PF1: performance summary in ReShade.log every 10 s ----
+// NR GPU time per evaluate (avg / p95 / max / count over 11 ms) and the
+// spacing of the bridge's presents (avg / sd / p99 / max / hitches), plus
+// real, generated and presented frame rates. One line per 10 s, kept even
+// with the detailed log off.
+static std::atomic<bool> g_pf_on{false};   // PerfLog: 0 = no measuring, no line
+static std::mutex g_pf_mx;
+static unsigned g_pf_nr_hist[160] = {};          // 0.25 ms bins, 0-40 ms
+static double   g_pf_nr_sum = 0.0, g_pf_nr_max = 0.0;
+static unsigned g_pf_nr_n = 0, g_pf_nr_over = 0;
+static unsigned g_pf_iv_hist[250] = {};          // 0.1 ms bins, 0-25 ms
+static double   g_pf_iv_sum = 0.0, g_pf_iv_sq = 0.0, g_pf_iv_max = 0.0;
+static unsigned g_pf_iv_n = 0;
+static long long g_pf_last = 0, g_pf_t0 = 0;
+static unsigned long long g_pf_gen0 = 0, g_pf_eval0 = 0;
+static void perf_nr_ms(double ms)
+{
+    if (!(ms >= 0.0) || !g_pf_on.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lk(g_pf_mx);
+    unsigned b = (unsigned)(ms / 0.25); if (b > 159u) b = 159u;
+    ++g_pf_nr_hist[b]; g_pf_nr_sum += ms; ++g_pf_nr_n;
+    if (ms > g_pf_nr_max) g_pf_nr_max = ms;
+    if (ms > 11.0) ++g_pf_nr_over;
+}
+static double pf_pct(const unsigned *h, unsigned nb, double w, unsigned n, double pct)
+{
+    if (n == 0) return 0.0;
+    const double want = pct * (double)n;
+    double acc = 0.0;
+    for (unsigned i = 0; i < nb; ++i) { acc += h[i]; if (acc >= want) return (i + 1) * w; }
+    return nb * w;
+}
+static void perf_present(unsigned long long evals, unsigned long long gens)
+{
+    if (!g_pf_on.load(std::memory_order_relaxed))
+    {
+        std::lock_guard<std::mutex> lk(g_pf_mx);
+        g_pf_t0 = 0; g_pf_last = 0;   // restart the window cleanly when turned back on
+        return;
+    }
+    LARGE_INTEGER now{}, fq{};
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
+    if (fq.QuadPart == 0) return;
+    char line[600]; line[0] = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_pf_mx);
+        if (g_pf_last != 0)
+        {
+            const double iv = (double)(now.QuadPart - g_pf_last) * 1000.0 / (double)fq.QuadPart;
+            unsigned b = (unsigned)(iv / 0.1); if (b > 249u) b = 249u;
+            ++g_pf_iv_hist[b]; g_pf_iv_sum += iv; g_pf_iv_sq += iv * iv; ++g_pf_iv_n;
+            if (iv > g_pf_iv_max) g_pf_iv_max = iv;
+        }
+        g_pf_last = now.QuadPart;
+        if (g_pf_t0 == 0) { g_pf_t0 = now.QuadPart; g_pf_gen0 = gens; g_pf_eval0 = evals; return; }
+        const double dt = (double)(now.QuadPart - g_pf_t0) / (double)fq.QuadPart;
+        if (dt < 10.0) return;
+        const double nr_avg = g_pf_nr_n ? g_pf_nr_sum / g_pf_nr_n : 0.0;
+        const double iv_avg = g_pf_iv_n ? g_pf_iv_sum / g_pf_iv_n : 0.0;
+        double var = g_pf_iv_n ? g_pf_iv_sq / g_pf_iv_n - iv_avg * iv_avg : 0.0;
+        if (var < 0.0) var = 0.0;
+        unsigned hitch = 0;   // presents more than twice the average spacing apart
+        for (unsigned i = 0; i < 250u; ++i) if ((i + 0.5) * 0.1 > 2.0 * iv_avg) hitch += g_pf_iv_hist[i];
+        snprintf(line, sizeof line,
+                 "[MGPU][PF1] last %.0f s | NR GPU avg %.2f p95 %.2f max %.2f ms, over 11 ms %u of %u | "
+                 "present %.1f fps, spacing avg %.2f sd %.2f p99 %.2f max %.2f ms, hitches %u | "
+                 "real %.1f fps, generated %.1f fps",
+                 dt, nr_avg, (std::min)(pf_pct(g_pf_nr_hist, 160u, 0.25, g_pf_nr_n, 0.95), g_pf_nr_max), g_pf_nr_max,
+                 g_pf_nr_over, g_pf_nr_n,
+                 g_pf_iv_n / dt, iv_avg, std::sqrt(var), (std::min)(pf_pct(g_pf_iv_hist, 250u, 0.1, g_pf_iv_n, 0.99), g_pf_iv_max),
+                 g_pf_iv_max, hitch,
+                 (double)(evals - g_pf_eval0) / dt, (double)(gens - g_pf_gen0) / dt);
+        std::memset(g_pf_nr_hist, 0, sizeof g_pf_nr_hist); std::memset(g_pf_iv_hist, 0, sizeof g_pf_iv_hist);
+        g_pf_nr_sum = g_pf_nr_max = 0.0; g_pf_nr_n = g_pf_nr_over = 0;
+        g_pf_iv_sum = g_pf_iv_sq = g_pf_iv_max = 0.0; g_pf_iv_n = 0;
+        g_pf_t0 = now.QuadPart; g_pf_gen0 = gens; g_pf_eval0 = evals;
+    }
+    if (line[0] != 0) mgpu::diag::info(line);
+}
 // FG2: present_frame is called from two threads while frame generation runs;
 // one present at a time.
 static std::mutex g_present_mx;
@@ -515,8 +943,13 @@ static bool dcomp_set_rooted(bool want, const char *why)
     IDCompositionVisual *visual = (IDCompositionVisual *)g_dcomp_visual;
     IDCompositionDevice *dcomp  = (IDCompositionDevice *)g_dcomp_device;
 
+    // SC3: hide the cover BEFORE unrooting so the panel never shows its empty
+    // surface; show it only AFTER the root is committed, for the same reason.
+    if (!want && g_sc_cover != nullptr && g_sc_cover_shown.exchange(false)) ShowWindowAsync(g_sc_cover, SW_HIDE);
     HRESULT hr = target->SetRoot(want ? visual : nullptr);
     if (SUCCEEDED(hr)) hr = dcomp->Commit();
+    if (SUCCEEDED(hr) && g_sc_cover != nullptr)
+        g_sc_sync_req.store(true);   // the bridge thread shows it on its next poll
     if (FAILED(hr))
     {
         char e[320];
@@ -572,6 +1005,7 @@ void dcomp_set_visible(bool on)
             return;
         }
     }
+    if (g_sc_cover != nullptr) { g_sc_console.store(!on); g_sc_sync_req.store(true); }   // SC9
     (void)dcomp_set_rooted(on, on ? "overlay closed" : "overlay open");
 }
 
@@ -680,6 +1114,7 @@ bool create_present_chain(HWND hwnd)
         // asynchronous - this file learned that the expensive way - and the
         // note above is specifically worried about a topmost target outliving
         // the DLL on the game's window. Make it deterministic.
+        if (g_sc_cover != nullptr) { ShowWindow(g_sc_cover, SW_HIDE); g_sc_cover = nullptr; g_sc_cover_shown.store(false); g_sc_click_in = false; mgpu::cursormap::uninstall(); g_sc_console.store(false); if (g_sc_mag_on) sc_magnify(false); }
         if (g_dcomp_target != nullptr && g_dcomp_device != nullptr)
         {
             ((IDCompositionTarget *)g_dcomp_target)->SetRoot(nullptr);
@@ -1640,7 +2075,13 @@ bool present_frame(float r, float g, float b)
         // changes - the seam appears, the picture does not move.
         D3D12_BOX pbox{ left + halfw, top, 0, left + cw, top + ch, 1 };
         if (lsrc == nullptr) pbox.left = left;
-        cl->CopyTextureRegion(&pd, (lsrc != nullptr) ? halfw : 0u, 0, 0, &ps, &pbox);
+        // SC1: game smaller than the (monitor-sized) chain - enlarge instead of copy.
+        bool scaled = false;
+        if (lsrc == nullptr && g_sc_active.load(std::memory_order_relaxed) && (nw != bw || nh != bh))
+            scaled = mgpu::scaler::run(dev, cl, nsrc, D3D12_RESOURCE_STATE_COPY_SOURCE, nw, nh,
+                                       backbuffer[index], bw, bh, bbfmt, index);
+        if (!scaled)
+            cl->CopyTextureRegion(&pd, (lsrc != nullptr) ? halfw : 0u, 0, 0, &ps, &pbox);
 
         nb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         nb.Transition.StateAfter = nrest;
@@ -1671,12 +2112,17 @@ bool present_frame(float r, float g, float b)
         // FW1: Frame Warp - turn the picture by the mouse movement since its
         // content was made. Whole-frame views only (not split, not a crop).
         // Before the captures, so screenshots and video show what is on screen.
-        if (lsrc == nullptr && cw == bw && ch == bh && nw == bw && nh == bh &&
+        if (lsrc == nullptr && (scaled || (cw == bw && ch == bh && nw == bw && nh == bh)) &&
             !g_ui_menu.load(std::memory_order_relaxed))   // HL2: never warp a menu
             (void)mgpu::framewarp::apply(dev, cl, backbuffer[index], bw, bh, bbfmt,
                                          (t_fg_src != nullptr) ? t_fg_content
                                                                : g_lat_cap_qpc.load(std::memory_order_relaxed),
                                          g_fw_fov.load(std::memory_order_relaxed));
+
+        // MC1: the game's pointer, drawn on the enlarged picture (after Frame
+        // Warp, so it never swims with the camera correction).
+        if (scaled)
+            mgpu::scaler::draw_cursor(dev, cl, backbuffer[index], bw, bh, nw, nh, bbfmt);
 
         // SS1/VR1/BM1: screenshots, recording and the benchmark take the frame
         // here - as shown, split included, before the FPS HUD is drawn.
@@ -1721,6 +2167,13 @@ bool present_frame(float r, float g, float b)
                                        hud_nr_skip_fps, hud_present_fps, hud_nr_gpu_ms,
                                        (ui_frame_gen() != 0) ? hud_gen_fps() : -1.0,   // FG1
                                        hud_st, hud_st_n);
+        }
+
+        // CK1: clock / stopwatch, top-right. Independent of the FPS HUD.
+        {
+            char ck[2][24] = {};
+            const int ckn = clock_lines(ck);
+            if (ckn > 0) mgpu::screen::draw_clock_box(cl, rtv, bw, bh, ck, ckn);
         }
 
         // SS1/VR1: captures that include the FPS HUD - exactly what is on screen.
@@ -1898,6 +2351,8 @@ bool present_frame(float r, float g, float b)
     {
         g_hud_present_count.fetch_add(1ull, std::memory_order_relaxed);
         mgpu::capture::on_present_shown();   // BM1
+        perf_present(g_hud_nr_ok_count.load(std::memory_order_relaxed),
+                     g_hud_gen_count.load(std::memory_order_relaxed));   // PF1
     }
 
     // ---- R111: THE SUCCESS CODES PRESENT RETURNS, WHICH WERE INVISIBLE ----
@@ -1978,6 +2433,13 @@ bool has_present_chain()
 void shutdown()
 {
     auto &S = st();
+
+    // MC2: put the game's SetCursor/ShowCursor imports back and release the
+    // pointer clip FIRST - the game keeps running its message loop after this
+    // add-on unloads, and a hooked import would jump into freed code.
+    mgpu::cursormap::uninstall();
+    g_sc_console.store(false);
+    if (g_sc_mag_on) sc_magnify(false);   // SC9: never leave the desktop zoomed
 
     // Detach the chain under the lock, release it outside: the lock is
     // never held across the fence wait below, and the raw pointers never
@@ -4065,6 +4527,49 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
             params = nullptr;
             teardown("GetCapabilityParameters");
             return false;
+        }
+        // DRV1: what NGX says about neural rendering on this driver. The key
+        // prefix for the neural renderer is not documented, so the likely
+        // ones are asked and whatever answers is logged.
+        {
+            static const char *const pre[] = { "DLSSNR", "NeuralRendering", "Reserved18" };
+            bool any = false;
+            for (const char *p : pre)
+            {
+                char k[96];
+                int avail = -1, needs = -1, mj = -1, mn = -1; unsigned fir = 0;
+                bool got = false;
+                snprintf(k, sizeof k, "%s.Available", p);             got |= params->Get(k, &avail) == NVSDK_NGX_Result_Success;
+                snprintf(k, sizeof k, "%s.NeedsUpdatedDriver", p);    got |= params->Get(k, &needs) == NVSDK_NGX_Result_Success;
+                snprintf(k, sizeof k, "%s.MinDriverVersionMajor", p); got |= params->Get(k, &mj) == NVSDK_NGX_Result_Success;
+                snprintf(k, sizeof k, "%s.MinDriverVersionMinor", p); got |= params->Get(k, &mn) == NVSDK_NGX_Result_Success;
+                snprintf(k, sizeof k, "%s.FeatureInitResult", p);     got |= params->Get(k, &fir) == NVSDK_NGX_Result_Success;
+                if (!got) continue;
+                any = true;
+                snprintf(line, sizeof line, "[MGPU][DRV1] NGX capability for '%s': Available=%d NeedsUpdatedDriver=%d "
+                         "MinDriver=%d.%d FeatureInitResult=0x%08X | installed driver %u.%02u.%s", p, avail, needs, mj, mn,
+                         fir, mgpu::adapter::nv_driver_version() / 100u, mgpu::adapter::nv_driver_version() % 100u,
+                         (avail == 0 && fir == 0xBAD00004u)
+                             ? " FeatureNotFound here means the driver's built-in feature list has no entry for it - "
+                               "neural rendering comes from the separate nvngx_dlssnr.dll this add-on loads, so this "
+                               "is expected and says nothing about the card. Only NeedsUpdatedDriver=1 stops the mod."
+                             : "");
+                mgpu::diag::info(line);
+                if (needs == 1)
+                {
+                    g_drv_min_major.store(mj > 0 ? mj : 0);
+                    g_drv_min_minor.store(mn > 0 ? mn : 0);
+                    g_drv_block.store(2);
+                }
+            }
+            if (!any)
+            {
+                snprintf(line, sizeof line, "[MGPU][DRV1] NGX reports no neural-rendering capability keys (normal - "
+                         "they are not documented); the driver check relies on the version floor %u.%02u. Installed "
+                         "driver %u.%02u.", kNrDriverFloor / 100u, kNrDriverFloor % 100u,
+                         mgpu::adapter::nv_driver_version() / 100u, mgpu::adapter::nv_driver_version() % 100u);
+                mgpu::diag::info(line);
+            }
         }
     }
 
@@ -8632,11 +9137,22 @@ namespace
         ID3D12Resource *sr_color[2] = {};   // R, tone-mapped, NR input
         ID3D12Resource *sr_depth    = nullptr;   // R, point-reduced
         ID3D12Resource *sr_nrout    = nullptr;   // R, NR output = SR input
+        ID3D12Resource *fov_out     = nullptr;   // FV1: full-size NR output of the centre rectangle
+        UINT fov_rect[4] = {0, 0, 0, 0};        // FV1: x0,y0,x1,y1 of the last centre evaluate
+        bool fov_first = true;                  // FV1: reset the centre feature's history
+        bool fov_said = false;
+        int  fov_src_mode = 0;                  // FV4: which input the centre's history is of
+        UINT fov_base_h = 0;                    // FV2: rows of R the base evaluate covers (0 = all)
+        bool fov_base_reset = false;
         ID3D12Resource *sr_expose   = nullptr;   // 1x1 R32_FLOAT = 1.0
         ID3D12RootSignature *ds_rs  = nullptr;
         ID3D12PipelineState *ds_pso = nullptr;
         ID3D12DescriptorHeap *ds_heap = nullptr;
         UINT ds_inc = 0;
+        // RS1: residual reconstruction (out = full original + up(NR(small) - small)).
+        ID3D12RootSignature *rs_rs  = nullptr;
+        ID3D12PipelineState *rs_pso = nullptr;
+        bool rs_said = false;
         unsigned long long sr_evals = 0, sr_fails = 0;
         bool sr_first = true;
         bool sr_ready = false;
@@ -11409,12 +11925,26 @@ bool dg_ensure(stream_state &s, ID3D12GraphicsCommandList *cl, ID3D12Resource *l
         ngx_modules mods;
         mods.core = ngx_find_core(nullptr);
         char where[MAX_PATH * 2] = {};
-        const char *src = "driver model store";
-        mods.snippet = dg_load_store_snippet(where, sizeof where);
+        // FL1: FGSource=1 tries mgpu\nvngx_dlssg.dll first (a newer DLL than
+        // the driver's store, e.g. one with FG Lite); 0 = the store first.
+        const bool mgpu_first = ini_read_sr_int("FGSource", 0, 0, 1) == 1;
+        const char *src = mgpu_first ? "mgpu folder" : "driver model store";
+        mods.snippet = mgpu_first ? load_private_snippet(L"nvngx_dlssg.dll", where, sizeof where)
+                                  : dg_load_store_snippet(where, sizeof where);
         if (mods.snippet == nullptr)
         {
-            src = "mgpu folder";
-            mods.snippet = load_private_snippet(L"nvngx_dlssg.dll", where, sizeof where);
+            src = mgpu_first ? "driver model store" : "mgpu folder";
+            mods.snippet = mgpu_first ? dg_load_store_snippet(where, sizeof where)
+                                      : load_private_snippet(L"nvngx_dlssg.dll", where, sizeof where);
+        }
+        if (mods.snippet != nullptr)
+        {
+            char ver[32] = "unknown";
+            (void)mgpu::slprobe::file_version(mods.snippet, ver, sizeof ver);
+            dv_record(2, mods.snippet, src[0] == 'm' ? "mgpu" : "driver");   // DV1
+            snprintf(line, sizeof line, "[MGPU][FL1] frame generation DLL version %s (from the %s, FGSource=%d)",
+                     ver, src, mgpu_first ? 1 : 0);
+            mgpu::diag::info(line);
         }
         if (mods.core == nullptr || mods.snippet == nullptr)
         {
@@ -11489,6 +12019,15 @@ bool dg_ensure(stream_state &s, ID3D12GraphicsCommandList *cl, ID3D12Resource *l
     p->Set("DLSSG.Width", g_dg.w);
     p->Set("DLSSG.Height", g_dg.h);
     p->Set("DLSSG.BackbufferFormat", (unsigned int)g_dg.fmt);
+    // FL1: FG Lite, the lighter candidate blending behind NVIDIA's faster
+    // frame generation preset (310.9.16 DLLs carry it). FGLite=1 asks for it
+    // at creation; a DLL that does not know the key ignores it.
+    {
+        const int lite = ini_read_sr_int("FGLite", 0, 0, 1);
+        if (lite) p->Set("DLSSG.LiteCandidateBlendingEnabled", 1);
+        snprintf(line, sizeof line, "[MGPU][FL1] FG Lite %s (FGLite=%d)", lite ? "requested" : "off", lite);
+        mgpu::diag::info(line);
+    }
     p->Set("DLSSG.InternalWidth", s.mvec_w != 0u ? s.mvec_w : g_dg.w);
     p->Set("DLSSG.InternalHeight", s.mvec_h != 0u ? s.mvec_h : g_dg.h);
     p->Set("DLSSG.DynamicResolution", 0u);
@@ -11902,7 +12441,10 @@ static bool fsr_load_dll(char *where, size_t where_n)
         g_ffx_mod = LoadLibraryExW(full, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (g_ffx_mod == nullptr && i == 0) load_err = GetLastError();
         if (g_ffx_mod != nullptr)
+        {
             WideCharToMultiByte(CP_UTF8, 0, full, -1, where, (int)where_n, nullptr, nullptr);
+            dv_record(3, g_ffx_mod, nullptr);   // DV1
+        }
     }
     if (g_ffx_mod == nullptr)
     {
@@ -12316,12 +12858,16 @@ static void g0_stage_release(stream_state &s)
         s.sr_ready = false;
         if (s.ds_pso  != nullptr) { s.ds_pso->Release();  s.ds_pso  = nullptr; }
         if (s.ds_rs   != nullptr) { s.ds_rs->Release();   s.ds_rs   = nullptr; }
+        if (s.rs_pso  != nullptr) { s.rs_pso->Release();  s.rs_pso  = nullptr; }   // RS1
+        if (s.rs_rs   != nullptr) { s.rs_rs->Release();   s.rs_rs   = nullptr; }
         if (s.ds_heap != nullptr) { s.ds_heap->Release(); s.ds_heap = nullptr; }
         mgpu::nr16::release();   // R208: same point, same reason
         for (unsigned i = 0; i < 2u; ++i)
             if (s.sr_color[i] != nullptr) { s.sr_color[i]->Release(); s.sr_color[i] = nullptr; }
         if (s.sr_depth  != nullptr) { s.sr_depth->Release();  s.sr_depth  = nullptr; }
         if (s.sr_nrout  != nullptr) { s.sr_nrout->Release();  s.sr_nrout  = nullptr; }
+        if (s.fov_out   != nullptr) { s.fov_out->Release();   s.fov_out   = nullptr; }   // FV1
+        s.fov_first = true;
         if (s.sr_expose != nullptr) { s.sr_expose->Release(); s.sr_expose = nullptr; }
         s.nr_final = nullptr;   // borrowed; released with tex_out / tex_pong
         if (s.nr_read != nullptr) { s.nr_read->Release(); s.nr_read = nullptr; }
@@ -12655,13 +13201,27 @@ namespace
         "RWTexture2D<float4> oColor : register(u0);\n"
         "RWTexture2D<float>  oDepth : register(u1);\n"
         "SamplerState gLin : register(s0);\n"
-        "cbuffer C : register(b0) { uint2 gSrc; uint2 gDst; };\n"
+        "cbuffer C : register(b0) { uint2 gSrc; uint2 gDst; uint gMode; };\n"
         "[numthreads(8,8,1)]\n"
         "void main(uint3 id : SV_DispatchThreadID)\n"
         "{\n"
         "  if (id.x >= gDst.x || id.y >= gDst.y) return;\n"
         "  float2 uv = (float2(id.xy) + 0.5f) / float2(gDst);\n"
-        "  oColor[id.xy] = gColor.SampleLevel(gLin, uv, 0);\n"
+        // RS1: gMode 0 = area (box over the footprint, up to 4x4), 1 = bilinear, 2 = nearest
+        "  if (gMode == 0u) {\n"
+        "    float2 sc = float2(gSrc) / float2(gDst);\n"
+        "    int2 a = int2(floor(float2(id.xy) * sc));\n"
+        "    int2 b = int2(ceil((float2(id.xy) + 1.0f) * sc)) - int2(1,1);\n"
+        "    b = min(b, a + int2(3,3)); b = min(b, int2(gSrc) - int2(1,1));\n"
+        "    float4 acc = 0; float n = 0;\n"
+        "    for (int y = a.y; y <= b.y; ++y) for (int x = a.x; x <= b.x; ++x) { acc += gColor.Load(int3(x,y,0)); n += 1; }\n"
+        "    oColor[id.xy] = acc / max(n, 1.0f);\n"
+        "  } else if (gMode == 2u) {\n"
+        "    int2 np = clamp(int2(uv * float2(gSrc)), int2(0,0), int2(gSrc) - int2(1,1));\n"
+        "    oColor[id.xy] = gColor.Load(int3(np, 0));\n"
+        "  } else {\n"
+        "    oColor[id.xy] = gColor.SampleLevel(gLin, uv, 0);\n"
+        "  }\n"
         "  int2 sp = int2(uv * float2(gSrc));\n"
         "  sp = clamp(sp, int2(0,0), int2(gSrc) - int2(1,1));\n"
         "  oDepth[id.xy] = gDepth.Load(int3(sp, 0));\n"
@@ -12718,7 +13278,7 @@ namespace
         rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         rp[1].Constants.ShaderRegister = 0;
-        rp[1].Constants.Num32BitValues = 4;
+        rp[1].Constants.Num32BitValues = 5;   // RS1: + filter mode
         rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_STATIC_SAMPLER_DESC ss{};
@@ -12761,9 +13321,102 @@ namespace
             return false;
         }
 
+        // ---- RS1: the residual reconstruction pass ----
+        // out = full-res original + upsample(NR output - NR input), both at R.
+        // The game's native detail is kept; only NR's change is at R.
+        {
+            static const char *kResidualHLSL =
+                "Texture2D<float4> gOrig : register(t0);\n"
+                "Texture2D<float4> gIn   : register(t1);\n"
+                "Texture2D<float4> gNr   : register(t2);\n"
+                "Texture2D<float4> gFov  : register(t3);\n"
+                "RWTexture2D<float4> oOut : register(u0);\n"
+                "cbuffer C : register(b0) { uint2 gFull; uint2 gSmall; uint4 gFovR; uint gMode; float gFeather; };\n"
+                "float3 D(int2 p) { p = clamp(p, int2(0,0), int2(gSmall) - int2(1,1));\n"
+                "  return gNr.Load(int3(p,0)).rgb - gIn.Load(int3(p,0)).rgb; }\n"
+                "float4 CR(float t) { float t2 = t*t, t3 = t2*t;\n"
+                "  return float4(-0.5f*t3 + t2 - 0.5f*t, 1.5f*t3 - 2.5f*t2 + 1.0f,\n"
+                "                -1.5f*t3 + 2.0f*t2 + 0.5f*t, 0.5f*t3 - 0.5f*t2); }\n"
+                "[numthreads(8,8,1)]\n"
+                "void main(uint3 id : SV_DispatchThreadID)\n"
+                "{\n"
+                "  if (id.x >= gFull.x || id.y >= gFull.y) return;\n"
+                "  float2 sp = (float2(id.xy) + 0.5f) * float2(gSmall) / float2(gFull) - 0.5f;\n"
+                "  float3 d;\n"
+                "  if (gMode == 2u) { d = D(int2(floor(sp + 0.5f))); }\n"
+                "  else { int2 i = int2(floor(sp)); float2 f = sp - float2(i);\n"
+                "    if (gMode == 1u) { float4 wx = CR(f.x), wy = CR(f.y); d = 0;\n"
+                "      [unroll] for (int y = 0; y < 4; ++y) { float3 r = 0;\n"
+                "        [unroll] for (int x = 0; x < 4; ++x) r += wx[x] * D(i + int2(x-1, y-1));\n"
+                "        d += wy[y] * r; } }\n"
+                "    else { d = lerp(lerp(D(i), D(i + int2(1,0)), f.x),\n"
+                "                    lerp(D(i + int2(0,1)), D(i + int2(1,1)), f.x), f.y); } }\n"
+                "  float4 o = gOrig.Load(int3(id.xy, 0));\n"
+                "  float3 c = saturate(o.rgb + d);\n"
+                "  if (gFovR.z > gFovR.x && id.x >= gFovR.x && id.x < gFovR.z && id.y >= gFovR.y && id.y < gFovR.w) {\n"
+                "    uint ei = 0xFFFFFFu;\n"
+                "    if (gFovR.x > 0u) ei = min(ei, id.x - gFovR.x);\n"
+                "    if (gFovR.z < gFull.x) ei = min(ei, gFovR.z - 1u - id.x);\n"
+                "    if (gFovR.y > 0u) ei = min(ei, id.y - gFovR.y);\n"
+                "    if (gFovR.w < gFull.y) ei = min(ei, gFovR.w - 1u - id.y);\n"
+                "    float e = (float)ei;\n"
+                "    float w = saturate((e + 1.0f) / max(gFeather, 1.0f)); w = w * w * (3.0f - 2.0f * w);\n"
+                "    c = lerp(c, gFov.Load(int3(id.xy, 0)).rgb, w); }\n"
+                "  oOut[id.xy] = float4(c, o.a);\n"
+                "}\n";
+            ID3DBlob *rcs = nullptr, *rerr = nullptr;
+            hr = p_compile(kResidualHLSL, strlen(kResidualHLSL), "residual", nullptr, nullptr,
+                           "main", "cs_5_1", 0, 0, &rcs, &rerr);
+            if (FAILED(hr) || rcs == nullptr)
+            {
+                snprintf(line, sizeof line, "[MGPU][RS1] residual shader failed to compile: 0x%08X %s - "
+                         "residual reconstruction unavailable, DLSS SR is used.",
+                         (unsigned)hr, (rerr != nullptr) ? (const char *)rerr->GetBufferPointer() : "");
+                mgpu::diag::warn(line);
+            }
+            else
+            {
+                D3D12_DESCRIPTOR_RANGE rr[2] = {};
+                rr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+                rr[0].NumDescriptors = 4; rr[0].BaseShaderRegister = 0;   // FV1: + t3 the centre
+                rr[0].OffsetInDescriptorsFromTableStart = 0;
+                rr[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+                rr[1].NumDescriptors = 1; rr[1].BaseShaderRegister = 0;
+                rr[1].OffsetInDescriptorsFromTableStart = 4;
+                D3D12_ROOT_PARAMETER rrp[2] = {};
+                rrp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                rrp[0].DescriptorTable.NumDescriptorRanges = 2;
+                rrp[0].DescriptorTable.pDescriptorRanges = rr;
+                rrp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                rrp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+                rrp[1].Constants.ShaderRegister = 0;
+                rrp[1].Constants.Num32BitValues = 10;   // FV1: + centre rect, feather
+                rrp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                D3D12_ROOT_SIGNATURE_DESC rsd2{};
+                rsd2.NumParameters = 2; rsd2.pParameters = rrp;
+                ID3DBlob *sig2 = nullptr;
+                if (SUCCEEDED(D3D12SerializeRootSignature(&rsd2, D3D_ROOT_SIGNATURE_VERSION_1, &sig2, &rerr)) &&
+                    SUCCEEDED(ndev->CreateRootSignature(0, sig2->GetBufferPointer(), sig2->GetBufferSize(),
+                                                        IID_PPV_ARGS(&s.rs_rs))))
+                {
+                    D3D12_COMPUTE_PIPELINE_STATE_DESC rpd{};
+                    rpd.pRootSignature = s.rs_rs;
+                    rpd.CS.pShaderBytecode = rcs->GetBufferPointer();
+                    rpd.CS.BytecodeLength  = rcs->GetBufferSize();
+                    if (FAILED(ndev->CreateComputePipelineState(&rpd, IID_PPV_ARGS(&s.rs_pso))))
+                        s.rs_pso = nullptr;
+                }
+                if (sig2 != nullptr) sig2->Release();
+                rcs->Release();
+                mgpu::diag::info(s.rs_pso != nullptr ? "[MGPU][RS1] residual reconstruction pass built."
+                                                     : "[MGPU][RS1] residual pass could not be built - DLSS SR is used.");
+            }
+            if (rerr != nullptr) rerr->Release();
+        }
+
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = 8;                       // 4 per parity
+        hd.NumDescriptors = 30;                      // 15 per parity: 4 reduce + 5 rebuild + 5 FV4 rebuild + 1 spare
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = ndev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.ds_heap));
         if (FAILED(hr)) return false;
@@ -13914,7 +14567,7 @@ namespace
                                      ID3D12Resource *src_color, ID3D12Resource *src_depth)
     {
         D3D12_CPU_DESCRIPTOR_HANDLE h = s.ds_heap->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += (SIZE_T)(ii * 4u) * s.ds_inc;
+        h.ptr += (SIZE_T)(ii * 15u) * s.ds_inc;   // RS1/FV4: 15 per parity
 
         D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
         sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -13956,11 +14609,15 @@ namespace
         s.sr_ready  = false;
         if (s.ds_pso  != nullptr) { s.ds_pso->Release();  s.ds_pso  = nullptr; }
         if (s.ds_rs   != nullptr) { s.ds_rs->Release();   s.ds_rs   = nullptr; }
+        if (s.rs_pso  != nullptr) { s.rs_pso->Release();  s.rs_pso  = nullptr; }   // RS1
+        if (s.rs_rs   != nullptr) { s.rs_rs->Release();   s.rs_rs   = nullptr; }
         if (s.ds_heap != nullptr) { s.ds_heap->Release(); s.ds_heap = nullptr; }
         for (unsigned i = 0; i < 2u; ++i)
             if (s.sr_color[i] != nullptr) { s.sr_color[i]->Release(); s.sr_color[i] = nullptr; }
         if (s.sr_depth  != nullptr) { s.sr_depth->Release();  s.sr_depth  = nullptr; }
         if (s.sr_nrout  != nullptr) { s.sr_nrout->Release();  s.sr_nrout  = nullptr; }
+        if (s.fov_out   != nullptr) { s.fov_out->Release();   s.fov_out   = nullptr; }   // FV1
+        s.fov_first = true;
         if (s.sr_expose != nullptr) { s.sr_expose->Release(); s.sr_expose = nullptr; }
     }
 
@@ -14393,6 +15050,7 @@ namespace
                 if (mods.snippet == nullptr) mods.snippet = LoadLibraryW(L"nvngx_dlss.dll");
             }
         }
+        dv_record(1, mods.snippet, nullptr);   // DV1
         if (mods.core == nullptr || mods.snippet == nullptr)
         {
             mgpu::diag::error("[MGPU][C2-SR] _nvngx.dll or nvngx_dlss.dll not reachable. "
@@ -14504,6 +15162,13 @@ namespace
             hr = make_tex(ndev, s.sr_w, s.sr_h, cfmt,
                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.sr_nrout);
+        // FV1: full-size target for the centre rectangle's NR output. Made
+        // always (one picture's worth of memory) so foveation can be switched
+        // on live; a failure only leaves foveation unavailable.
+        if (SUCCEEDED(hr) &&
+            FAILED(make_tex(ndev, s.width, s.height, cfmt, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.fov_out)))
+            s.fov_out = nullptr;
         if (SUCCEEDED(hr))
             hr = make_tex(ndev, 1, 1, DXGI_FORMAT_R32_FLOAT,
                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
@@ -14702,6 +15367,7 @@ namespace
     bool stream_nr_create(stream_state &s, ID3D12Device *ndev)
     {
         char line[900];
+        if (drv_blocked("neural stage")) return false;   // DRV1
 
         ngx_modules mods;
         mods.core = ngx_find_core(nullptr);   // R240
@@ -14715,17 +15381,21 @@ namespace
             mods.snippet = nr_load_private_snippet(arm_where, sizeof arm_where);
             if (mods.snippet != nullptr)
             {
-                char sl[MAX_PATH * 2 + 160];
+                char sl[MAX_PATH * 2 + 220];
+                char nv[32] = "unknown";
+                (void)mgpu::slprobe::file_version(mods.snippet, nv, sizeof nv);   // NM1
+                dv_record(0, mods.snippet, "mgpu");
                 snprintf(sl, sizeof sl,
-                         "[MGPU][P4.1] using the PRIVATE NR snippet at %s - this module instance "
+                         "[MGPU][P4.1] NR DLL version %s. Using the PRIVATE NR snippet at %s - this module instance "
                          "is ours alone, so the Init below is the FIRST one it has seen and NGX "
-                         "binds to the adapter we pass.", arm_where);
+                         "binds to the adapter we pass.", nv, arm_where);
                 mgpu::diag::info(sl);
             }
             else
             {
                 mods.snippet = GetModuleHandleW(L"nvngx_dlssnr.dll");
                 if (mods.snippet == nullptr) mods.snippet = LoadLibraryW(L"nvngx_dlssnr.dll");
+                dv_record(0, mods.snippet, "game folder");
                 if (mods.snippet != nullptr)
                     mgpu::diag::warn(
                         "[MGPU][P4.1] NO PRIVATE NR SNIPPET - falling back to the copy beside the "
@@ -14843,6 +15513,18 @@ namespace
         (void)p_pop(s.nr_params);
         s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
         s.nr_params->Set("DLSSNR.Height", (unsigned int)s.height);
+        // NM1: which network the NR DLL builds. 310.9.16 carries two
+        // (DLSSNR.Hint.Render.Preset, read at CreateFeature): preset 1 = A,
+        // the original model; preset 2 = B, the smaller FP8 model and the
+        // DLL's default. 0 leaves the key unset (the DLL's own choice). A
+        // DLL without the asked-for preset falls back to its default.
+        {
+            const int nm = ini_read_sr_int("NRModel", 0, 0, 2);
+            if (nm > 0) s.nr_params->Set("DLSSNR.Hint.Render.Preset", (unsigned int)nm);
+            snprintf(line, sizeof line, "[MGPU][NM1] NR model: %s (NRModel=%d)",
+                     nm == 1 ? "A, original" : nm == 2 ? "B, fast" : "the DLL's default", nm);
+            mgpu::diag::info(line);
+        }
 
         // NATIVE FORMAT, no conversion. P3.1 established DLSS-NR consumes the
         // game's R10G10B10A2 buffer as rendered, so the stream hands it over
@@ -15302,6 +15984,58 @@ namespace
 // resize is no longer only a window-shape operation: a format mismatch has to
 // be corrected in Window=crop too, where no geometry changes at all - which is
 // why `mode == 0` no longer returns early on its own.
+// SC3. Move the composition from the game's window to the bridge window, made a
+// cover over the game's monitor: WS_POPUP, top-most, layered + transparent (the
+// mouse goes through to whatever is under it), never activated and kept out of
+// Alt+Tab. It is shown only while the visual is rooted. False leaves everything
+// as it was - the visual stays on the game's window and the scaler stays off.
+static bool sc_make_cover(HWND hwnd, int x, int y, UINT w, UINT h)
+{
+    if (g_sc_cover != nullptr) return true;
+    if (hwnd == nullptr || g_dcomp_device == nullptr || g_dcomp_target == nullptr) return false;
+    IDCompositionDevice *dcomp = (IDCompositionDevice *)g_dcomp_device;
+
+    SetWindowLongPtrW(hwnd, GWL_STYLE, (LONG_PTR)WS_POPUP);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (LONG_PTR)(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW |
+                                                    WS_EX_LAYERED | WS_EX_TRANSPARENT));
+    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+    SetWindowPos(hwnd, HWND_TOPMOST, x, y, (int)w, (int)h, SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_HIDEWINDOW);
+
+    IDCompositionTarget *t2 = nullptr;
+    HRESULT hr = dcomp->CreateTargetForHwnd(hwnd, TRUE, &t2);
+    if (FAILED(hr) || t2 == nullptr)
+    {
+        char e[300];
+        snprintf(e, sizeof e, "[MGPU][SC3] could not compose onto the cover window (CreateTargetForHwnd hr=0x%08X). "
+                 "The picture stays on the game's window and the scaler stays off for this run.", (unsigned)hr);
+        mgpu::diag::error(e);
+        return false;
+    }
+    IDCompositionTarget *old = (IDCompositionTarget *)g_dcomp_target;
+    old->SetRoot(nullptr);
+    if (g_dcomp_rooted) t2->SetRoot((IDCompositionVisual *)g_dcomp_visual);
+    dcomp->Commit();
+    dcomp->WaitForCommitCompletion();
+    old->Release();
+    g_dcomp_target = t2;
+    g_sc_cover = hwnd;
+    g_sc_cover_shown.store(false);
+    sc_log_refresh(hwnd, "picture on its own window");
+    (void)mgpu::cursormap::install(g_game_hwnd);   // MC1: the pointer on the picture
+    // SC9b: load and initialise the magnifier now, on this (bridge) thread,
+    // so the first console zoom is as quick as the later ones (the first one
+    // took ~0.45 s on the rig, showing the small window meanwhile).
+    if (sc_console_cfg()) (void)sc_mag_api();
+    sc_cover_sync(false);
+
+    char m[400];
+    snprintf(m, sizeof m, "[MGPU][SC3] composition mode: the picture now goes to a click-through cover over the "
+             "game's monitor (%ux%u at %d,%d) so the scaler can fill it. The game keeps the foreground and input.",
+             w, h, x, y);
+    mgpu::diag::info(m);
+    return true;
+}
+
 bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 0=crop 1=match 2=fit
 {
     if (src_w == 0 || src_h == 0) return false;
@@ -15367,7 +16101,11 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
     int  mon_x = 0, mon_y = 0;
     bool mon_ok = false;
     {
-        HMONITOR mh = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        // SC3: composing onto the game's window, the panel that matters is
+        // the GAME's - the bridge window is hidden wherever it was created.
+        const bool sc_comp = g_dcomp_device != nullptr && g_game_hwnd != nullptr
+                             && mgpu::scaler::mode() != 0 && mode == 2;
+        HMONITOR mh = MonitorFromWindow(sc_comp ? g_game_hwnd : hwnd, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi{}; mi.cbSize = sizeof mi;
         if (mh != nullptr && GetMonitorInfoW(mh, &mi) != FALSE)
         {
@@ -15398,7 +16136,25 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
         win_w = cur_w; win_h = cur_h;
         buf_w = cur_w; buf_h = cur_h;
     }
-    else if (mode == 2) { win_w = mon_w; win_h = mon_h; }
+    else if (mode == 2)
+    {
+        win_w = mon_w; win_h = mon_h;
+        // SC1: a game below the monitor's resolution, with the scaler on -
+        // the buffers follow the MONITOR and the mod enlarges each frame
+        // itself (FSR 1 / NIS) instead of DXGI's bilinear stretch.
+        bool sc_ok = mgpu::scaler::mode() != 0 && mon_ok && src_w < mon_w && src_h < mon_h;
+        if (sc_ok && g_dcomp_device != nullptr)
+            sc_ok = sc_make_cover(hwnd, mon_x, mon_y, mon_w, mon_h);
+        if (sc_ok)
+        {
+            buf_w = mon_w; buf_h = mon_h;
+            g_sc_active.store(true, std::memory_order_relaxed);
+            snprintf(l, sizeof l, "[MGPU][SC1] game at %ux%u, monitor %ux%u: the present window is sized to the "
+                     "monitor and the mod enlarges each frame (Scaler=%d).", src_w, src_h, mon_w, mon_h,
+                     mgpu::scaler::mode());
+            mgpu::diag::info(l);
+        }
+    }
     else
     {
         win_w = (src_w < mon_w) ? src_w : mon_w;
@@ -17143,6 +17899,179 @@ void ui_set_status_hud(bool on)
     (void)ui_ini_write("StatusHud", on ? 1 : 0);
 }
 
+// DV1: "NR 310.9.16.0 local | SR - | FG 310.9.16.0 system"; "-" = not loaded yet.
+void ui_dll_versions(char *out, unsigned n)
+{
+    if (out == nullptr || n == 0) return;
+    std::lock_guard<std::mutex> lk(g_dv_mx);
+    snprintf(out, n, "NR %s | SR %s | FG %s | FSR %s",
+             g_dv[0][0] ? g_dv[0] : "-", g_dv[1][0] ? g_dv[1] : "-", g_dv[2][0] ? g_dv[2] : "-",
+             g_dv[3][0] ? g_dv[3] : "-");
+}
+
+// SC1: scaler filter and sharpness (live once the window is monitor-sized).
+int  ui_scaler()               { return mgpu::scaler::mode(); }
+void ui_set_scaler(int m)      { mgpu::scaler::set_mode(m); (void)ui_ini_write("Scaler", mgpu::scaler::mode()); }
+int  ui_scaler_sharp()         { return mgpu::scaler::sharpness(); }
+void ui_set_scaler_sharp(int p){ mgpu::scaler::set_sharpness(p); (void)ui_ini_write("ScalerSharpness", mgpu::scaler::sharpness()); }
+bool ui_scaler_active()        { return g_sc_active.load(); }
+// PP1 (PanelOverPicture support, as upstream 0.4.0 has them, plus the scaled case)
+bool dcomp_visual_rooted()      { return g_dcomp_rooted; }
+void *dcomp_game_hwnd()         { return (void *)g_game_hwnd; }
+void sc_set_panel_live(bool up) { g_sc_panel.store(up); g_sc_sync_req.store(true); if (!up) g_pm_btn.store(0);
+                                  mgpu::hotkeys::panel_mouse(up); }   // PP3
+bool sc_panel_live()            { return g_sc_panel.load(); }
+void sc_cover_mouse(int x, int y, unsigned btn, int wheel)
+{
+    g_pm_x.store(x); g_pm_y.store(y); g_pm_btn.store(btn);
+    if (wheel != 0) g_pm_wheel.fetch_add(wheel);
+}
+bool sc_cover_mouse_get(float *u, float *v, unsigned *btn, int *wheel)
+{
+    if (g_sc_cover == nullptr || !g_sc_cover_shown.load() || !g_sc_panel.load()) return false;
+    const int x = g_pm_x.load(), y = g_pm_y.load();
+    RECT rc{};
+    if (x < 0 || y < 0 || !GetClientRect(g_sc_cover, &rc) || rc.right <= 0 || rc.bottom <= 0) return false;
+    if (u) *u = (float)x / (float)rc.right;
+    if (v) *v = (float)y / (float)rc.bottom;
+    if (btn) *btn = g_pm_btn.load();
+    if (wheel) *wheel = g_pm_wheel.exchange(0);
+    return true;
+}
+bool sc_cover_live_rect(RECT *r)
+{
+    if (r == nullptr || g_sc_cover == nullptr || !g_sc_cover_shown.load()) return false;
+    return GetWindowRect(g_sc_cover, r) != FALSE;
+}
+// DRV1: a one-line reason neural rendering is off because of the driver, or empty.
+void ui_driver_notice(char *out, unsigned n)
+{
+    if (out == nullptr || n == 0) return;
+    out[0] = 0;
+    // GPU1: the card count first - without a second card nothing else matters.
+    {
+        unsigned nvc = 0;
+        const int t = mgpu::adapter::topology_block(&nvc);
+        if (t == 1)
+        {
+            snprintf(out, n, "The mod is off: it needs a second NVIDIA RTX card and found %u NVIDIA card%s in total "
+                     "(integrated graphics do not count).", nvc, nvc == 1 ? "" : "s");
+            return;
+        }
+        if (t == 2) { snprintf(out, n, "The mod is off: it could not tell which card runs the game - see [MGPU][T2] in the log."); return; }
+        if (t == 3) { snprintf(out, n, "The mod is off: several possible second cards and no safe way to pick one - see [MGPU][T2] in the log."); return; }
+    }
+    const unsigned v = mgpu::adapter::nv_driver_version();
+    if (v != 0 && v < kNrDriverFloor) g_drv_block.store(1);
+    const int b = g_drv_block.load();
+    if (b == 1)
+        snprintf(out, n, "Neural rendering is off: NVIDIA driver %u.%02u is too old - DLSS 5 needs %u.%02u or newer.",
+                 v / 100u, v % 100u, kNrDriverFloor / 100u, kNrDriverFloor % 100u);
+    else if (b == 2)
+    {
+        if (g_drv_min_major.load() > 0)
+            snprintf(out, n, "Neural rendering is off: NVIDIA says driver %u.%02u needs updating (minimum %d.%d).",
+                     v / 100u, v % 100u, g_drv_min_major.load(), g_drv_min_minor.load());
+        else
+            snprintf(out, n, "Neural rendering is off: NVIDIA says driver %u.%02u needs updating.", v / 100u, v % 100u);
+    }
+}
+unsigned ui_driver_version() { return mgpu::adapter::nv_driver_version(); }
+void sc_unzoom_now()           { g_sc_console.store(false); if (g_sc_mag_on) sc_magnify(false); }   // SC9
+
+// PF1: detailed log on/off, live, saved as DetailedLog.
+bool ui_detailed_log()            { return mgpu::diag::detailed(); }
+void ui_set_detailed_log(bool on) { mgpu::diag::set_detailed(on); (void)ui_ini_write("DetailedLog", on ? 1 : 0); }
+bool ui_perf_log()                { return g_pf_on.load(); }
+void ui_set_perf_log(bool on)     { g_pf_on.store(on); (void)ui_ini_write("PerfLog", on ? 1 : 0); }
+
+// RS1 / UC1: live settings, saved to mgpu.ini.
+int  ui_rs_recon()            { return g_rs_recon.load(); }
+void ui_set_rs_recon(int v)   { g_rs_recon.store(v ? 1 : 0); (void)ui_ini_write("SRRecon", v ? 1 : 0); }
+int  ui_rs_down()             { return g_rs_down.load(); }
+void ui_set_rs_down(int v)    { if (v < 0 || v > 2) v = 0; g_rs_down.store(v); (void)ui_ini_write("SRDownFilter", v); }
+int  ui_rs_up()               { return g_rs_up.load(); }
+void ui_set_rs_up(int v)      { if (v < 0 || v > 2) v = 0; g_rs_up.store(v); (void)ui_ini_write("SRUpFilter", v); }
+// FV1: foveation, live.
+int  ui_fov_mode()            { return g_fov_on.load(); }
+void ui_set_fov_mode(int m)   { if (m < 0 || m > 3) m = 0; g_fov_on.store(m); (void)ui_ini_write("FovNR", m); }
+int  ui_fov_band()            { return g_fov_band.load(); }
+void ui_set_fov_band(int v)   { if (v < 30) v = 30; if (v > 90) v = 90; g_fov_band.store(v); (void)ui_ini_write("FovBand", v); }
+int  ui_fov_bpos()            { return g_fov_bpos.load(); }
+void ui_set_fov_bpos(int v)   { if (v < 0) v = 0; if (v > 100) v = 100; g_fov_bpos.store(v); (void)ui_ini_write("FovBandPos", v); }
+bool ui_fov_fullw()           { return g_fov_fullw.load() != 0; }
+void ui_set_fov_fullw(bool on){ g_fov_fullw.store(on ? 1 : 0); (void)ui_ini_write("FovFullWidth", on ? 1 : 0); }
+int  ui_fov_pct()             { return g_fov_pct.load(); }
+void ui_set_fov_pct(int v)    { if (v < 30) v = 30; if (v > 90) v = 90; g_fov_pct.store(v); (void)ui_ini_write("FovSize", v); }
+int  ui_fov_feather()         { return g_fov_feather.load(); }
+void ui_set_fov_feather(int v){ if (v < 0) v = 0; if (v > 50) v = 50; g_fov_feather.store(v); (void)ui_ini_write("FovFeather", v); }
+int  ui_nr_uic()              { return g_nr_uic.load(); }
+void ui_set_nr_uic(int v)     { if (v < 0 || v > 2) v = 0; g_nr_uic.store(v); (void)ui_ini_write("NRUICorrection", v); }
+
+// FL1: FG Lite and which frame generation DLL loads (next launch).
+int  ui_fg_lite()            { return ini_read_sr_int("FGLite", 0, 0, 1); }
+void ui_set_fg_lite(int on)  { (void)ui_ini_write("FGLite", on ? 1 : 0); }
+int  ui_fg_source()          { return ini_read_sr_int("FGSource", 0, 0, 1); }
+void ui_set_fg_source(int v) { (void)ui_ini_write("FGSource", v ? 1 : 0); }
+
+// NM1: NR model preset, applied when NR is created (next launch).
+int  ui_nr_model()      { return ini_read_sr_int("NRModel", 0, 0, 2); }
+void ui_set_nr_model(int m)
+{
+    if (m < 0) m = 0;
+    if (m > 2) m = 2;
+    (void)ui_ini_write("NRModel", m);
+}
+
+// CK1: clock and stopwatch.
+static std::atomic<int> g_clock_show{-1};
+static std::atomic<bool> g_sw_show{false};
+static std::atomic<unsigned long long> g_sw_t0{0};
+bool ui_clock()
+{
+    int v = g_clock_show.load(std::memory_order_relaxed);
+    if (v < 0)
+    {
+        v = ini_read_sr_int("Clock", 0, 0, 1);
+        g_clock_show.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+void ui_set_clock(bool on)
+{
+    g_clock_show.store(on ? 1 : 0, std::memory_order_relaxed);
+    (void)ui_ini_write("Clock", on ? 1 : 0);
+    mgpu::diag::info(on ? "[MGPU][CK1] clock shown" : "[MGPU][CK1] clock hidden");
+}
+bool ui_stopwatch() { return g_sw_show.load(std::memory_order_relaxed); }
+void ui_set_stopwatch(bool on)
+{
+    if (on) g_sw_t0.store(GetTickCount64(), std::memory_order_relaxed);   // from 0 every time
+    g_sw_show.store(on, std::memory_order_relaxed);
+    mgpu::diag::info(on ? "[MGPU][CK1] stopwatch started from 0" : "[MGPU][CK1] stopwatch hidden");
+}
+// Present path: the box's lines (0..2).
+static int clock_lines(char (*out)[24])
+{
+    int n = 0;
+    if (ui_clock())
+    {
+        SYSTEMTIME t{};
+        GetLocalTime(&t);
+        int h = t.wHour % 12;
+        if (h == 0) h = 12;
+        snprintf(out[n++], 24, "%d:%02d %s", h, t.wMinute, t.wHour < 12 ? "AM" : "PM");
+    }
+    if (ui_stopwatch())
+    {
+        const unsigned long long s = (GetTickCount64() - g_sw_t0.load(std::memory_order_relaxed)) / 1000ull;
+        const unsigned hh = (unsigned)(s / 3600ull), mm = (unsigned)((s / 60ull) % 60ull), ss = (unsigned)(s % 60ull);
+        if (hh > 0) snprintf(out[n++], 24, "%u:%02u:%02u", hh, mm, ss);
+        else        snprintf(out[n++], 24, "%u:%02u", mm, ss);
+    }
+    return n;
+}
+
 // Present path only (under g_present_mx, so the statics need no lock).
 int hud_status_lines(char (*out)[48], int max)
 {
@@ -18587,6 +19516,7 @@ void stream_note_real_vectors()
 
 void stream_request()
 {
+    if (drv_blocked("start")) return;   // DRV1
     // V43. Refuse every arm during a recovery launch - AutoArm, the hotkey,
     // and the panel's START NOW all funnel through here, so one gate covers
     // all three and worker.cpp needs no change. Said out loud rather than
@@ -18817,6 +19747,20 @@ void stream_request()
             s.sf_path.store(ini_read_sr_int("SFPath", -2, 0, 1),
                             std::memory_order_relaxed);
             s.sr_scale_pct = (unsigned)ini_read_sr_int("SRScale", 0, 0, 99);
+            g_rs_recon.store(ini_read_sr_int("SRRecon", 1, 0, 1));          // RS1
+            g_rs_down.store(ini_read_sr_int("SRDownFilter", 0, 0, 2));
+            g_rs_up.store(ini_read_sr_int("SRUpFilter", 0, 0, 2));
+            g_fov_on.store(ini_read_sr_int("FovNR", 0, 0, 3));          // FV1/FV2, 3 = FV4 centre 2nd pass
+            g_fov_band.store(ini_read_sr_int("FovBand", 50, 30, 90));
+            g_fov_bpos.store(ini_read_sr_int("FovBandPos", 50, 0, 100));   // FV3
+            g_fov_fullw.store(ini_read_sr_int("FovFullWidth", 0, 0, 1));
+            g_fov_pct.store(ini_read_sr_int("FovSize", 60, 30, 90));
+            g_fov_feather.store(ini_read_sr_int("FovFeather", 15, 0, 50));
+            g_nr_uic.store(ini_read_sr_int("NRUICorrection", 0, 0, 2));     // UC1
+            mgpu::diag::set_detailed(ini_read_sr_int("DetailedLog", 0, 0, 1) != 0);   // PF1
+            g_pf_on.store(ini_read_sr_int("PerfLog", 0, 0, 1) != 0);
+            mgpu::scaler::set_mode(ini_read_sr_int("Scaler", 0, 0, 3));                 // SC1
+            mgpu::scaler::set_sharpness(ini_read_sr_int("ScalerSharpness", 50, 0, 100));
 
             if (s.sr_on != 0u && s.passes != 1u)
             {
@@ -21981,7 +22925,10 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         // excluded from every other statistic - they describe
                         // the measurement, not the run.
                         if (i == 2)
+                        {
                             s.hud_nr_gpu_ms = ms;
+                            perf_nr_ms(ms);   // PF1
+                        }
                         if (i == 2 && !cc_busy)
                         { s.auto_win_sum += ms; ++s.auto_win_n; }
                         if (!cc_busy)
@@ -23013,6 +23960,15 @@ static DWORD ll_wait_and_latch(stream_state &s, std::unique_lock<std::mutex> &lk
 
 void stream_poll()
 {
+    // SC5: re-check focus and menus for the scaled-picture cover (~10x a second).
+    if (g_sc_cover != nullptr)
+    {
+        static ULONGLONG last = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (g_sc_sync_req.exchange(false) || now - last >= 100) { last = now; sc_cover_sync(false); }
+        static ULONGLONG last_hz = 0;
+        if (now - last_hz >= 5000) { last_hz = now; sc_log_refresh(g_sc_cover, nullptr); }
+    }
     stream_state &s = str();
     // DEFECT E, found on the rig 2026-09-05 by running Passes=2 and watching the
     // GAME slow down from ~60 to ~49.8 fps.
@@ -24472,15 +25428,86 @@ void stream_poll()
                     s.nl->SetPipelineState(s.ds_pso);
                     D3D12_GPU_DESCRIPTOR_HANDLE gh =
                         s.ds_heap->GetGPUDescriptorHandleForHeapStart();
-                    gh.ptr += (UINT64)(ii * 4u) * s.ds_inc;
+                    gh.ptr += (UINT64)(ii * 15u) * s.ds_inc;   // RS1/FV4: 15 per parity
                     s.nl->SetComputeRootDescriptorTable(0, gh);
-                    const UINT cnst[4] = { s.width, s.height, s.sr_w, s.sr_h };
-                    s.nl->SetComputeRoot32BitConstants(1, 4, cnst, 0);
+                    const UINT cnst[5] = { s.width, s.height, s.sr_w, s.sr_h,
+                                           (UINT)g_rs_down.load(std::memory_order_relaxed) };
+                    s.nl->SetComputeRoot32BitConstants(1, 5, cnst, 0);
                     s.nl->Dispatch((s.sr_w + 7u) / 8u, (s.sr_h + 7u) / 8u, 1u);
 
                     barrier(s.nl, s.sr_color[ii], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 }
+
+                // ---- FV1/FV2: the full-resolution rectangle, planned before
+                // the base pass so FV2 can crop it ----
+                //
+                // FV1: a centred box. FV2: a full-width band along the bottom.
+                // With FV2 the base (reduced) evaluate only needs the strip
+                // ABOVE the band plus the soft edge, so its subrect is cut to
+                // that and the part of the picture the band covers is not
+                // evaluated twice.
+                const int fv_mode = g_fov_on.load(std::memory_order_relaxed);
+                const bool fv_plan = fv_mode != 0 && s.sr_ready && s.rs_pso != nullptr &&
+                                     g_rs_recon.load(std::memory_order_relaxed) == 1 &&
+                                     s.passes == 1u && s.fov_out != nullptr && s.nr_handle[1] != nullptr;
+                UINT pcx = 0, pcy = 0, pcw = 0, pch = 0, base_h = 0;
+                // FV3: what the eye looks at closely is set by the field of
+                // view, not by the monitor's width - an ultrawide's extra width
+                // is periphery. So the full-resolution area is never wider
+                // than 16:9 of the picture's height: identical to before on a
+                // 16:9 (or narrower) picture, centred with reduced sides on
+                // 21:9 / 32:9.
+                const UINT w169 = (UINT)(((unsigned long long)s.height * 16ull) / 9ull) & ~7u;
+                if (fv_plan)
+                {
+                    if (fv_mode == 2)
+                    {
+                        const unsigned bp = (unsigned)g_fov_band.load(std::memory_order_relaxed);
+                        pcw = s.width;
+                        if (g_fov_fullw.load(std::memory_order_relaxed) == 0 && w169 >= 64u && w169 < pcw) pcw = w169;
+                        pch = (UINT)(((unsigned long long)s.height * bp) / 100ull) & ~7u;
+                        if (pch < 64u) pch = 64u;
+                        if (pch > s.height) pch = s.height;
+                        pcx = ((s.width - pcw) / 2u) & ~1u;
+                        const unsigned pos = (unsigned)g_fov_bpos.load(std::memory_order_relaxed);
+                        pcy = (UINT)(((unsigned long long)(s.height - pch) * pos) / 100ull) & ~1u;
+                    }
+                    else
+                    {
+                        const unsigned pct = (unsigned)g_fov_pct.load(std::memory_order_relaxed);
+                        pcw = (UINT)(((unsigned long long)s.width  * pct) / 100ull) & ~7u;
+                        pch = (UINT)(((unsigned long long)s.height * pct) / 100ull) & ~7u;
+                        if (pcw < 64u) pcw = 64u;
+                        if (pch < 64u) pch = 64u;
+                        if (pcw > s.width) pcw = s.width;
+                        if (pch > s.height) pch = s.height;
+                        if ((unsigned long long)pcw * 9ull > (unsigned long long)pch * 16ull)   // FV3: never wider than 16:9
+                            pcw = (UINT)(((unsigned long long)pch * 16ull / 9ull) & ~7ull);
+                        pcx = ((s.width - pcw) / 2u) & ~1u; pcy = ((s.height - pch) / 2u) & ~1u;
+                    }
+                    // The base pass can skip the band only when the band takes
+                    // the whole width and reaches the bottom (FV2's case): then
+                    // everything below its top edge is the band's.
+                    if (fv_mode == 2 && pcx == 0u && pcw == s.width && pcy + pch >= s.height - 1u)
+                    {
+                        // Base strip: down to the band's top + the soft edge +
+                        // 16 px of margin for the upsample taps, in R pixels.
+                        const float fth = (float)pch * 0.5f *
+                                          (float)g_fov_feather.load(std::memory_order_relaxed) / 100.0f;
+                        const unsigned long long need = (unsigned long long)pcy + (unsigned long long)fth + 16ull;
+                        UINT bh = (UINT)((need * s.sr_h + s.height - 1ull) / s.height);
+                        bh = (bh + 7u) & ~7u;
+                        if (bh < 64u) bh = 64u;
+                        if (bh < s.sr_h) base_h = bh;
+                    }
+                }
+                if (base_h != 0u)
+                {
+                    eh = base_h;
+                    if (s.fov_base_h != base_h) { s.fov_base_h = base_h; s.fov_base_reset = true; }
+                }
+                else if (s.fov_base_h != 0u) { s.fov_base_h = 0u; s.fov_base_reset = true; }
 
                 bool final_pass_ok = false;
                 for (unsigned pi = 0; pi < s.passes; ++pi)
@@ -24528,6 +25555,10 @@ void stream_poll()
                     if (nr16_on) mgpu::nr16::encode(s.nl, ii, src, &nr_color, &nr_output);
                     s.nr_params->Set("DLSSNR.Color", nr_color);
                     s.nr_params->Set("DLSSNR.Output", nr_output);
+                    {   // UC1: NR's own UI correction. 0 = leave it to the DLL.
+                        const int uic = g_nr_uic.load(std::memory_order_relaxed);
+                        if (uic > 0) s.nr_params->Set("DLSSNR.UICorrection", uic == 2 ? 1 : 0);
+                    }
                     s.nr_params->Set("DLSSNR.ColorSubrectBaseX", 0u);
                     s.nr_params->Set("DLSSNR.ColorSubrectBaseY", 0u);
                     // R102: ew/eh, not s.width/s.height. They ARE s.width and
@@ -24631,6 +25662,15 @@ void stream_poll()
                         s.nr_params->Set("DLSSNR.Depth", (ID3D12Resource *)nullptr);
                         if (pi == 0) ++s.depth_skipped;
                     }
+                    // FV2: the base evaluate covers only the top strip of R; motion
+                    // and depth are cut to the same share of their own heights.
+                    if (base_h != 0u && s.sr_h != 0u)
+                    {
+                        auto cut = [&](UINT full) { return (unsigned int)(((unsigned long long)full * base_h + s.sr_h - 1ull) / s.sr_h); };
+                        if (s.mvec_mode == 3) s.nr_params->Set("DLSSNR.MVecSubrectHeight", cut(s.mvec_h));
+                        else if (s.mvec_mode != 0) s.nr_params->Set("DLSSNR.MVecSubrectHeight", cut(s.height));
+                        if (s.depth_mode == 1) s.nr_params->Set("DLSSNR.DepthSubrectHeight", cut(s.depth_h));
+                    }
                     // P6.2: per pass, not one hardcoded value for all of them.
                     s.nr_params->Set("DLSSNR.Intensity", s.intensity[pi]);
                     // P7.9. Only when explicitly enabled - see stream_state.
@@ -24672,6 +25712,7 @@ void stream_poll()
                     if (s.pass_reset == 2) rst = 1u;
                     else if (s.pass_reset == 1 && pi > 0) rst = 1u;
                     if (pi == 0u && mgpu::nr16::take_reset()) rst = 1u;   // R208: history from the other format is not reused
+                    if (pi == 0u && s.fov_base_reset) { rst = 1u; s.fov_base_reset = false; }   // FV2: base extent changed
                     s.nr_params->Set("DLSSNR.Reset", rst);
 
                     const NVSDK_NGX_Result er =
@@ -24731,7 +25772,179 @@ void stream_poll()
                 // Section 11's disclaimer still applies and is not cancelled by
                 // doing it here: SR is upscaling a TONE-MAPPED image, which
                 // costs it headroom above white. It is a trade, not a free win.
-                if (s.sr_ready && final_pass_ok)
+                // RS1: residual reconstruction instead of DLSS SR when chosen.
+                const bool rs_on = s.sr_ready && final_pass_ok && s.rs_pso != nullptr &&
+                                   g_rs_recon.load(std::memory_order_relaxed) == 1;
+                // ---- FV1/FV2/FV4: foveation - a rectangle again, at full resolution ----
+                //
+                // The reduced pass above covers the whole picture. The second
+                // NR handle (full size, idle with one pass) evaluates a
+                // rectangle into fov_out and the rebuild blends it in with a
+                // soft edge. FV1/FV2 feed it the ORIGINAL frame (a sharper
+                // centre). FV4 feeds it the rebuilt 1x picture instead, so the
+                // rectangle gets a SECOND pass over the first - the two-pass
+                // look in the centre over a one-pass backdrop. Every key
+                // touched here is set again by the base pass next frame.
+                UINT fx0 = 0, fy0 = 0, fx1 = 0, fy1 = 0;
+                const bool fov_on  = rs_on && fv_plan && fv_mode != 3;   // evaluated now
+                const bool fov2_on = rs_on && fv_plan && fv_mode == 3 && s.tex_pong != nullptr;   // inside the rebuild
+                auto run_centre = [&](ID3D12Resource *csrc, float inten)
+                {
+                    const UINT cw = pcw, chh = pch, cx = pcx, cy = pcy;
+                    unsigned rst = s.fov_first ? 1u : 0u;
+                    if (s.fov_rect[0] != cx || s.fov_rect[1] != cy ||
+                        s.fov_rect[2] != cx + cw || s.fov_rect[3] != cy + chh ||
+                        s.fov_src_mode != fv_mode) { rst = 1u; s.fov_said = false; }
+                    s.fov_rect[0] = cx; s.fov_rect[1] = cy; s.fov_rect[2] = cx + cw; s.fov_rect[3] = cy + chh;
+                    s.fov_src_mode = fv_mode;
+
+                    s.nr_params->Set("DLSSNR.Color", csrc);
+                    s.nr_params->Set("DLSSNR.Output", s.fov_out);
+                    s.nr_params->Set("DLSSNR.ColorSubrectBaseX", (unsigned int)cx);
+                    s.nr_params->Set("DLSSNR.ColorSubrectBaseY", (unsigned int)cy);
+                    s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)cw);
+                    s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)chh);
+                    s.nr_params->Set("DLSSNR.OutputSubrectBaseX", (unsigned int)cx);
+                    s.nr_params->Set("DLSSNR.OutputSubrectBaseY", (unsigned int)cy);
+                    s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)cw);
+                    s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)chh);
+                    // Motion and depth: the same window, in each buffer's own pixels.
+                    auto sub = [&](const char *kb, UINT rw, UINT rh)
+                    {
+                        char k[64];
+                        const unsigned long long W = s.width ? s.width : 1u, H = s.height ? s.height : 1u;
+                        snprintf(k, sizeof k, "DLSSNR.%sSubrectBaseX", kb);
+                        s.nr_params->Set(k, (unsigned int)((unsigned long long)cx * rw / W));
+                        snprintf(k, sizeof k, "DLSSNR.%sSubrectBaseY", kb);
+                        s.nr_params->Set(k, (unsigned int)((unsigned long long)cy * rh / H));
+                        snprintf(k, sizeof k, "DLSSNR.%sSubrectWidth", kb);
+                        s.nr_params->Set(k, (unsigned int)((unsigned long long)cw * rw / W));
+                        snprintf(k, sizeof k, "DLSSNR.%sSubrectHeight", kb);
+                        s.nr_params->Set(k, (unsigned int)((unsigned long long)chh * rh / H));
+                    };
+                    if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr && s.mvec_bytes2 != 0 && fr_mvec)
+                        sub("MVec", s.mvec_w, s.mvec_h);         // scale/jitter: already set by the base pass
+                    else if (s.mvec_mode != 0 && s.mvec_mode != 3 && s.tex_mvec != nullptr)
+                        sub("MVec", s.width, s.height);
+                    if (s.depth_mode == 1 && s.tex_depth[ii] != nullptr && fr_depth)
+                        sub("Depth", s.depth_w, s.depth_h);
+                    s.nr_params->Set("DLSSNR.Intensity", inten);
+                    s.nr_params->Set("DLSSNR.Reset", rst);
+                    const NVSDK_NGX_Result fer = s.nr_eval(s.nl, s.nr_handle[1], s.nr_params, nullptr);
+                    if (fer == NVSDK_NGX_Result_Success)
+                    {
+                        s.fov_first = false;
+                        fx0 = cx; fy0 = cy; fx1 = cx + cw; fy1 = cy + chh;
+                        barrier(s.nl, s.fov_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    }
+                    else
+                        s.fov_first = true;
+                    if (!s.fov_said || fer != NVSDK_NGX_Result_Success)
+                    {
+                        if (!s.fov_said || s.nr_fails < 3) {
+                            char fl[300];
+                            snprintf(fl, sizeof fl, "[MGPU][FV%d] foveation (mode %d): %s %ux%u at %u,%u full resolution "
+                                     "over %ux%u (%u%%, base rows %u), feather %d%%, intensity %.2f: 0x%08X.", fv_mode == 3 ? 4 : fv_mode, fv_mode,
+                                     fv_mode == 2 ? "band" : fv_mode == 3 ? "centre, 2nd pass over the 1x picture" : "centre",
+                                     cw, chh, cx, cy, s.sr_w, s.sr_h,
+                                     s.width ? (unsigned)(100ull * s.sr_w / s.width) : 0u,
+                                     base_h ? base_h : s.sr_h, g_fov_feather.load(), (double)inten, (unsigned)fer);
+                            mgpu::diag::info(fl);
+                        }
+                        if (fer != NVSDK_NGX_Result_Success) ++s.nr_fails;
+                        s.fov_said = true;
+                    }
+                };
+                if (fov_on) run_centre(s.tex_in[ii], s.intensity[0]);
+                else if (!fov2_on) s.fov_first = true;
+                if (rs_on)
+                {
+                    barrier(s.nl, s.sr_nrout, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    ID3D12DescriptorHeap *rheaps[1] = { s.ds_heap };
+                    // One rebuild dispatch. `blk` picks its own 5 descriptors
+                    // (FV4 records two dispatches in one list, and a descriptor
+                    // may not be rewritten between them).
+                    auto rs_dispatch = [&](UINT blk, ID3D12Resource *uav_dst, bool blend)
+                    {
+                        const bool fb = blend && (fx1 > fx0);
+                        D3D12_CPU_DESCRIPTOR_HANDLE ch = s.ds_heap->GetCPUDescriptorHandleForHeapStart();
+                        ch.ptr += (SIZE_T)(ii * 15u + blk) * s.ds_inc;
+                        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+                        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                        sv.Texture2D.MipLevels = 1;
+                        ID3D12Resource *srvs[4] = { s.tex_in[ii], s.sr_color[ii], s.sr_nrout,
+                                                    fb ? s.fov_out : s.tex_in[ii] };   // FV1: t3
+                        for (unsigned k = 0; k < 4u; ++k)
+                        {
+                            sv.Format = srvs[k]->GetDesc().Format;
+                            s.ndev_b->CreateShaderResourceView(srvs[k], &sv, ch);
+                            ch.ptr += s.ds_inc;
+                        }
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+                        uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                        uv.Format = uav_dst->GetDesc().Format;
+                        s.ndev_b->CreateUnorderedAccessView(uav_dst, nullptr, &uv, ch);
+
+                        s.nl->SetDescriptorHeaps(1, rheaps);
+                        s.nl->SetComputeRootSignature(s.rs_rs);
+                        s.nl->SetPipelineState(s.rs_pso);
+                        D3D12_GPU_DESCRIPTOR_HANDLE rgh = s.ds_heap->GetGPUDescriptorHandleForHeapStart();
+                        rgh.ptr += (UINT64)(ii * 15u + blk) * s.ds_inc;
+                        s.nl->SetComputeRootDescriptorTable(0, rgh);
+                        // FV1: feather in pixels, from % of the rectangle's smaller half-size.
+                        float feather = 1.0f;
+                        UINT r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+                        if (fb)
+                        {
+                            const UINT mn = ((fx1 - fx0) < (fy1 - fy0)) ? (fx1 - fx0) : (fy1 - fy0);
+                            feather = (float)mn * 0.5f * (float)g_fov_feather.load(std::memory_order_relaxed) / 100.0f;
+                            r0 = fx0; r1 = fy0; r2 = fx1; r3 = fy1;
+                        }
+                        UINT fbits; memcpy(&fbits, &feather, 4);
+                        const UINT rc[10] = { s.width, s.height, s.sr_w, s.sr_h, r0, r1, r2, r3,
+                                              (UINT)g_rs_up.load(std::memory_order_relaxed), fbits };
+                        s.nl->SetComputeRoot32BitConstants(1, 10, rc, 0);
+                        s.nl->Dispatch((s.width + 7u) / 8u, (s.height + 7u) / 8u, 1u);
+                        D3D12_RESOURCE_BARRIER ub{};
+                        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                        ub.UAV.pResource = uav_dst;
+                        s.nl->ResourceBarrier(1, &ub);
+                    };
+                    if (fov2_on)
+                    {
+                        // FV4: 1) rebuild the 1x picture into tex_pong (free
+                        // with one pass), 2) the second pass on its centre,
+                        // 3) rebuild again into tex_out with the centre blended.
+                        rs_dispatch(4u, s.tex_pong, false);
+                        barrier(s.nl, s.tex_pong, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        run_centre(s.tex_pong, s.intensity[1]);
+                        rs_dispatch(9u, s.tex_out, true);
+                        barrier(s.nl, s.tex_pong, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    }
+                    else
+                        rs_dispatch(4u, s.tex_out, true);
+                    barrier(s.nl, s.sr_nrout, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    if (fx1 > fx0)   // FV1: back to the state every UAV ends a list in
+                        barrier(s.nl, s.fov_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    if (!s.rs_said)
+                    {
+                        s.rs_said = true;
+                        char rl2[240];
+                        snprintf(rl2, sizeof rl2, "[MGPU][RS1] residual reconstruction: NR at %ux%u (%u%% of %ux%u), "
+                                 "downsample %d, upsample %d.", s.sr_w, s.sr_h,
+                                 s.width ? (unsigned)(100ull * s.sr_w / s.width) : 0u, s.width, s.height,
+                                 g_rs_down.load(), g_rs_up.load());
+                        mgpu::diag::info(rl2);
+                    }
+                }
+                else if (s.sr_ready && final_pass_ok)
                 {
                     barrier(s.nl, s.sr_nrout, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

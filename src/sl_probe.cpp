@@ -132,6 +132,11 @@ namespace
     }
 } // namespace
 
+bool file_version(void *hmodule, char *out, unsigned long long out_n)
+{
+    return module_version((HMODULE)hmodule, out, (size_t)out_n);
+}
+
 kind classify(void *iface, void **out_native)
 {
     if (out_native != nullptr) *out_native = nullptr;

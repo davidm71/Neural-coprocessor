@@ -60,6 +60,12 @@
 
 namespace mgpu::adapter
 {
+static std::atomic<unsigned> g_nv_drv{0};   // DRV1
+// GPU1: why no second card was selected (0 = selected / not decided yet),
+// and how many NVIDIA hardware adapters there were. For the console notice.
+static std::atomic<int> g_topo_block{0};
+static std::atomic<unsigned> g_topo_nv{0};
+
 namespace
 {
     struct entry
@@ -268,6 +274,13 @@ namespace
                 }
             }
 
+            // DRV1: 32.0.16.1742 -> 617.42 (last digit of the third field, then the fourth).
+            if (e.vendor_id == 0x10DE && (dv[2] != 0 || dv[3] != 0))
+            {
+                const unsigned nv = (dv[2] % 10u) * 10000u + dv[3];
+                if (nv > g_nv_drv.load()) g_nv_drv.store(nv);
+            }
+
             char line[512];
             snprintf(line, sizeof line,
                      "[MGPU][T2] adapter[%u] driver=%u.%u.%u.%u luid=0x%08X-0x%08X flags=0x%X vendor=0x%04X "
@@ -349,6 +362,8 @@ namespace
             // `software` has had since rule 3, with its own line because
             // calling an AMD iGPU "software" in a log would be a lie.
             const bool neural_capable = (S.table[i].vendor_id == 0x10DE);
+            if (i == 0) g_topo_nv.store(0);
+            if (neural_capable && !is_software) g_topo_nv.fetch_add(1);
 
             policy.push_back({S.table[i].luid, is_software, S.table[i].outputs,
                               neural_capable});
@@ -396,11 +411,13 @@ namespace
                      (unsigned)game.HighPart, (unsigned)game.LowPart, hw.size());
             mgpu::diag::error(line);
             rule = "none (refused: game luid not in adapter table)";
+            g_topo_block.store(2);
         }
         else if (choice.valid)
         {
             sel = choice.selected_index;
             degenerate = choice.degenerate;
+            g_topo_block.store(0);
             rule = degenerate
                        ? "exclusion + software filter + output-count tiebreak "
                          "(R189-A: display-count aware)"
@@ -417,6 +434,7 @@ namespace
                      (unsigned)game.HighPart, (unsigned)game.LowPart, hw.size());
             mgpu::diag::error(line);
             rule = "none (refused: no non-game hardware adapter)";
+            g_topo_block.store(1);
         }
         else
         {
@@ -447,6 +465,7 @@ namespace
                          cand.size(), n_with_outputs);
                 mgpu::diag::error(line);
                 rule = "none (refused: ambiguous)";
+                g_topo_block.store(3);
             }
         }
 
@@ -770,6 +789,9 @@ void get_selection(selection_result &out)
 // P7.10. Both are atomics read without the lock deliberately: they are called
 // from the bridge thread's present loop and from an overlay callback, neither
 // of which may block behind a selection that is mid-decision.
+unsigned nv_driver_version() { return g_nv_drv.load(); }
+int topology_block(unsigned *nv_count) { if (nv_count) *nv_count = g_topo_nv.load(); return g_topo_block.load(); }
+
 unsigned long long ms_since_last_swapchain_event()
 {
     ensure_init();

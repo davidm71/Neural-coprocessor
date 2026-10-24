@@ -470,5 +470,29 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
                   is_status[i] ? sf : fg, W, H);
 }
 
+void draw_clock_box(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                    unsigned width, unsigned height, const char (*lines)[24], int n)
+{
+    if (cl == nullptr || width == 0 || height == 0 || lines == nullptr || n <= 0) return;
+    if (n > 2) n = 2;
+    const int W = (int)width, H = (int)height;
+    int px = W / 640;           // a little larger than the FPS HUD's
+    if (px < 3) px = 3;
+    const int gap = px, pad = px * 4, line_h = 7 * px;
+    int tw = 0;
+    for (int i = 0; i < n; ++i) { const int w = text_width(lines[i], px, gap); if (w > tw) tw = w; }
+    const int box_w = tw + pad * 2;
+    const int box_h = line_h * n + pad * (n + 1);
+    const int x = W - box_w - pad;
+    const int y = pad;
+    const float bg[4] = { 0.018f, 0.020f, 0.023f, 1.0f };
+    const float fg[4] = { 0.88f, 0.90f, 0.94f, 1.0f };
+    if (!translucent_hud_box(cl, rtv, x, y, box_w, box_h, W, H))
+        fill(cl, rtv, bg, x, y, box_w, box_h, W, H);
+    for (int i = 0; i < n; ++i)   // right-aligned, so the digits don't jump sideways
+        draw_text(cl, rtv, lines[i], x + pad + (tw - text_width(lines[i], px, gap)),
+                  y + pad * (i + 1) + line_h * i, px, gap, fg, W, H);
+}
+
 } // namespace screen
 } // namespace mgpu
