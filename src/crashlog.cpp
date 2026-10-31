@@ -3,6 +3,9 @@
 // ---------------------------------------------------------------------------
 #include "crashlog.hpp"
 #include "diag.hpp"
+#include "mgpu_ini_parser.hpp"
+
+#include <tlhelp32.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -17,6 +20,7 @@ namespace
 {
 
 PVOID g_veh = nullptr;
+HMODULE g_self = nullptr;
 
 // CR2: Windows' own list of recently UNLOADED modules (ntdll), so an address
 // in a DLL that is no longer there can still be named.
@@ -34,6 +38,163 @@ typedef VOID (NTAPI *pfn_unload_trace)(PULONG *ElementSize, PULONG *ElementCount
 pfn_unload_trace g_unload_trace = nullptr;
 
 bool read_mem(const void *p, void *out, size_t n);
+
+// ---- DW1: every DLL load and unload, as it happens ----
+//
+// Several crashes jumped into code that was no longer there, from DXGI's
+// present (dxgi.dll+0x17f9d6): something that hooks Present went away while
+// its hook stayed. Windows' own unload list named it once (sl.common.dll) and
+// not at all the other times. The loader tells us about every load and
+// unload; the callback runs under the loader lock, so it only copies into a
+// ring here, and the bridge thread writes the lines to the log later.
+struct dw_ev
+{
+    volatile LONG seq;           // index + 1 once the entry is complete
+    unsigned char kind;          // 1 load, 2 unload
+    ULONGLONG     ms;            // GetTickCount64
+    const char   *base;
+    SIZE_T        size;
+    char          name[56];
+};
+const unsigned DW_N = 256;
+dw_ev g_dw[DW_N] = {};
+volatile LONG g_dw_w = 0;        // next index to write
+LONG g_dw_r = 0;                 // next index to log (bridge thread)
+ULONGLONG g_dw_t0 = 0;           // when watching started
+PVOID g_dw_cookie = nullptr;
+
+// ---- PN1: keep Streamline's code in memory ----
+//
+// The game starts NVIDIA Streamline (sl.*.dll) and shuts it down again about
+// 9 s later; the crashes were calls from DXGI's present into sl.common.dll
+// after it had been unloaded (a hook it left behind). Pinning a module makes
+// FreeLibrary leave it mapped until the game exits, so a late call lands in
+// real code instead of freed memory. Streamline's own shutdown still runs; only
+// the unmapping is skipped. Cost: a few MB. mgpu.ini PinStreamline=0 turns it off.
+//
+// The loader-notification callback runs under the loader lock, where calling
+// back into the loader is not allowed, so it only signals; this small thread
+// does the pinning a moment later (Streamline unloads seconds after loading).
+HANDLE g_pin_ev = nullptr;
+volatile LONG g_pin_stop = 0;
+
+bool is_sl(const char *n)
+{
+    if (_strnicmp(n, "sl.", 3) != 0) return false;
+    const size_t k = strlen(n);
+    return k > 7 && _stricmp(n + k - 4, ".dll") == 0;
+}
+bool is_ngx_family(const char *n) { return is_sl(n) || _strnicmp(n, "nvngx", 5) == 0; }
+
+bool pin_enabled()
+{
+    if (g_self == nullptr) return true;
+    wchar_t p[MAX_PATH * 2];
+    const DWORD n = GetModuleFileNameW(g_self, p, MAX_PATH * 2);
+    wchar_t *slash = (n != 0 && n < MAX_PATH * 2) ? wcsrchr(p, L'\\') : nullptr;
+    if (slash == nullptr || (size_t)(slash - p) + 12u >= (size_t)(MAX_PATH * 2)) return true;
+    wcscpy(slash + 1, L"mgpu.ini");
+    FILE *fp = _wfopen(p, L"rb");
+    if (fp == nullptr) return true;
+    static char buf[256 * 1024];
+    const size_t got = fread(buf, 1, sizeof buf - 1, fp);
+    fclose(fp);
+    buf[got] = '\0';
+    const char *v = mgpu::config::find(buf, got, "PinStreamline");
+    return v == nullptr || *v != '0';
+}
+
+DWORD WINAPI pin_thread(LPVOID)
+{
+    const bool on = pin_enabled();
+    if (!on)
+    {
+        mgpu::diag::info("[MGPU][PN1] PinStreamline=0: Streamline's DLLs are left to unload normally.");
+        return 0;
+    }
+    mgpu::diag::info("[MGPU][PN1] Streamline's DLLs (sl.*) are kept in memory once loaded, so a hook it "
+                     "leaves behind cannot jump into freed code (PinStreamline=0 turns this off).");
+    char pinned[24][56] = {};
+    unsigned n_pinned = 0;
+    for (;;)
+    {
+        // every module now loaded; pin each sl.* not yet pinned
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+        if (snap != INVALID_HANDLE_VALUE)
+        {
+            MODULEENTRY32W me;
+            me.dwSize = sizeof me;
+            for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me))
+            {
+                char nm[56];
+                size_t k = 0;
+                for (; k + 1 < sizeof nm && me.szModule[k] != 0; ++k)
+                    nm[k] = (me.szModule[k] >= 0x20 && me.szModule[k] < 0x7F) ? (char)me.szModule[k] : '?';
+                nm[k] = '\0';
+                if (!is_sl(nm)) continue;
+                bool seen = false;
+                for (unsigned i = 0; i < n_pinned && !seen; ++i) seen = _stricmp(pinned[i], nm) == 0;
+                if (seen || n_pinned >= 24) continue;
+                HMODULE h = nullptr;
+                const BOOL ok2 = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, me.szModule, &h);
+                snprintf(pinned[n_pinned++], 56, "%s", nm);
+                char l[160];
+                snprintf(l, sizeof l, ok2 ? "[MGPU][PN1] kept in memory: %s" : "[MGPU][PN1] could not keep %s (error %lu)",
+                         nm, ok2 ? 0ul : (unsigned long)GetLastError());
+                mgpu::diag::info(l);
+            }
+            CloseHandle(snap);
+        }
+        WaitForSingleObject(g_pin_ev, INFINITE);
+        if (g_pin_stop != 0) return 0;
+    }
+}
+
+struct dw_ustr { USHORT Length; USHORT MaximumLength; PWSTR Buffer; };
+struct dw_data { ULONG Flags; const dw_ustr *FullDllName; const dw_ustr *BaseDllName; PVOID DllBase; ULONG SizeOfImage; };
+typedef VOID (CALLBACK *pfn_dw_cb)(ULONG reason, const dw_data *data, PVOID ctx);
+typedef LONG (NTAPI *pfn_dw_reg)(ULONG flags, pfn_dw_cb cb, PVOID ctx, PVOID *cookie);
+
+VOID CALLBACK dw_cb(ULONG reason, const dw_data *d, PVOID)
+{
+    if (d == nullptr || (reason != 1 && reason != 2)) return;
+    const LONG idx = InterlockedIncrement(&g_dw_w) - 1;
+    dw_ev &e = g_dw[(unsigned)idx % DW_N];
+    e.seq = 0;
+    e.kind = (unsigned char)reason;
+    e.ms = GetTickCount64();
+    e.base = (const char *)d->DllBase;
+    e.size = d->SizeOfImage;
+    size_t k = 0;
+    if (d->BaseDllName != nullptr && d->BaseDllName->Buffer != nullptr)
+        for (; k + 1 < sizeof e.name && k < d->BaseDllName->Length / 2u; ++k)
+        {
+            const WCHAR c = d->BaseDllName->Buffer[k];
+            e.name[k] = (c >= 0x20 && c < 0x7F) ? (char)c : '?';
+        }
+    e.name[k] = '\0';
+    InterlockedExchange(&e.seq, idx + 1);
+    if (reason == 1 && g_pin_ev != nullptr && is_sl(e.name)) SetEvent(g_pin_ev);   // PN1
+}
+
+// The newest unload (our own record) that covered `addr`.
+bool dw_unloaded(const void *addr, char *name, size_t n, unsigned long long &off)
+{
+    const LONG w = g_dw_w;
+    for (LONG i = w - 1; i >= 0 && i >= w - (LONG)DW_N; --i)
+    {
+        const dw_ev &e = g_dw[(unsigned)i % DW_N];
+        if (e.seq != i + 1 || e.kind != 2 || e.base == nullptr) continue;
+        if ((const char *)addr >= e.base && (const char *)addr < e.base + e.size)
+        {
+            snprintf(name, n, "%s", e.name);
+            off = (unsigned long long)((const char *)addr - e.base);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool unloaded_name(const void *addr, char *name, size_t n, unsigned long long &off)
 {
     if (g_unload_trace == nullptr) return false;
@@ -126,8 +287,8 @@ void where(const void *addr, char *out, size_t n)
     else
     {
         char nm[40]; unsigned long long off = 0;
-        if (unloaded_name(addr, nm, sizeof nm, off))
-            snprintf(out, n, "UNLOADED %s+0x%llx", nm, off);   // CR2: a DLL that has been unloaded
+        if (unloaded_name(addr, nm, sizeof nm, off) || dw_unloaded(addr, nm, sizeof nm, off))
+            snprintf(out, n, "UNLOADED %s+0x%llx", nm, off);   // CR2/DW1: a DLL that has been unloaded
         else
             snprintf(out, n, "?+0x%llx", (unsigned long long)(uintptr_t)addr);
     }
@@ -262,6 +423,23 @@ LONG CALLBACK on_exception(PEXCEPTION_POINTERS ep)
             len += snprintf(line + len, sizeof line - (size_t)len, " %s", w);
         }
     }
+    // DW1: the last DLL loads/unloads before this, newest first, with how long ago.
+    if (len < (int)sizeof line - 80)
+    {
+        const LONG w = g_dw_w;
+        const ULONGLONG now = GetTickCount64();
+        len += snprintf(line + len, sizeof line - (size_t)len, " | recent DLL events:");
+        unsigned shown = 0;
+        for (LONG i = w - 1; i >= 0 && i >= w - (LONG)DW_N && shown < 8 && len < (int)sizeof line - 90; --i)
+        {
+            const dw_ev &e = g_dw[(unsigned)i % DW_N];
+            if (e.seq != i + 1) continue;
+            len += snprintf(line + len, sizeof line - (size_t)len, " %c%s(%.1fs ago)",
+                            e.kind == 2 ? '-' : '+', e.name, (double)(now - e.ms) / 1000.0);
+            ++shown;
+        }
+        if (shown == 0) len += snprintf(line + len, sizeof line - (size_t)len, " none recorded");
+    }
     if (len > (int)sizeof line - 3) len = (int)sizeof line - 3;
     line[len++] = '\r'; line[len++] = '\n'; line[len] = '\0';
 
@@ -281,6 +459,7 @@ LONG CALLBACK on_exception(PEXCEPTION_POINTERS ep)
 void install(HMODULE self)
 {
     if (g_veh != nullptr) return;
+    g_self = self;
     const DWORD n = GetModuleFileNameW(self, g_path, MAX_PATH * 2);
     wchar_t *slash = (n != 0 && n < MAX_PATH * 2) ? wcsrchr(g_path, L'\\') : nullptr;
     if (slash != nullptr && (size_t)(slash - g_path) + 20u < (size_t)(MAX_PATH * 2))
@@ -294,6 +473,17 @@ void install(HMODULE self)
 
 void uninstall()
 {
+    // PN1: only at process exit in practice (threads are already gone then);
+    // tell the pin thread to finish if it is still waiting.
+    if (g_pin_ev != nullptr) { InterlockedExchange(&g_pin_stop, 1); SetEvent(g_pin_ev); }
+    if (g_dw_cookie != nullptr)
+    {
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        typedef LONG (NTAPI *pfn_unreg)(PVOID);
+        pfn_unreg un = nt ? (pfn_unreg)(void *)GetProcAddress(nt, "LdrUnregisterDllNotification") : nullptr;
+        if (un != nullptr) un(g_dw_cookie);
+        g_dw_cookie = nullptr;
+    }
     if (g_veh != nullptr) { RemoveVectoredExceptionHandler(g_veh); g_veh = nullptr; }
 }
 
@@ -302,11 +492,56 @@ void announce()
     static bool done = false;
     if (done) return;
     done = true;
+    {   // DW1: watch DLL loads and unloads from here on
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        pfn_dw_reg reg = nt ? (pfn_dw_reg)(void *)GetProcAddress(nt, "LdrRegisterDllNotification") : nullptr;
+        g_dw_t0 = GetTickCount64();
+        // PN1: created here (the thread starts once the loader lock is free).
+        g_pin_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (g_pin_ev != nullptr)
+        {
+            HANDLE th = CreateThread(nullptr, 0, pin_thread, nullptr, 0, nullptr);
+            if (th != nullptr) CloseHandle(th);
+            else { CloseHandle(g_pin_ev); g_pin_ev = nullptr; }
+        }
+        if (reg != nullptr && reg(0, dw_cb, nullptr, &g_dw_cookie) == 0)
+            mgpu::diag::info("[MGPU][DW1] watching DLL loads and unloads - each is logged as [MGPU][DW1] "
+                             "(startup loads are summed up), and a crash lists the last few.");
+    }
     mgpu::diag::info(g_veh != nullptr
                          ? "[MGPU][CR1] crash catcher installed: a fatal error anywhere in the game is named "
                            "(module, offset, call chain) in mgpu\\crash.txt and here, as [MGPU][CR1]. Errors are "
                            "seen first-chance: if the game kept running after one, it was handled and is harmless."
                          : "[MGPU][CR1] crash catcher could not be installed.");
+}
+
+// DW1: bridge thread, a few times a second. Loads in the first 30 s after
+// watching started are only counted (the game's startup); everything after
+// that, and every unload, gets its own line.
+void flush_dll_events()
+{
+    static unsigned startup_loads = 0;
+    static bool startup_said = false;
+    const LONG w = g_dw_w;
+    if (w - g_dw_r > (LONG)DW_N) g_dw_r = w - (LONG)DW_N;   // fell behind: skip the overwritten ones
+    for (; g_dw_r < w; ++g_dw_r)
+    {
+        const dw_ev &e = g_dw[(unsigned)g_dw_r % DW_N];
+        if (e.seq != g_dw_r + 1) break;   // still being written
+        // PN1: Streamline and NGX loads are named even during startup.
+        if (e.kind == 1 && e.ms - g_dw_t0 < 30000ull && !is_ngx_family(e.name)) { ++startup_loads; continue; }
+        if (!startup_said && e.ms - g_dw_t0 >= 30000ull)
+        {
+            startup_said = true;
+            char s0[120];
+            snprintf(s0, sizeof s0, "[MGPU][DW1] %u other DLL(s) loaded during the first 30 s (startup, not listed).", startup_loads);
+            mgpu::diag::info(s0);
+        }
+        char l[200];
+        snprintf(l, sizeof l, "[MGPU][DW1] %s %s at 0x%p (%llu KB) t+%.1fs", e.kind == 2 ? "UNLOADED" : "loaded", e.name,
+                 (const void *)e.base, (unsigned long long)e.size / 1024ull, (double)(e.ms - g_dw_t0) / 1000.0);
+        mgpu::diag::info(l);
+    }
 }
 
 } // namespace crashlog

@@ -76,6 +76,10 @@ add_library(mgpu_bridge SHARED
     src/capture.cpp
     src/replay.cpp
     src/framewarp.cpp
+    # HD1: HDR output (SDR to HDR10 on the neural card).
+    src/hdr.cpp
+    # GT1: the neural card's busy time from GPU timestamps (dynamic resolution).
+    src/gputime.cpp
     src/crashlog.cpp
     src/scaler.cpp
     src/cursormap.cpp

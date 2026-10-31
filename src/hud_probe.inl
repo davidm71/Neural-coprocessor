@@ -59,6 +59,7 @@ std::atomic<unsigned> g_hl_streak{ 0 };
 std::atomic<unsigned long long> g_hl_lock{ 0 };      // the locked HUD-less texture
 std::atomic<unsigned long long> g_hl_fires{ 0 };
 std::atomic<unsigned long long> g_hl_fire_frame{ 0 };
+std::atomic<unsigned long long> g_hl_fire_ms{ 0 };   // HL3: GetTickCount64 of the last copy
 std::atomic<unsigned long long> g_hl_unlocks{ 0 };
 std::atomic<unsigned long long> g_frame_a{ 0 };
 
@@ -365,6 +366,7 @@ void on_barrier_hp(reshade::api::command_list *cl, uint32_t count,
                         g_hl_fires.fetch_add(1, std::memory_order_relaxed);
                         g_hl_fire_frame.store(g_frame_a.load(std::memory_order_relaxed),
                                               std::memory_order_relaxed);
+                        g_hl_fire_ms.store(GetTickCount64(), std::memory_order_relaxed);   // HL3
                     }
                 }
             }
@@ -748,6 +750,17 @@ void request_capture()
 }
 
 int state() { return g_phase.load(std::memory_order_relaxed); }
+
+unsigned scene_gap_ms()
+{
+    if (!g_hl_on.load(std::memory_order_relaxed)) return 0;
+    const unsigned long long t = g_hl_fire_ms.load(std::memory_order_relaxed);
+    if (t == 0) return 0;   // never copied yet: start-up runs as before
+    const unsigned long long now = GetTickCount64();
+    if (now <= t) return 0;
+    const unsigned long long d = now - t;
+    return d > 0xFFFFFFFFull ? 0xFFFFFFFFu : (unsigned)d;
+}
 unsigned last_capture_id() { return g_cap_id.load(std::memory_order_relaxed); }
 unsigned last_capture_images() { return g_cap_images.load(std::memory_order_relaxed); }
 

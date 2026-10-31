@@ -154,7 +154,11 @@ namespace mgpu::gpu1
 
     // Any thread (takes this file's lock). True when the present chain
     // exists.
-    bool has_present_chain();
+    // RV1: fence-based retirement for objects present lists use (Frame Warp, HDR).
+unsigned long long present_chain_gen();
+unsigned long long present_recording_value();   // present thread, while recording
+bool present_value_done(unsigned long long gen, unsigned long long v);
+bool has_present_chain();
 
     // ---- P1.0: the NGX probe ----
     //
@@ -570,6 +574,38 @@ int  ui_fg_lite();     void ui_set_fg_lite(int on);
 int  ui_rs_recon();    void ui_set_rs_recon(int v);
 int  ui_rs_down();     void ui_set_rs_down(int v);
 int  ui_rs_up();       void ui_set_rs_up(int v);
+// TF1: target frame rate (cap + automatic DLSS FG multiplier)
+bool ui_tf_on();      void ui_set_tf_on(bool on);
+int  ui_tf_target();  void ui_set_tf_target(int v);
+bool ui_tf_cap_on();  void ui_set_tf_cap_on(bool on);
+int  ui_tf_cap();     void ui_set_tf_cap(int v);
+float ui_tf_real_fps();
+int  ui_tf_pick();
+bool ui_tf_brake_on(); void ui_set_tf_brake_on(bool on);   // TF4
+// QD1: queue guard - the game waits briefly when the neural stage is 2+ frames behind. Live.
+bool ui_qd_on(); void ui_set_qd_on(bool on);
+// DR1: dynamic neural resolution (Custom scale only). Min live; max sizes the
+// textures, read at the next start.
+bool ui_dr_on();  void ui_set_dr_on(bool on);
+int  ui_dr_min(); void ui_set_dr_min(int v);
+int  ui_dr_max(); void ui_set_dr_max(int v);
+float ui_dr_now();   // current scale %, 0 = not running
+int  ui_dr_alloc();  // % the textures were made at this run
+float ui_dr_busy();   // DR3: neural card busy %, -1 = not measured yet
+const char *ui_dr_status();   // DR3: why it is holding ("" = running normally)
+// SM1: smoothness - 0 off, 1 relaxed, 2 normal, 3 strict; and the last 2 s
+// window's frame spacing (false = no window yet).
+int  ui_sm_sens(); void ui_set_sm_sens(int v);
+bool ui_sm_spacing(float *sd_ms, float *sd_pct, int *hits);
+// AT1: auto-tune (Limiter x multiplier). State: 0 idle, 1 waiting, 2 testing,
+// 3 done (applied), 4 failed, 5 cancelled.
+void ui_at_start(int monitor_hz);
+void ui_at_cancel();
+int  ui_at_state();
+void ui_at_progress(int *cap, int *mult, int *tested, int *target);
+void ui_at_result(int *cap, int *mult, float *out);
+float ui_tf_out_fps(); float ui_tf_expected_fps(); bool ui_tf_short();
+int  ui_tf_ceiling(); int ui_tf_retry_s();
 int  ui_fov_mode();    void ui_set_fov_mode(int m);       // FV1/FV2: 0 off, 1 centre, 2 lower band
 int  ui_fov_band();    void ui_set_fov_band(int v);
 int  ui_fov_bpos();    void ui_set_fov_bpos(int v);       // FV3: 0 top, 50 middle, 100 bottom
@@ -581,6 +617,8 @@ int  ui_nr_uic();      void ui_set_nr_uic(int v);
 // 3 NIS, sharpness 0-100. active = the window was sized to the monitor for it.
 int  ui_scaler();        void ui_set_scaler(int m);
 int  ui_scaler_sharp();  void ui_set_scaler_sharp(int pct);
+int  ui_scaler_mas();        void ui_set_scaler_mas(int on);          // MAS1
+int  ui_scaler_mas_motion(); void ui_set_scaler_mas_motion(int pct);
 bool ui_scaler_active();
 // PP1: PanelOverPicture support (upstream 0.4.0) and the scaled-picture case.
 bool dcomp_visual_rooted();

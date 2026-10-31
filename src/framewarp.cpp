@@ -5,6 +5,7 @@
 #include "gpu1_context.hpp"
 #include "diag.hpp"
 #include "sl_tags.hpp"
+#include "d3dc.hpp"
 
 #include <windows.h>
 #include <d3dcompiler.h>
@@ -135,9 +136,14 @@ void hist_now(long long &x, long long &y)
 // ===========================================================================
 // the hook thread
 // ===========================================================================
-std::thread *g_thread = nullptr;     // a pointer: no joinable static at unload
+std::thread *g_thread = nullptr;     // a pointer: no joinable static at unload (guarded by g_hook_mx)
 std::atomic<DWORD> g_tid{0};
-HHOOK g_hook = nullptr;
+// RV1: the hook handle is shared by the hook thread (sets it, removes it on
+// exit), stop_hook's fallback and emergency_unhook (remove it), and status()
+// (reads it). Atomic, and removal is an exchange, so exactly one caller ever
+// unhooks it.
+std::atomic<HHOOK> g_hook{nullptr};
+void unhook_once() { HHOOK h = g_hook.exchange(nullptr); if (h != nullptr) UnhookWindowsHookEx(h); }
 
 LRESULT CALLBACK ms_proc(int code, WPARAM wp, LPARAM lp)
 {
@@ -170,10 +176,14 @@ void hook_main()
     HMODULE self = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(&ms_proc), &self);
-    // The hook callback runs on this thread: keep it responsive.
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    g_hook = SetWindowsHookExW(WH_MOUSE_LL, ms_proc, self, 0);
-    if (g_hook == nullptr)
+    // The hook callback runs on this thread and every mouse move in Windows
+    // waits for it, so it must not be starved by busy game threads. RV1:
+    // HIGHEST (above normal threads) rather than TIME_CRITICAL - the callback
+    // is a few instructions and one short lock, it does not need to pre-empt
+    // the system.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    g_hook.store(SetWindowsHookExW(WH_MOUSE_LL, ms_proc, self, 0));
+    if (g_hook.load() == nullptr)
     {
         char l[200];
         snprintf(l, sizeof l, "[MGPU][FW1] the mouse hook could not be installed (error %lu) - Frame Warp has "
@@ -185,7 +195,7 @@ void hook_main()
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; }
+    unhook_once();
 }
 
 std::mutex g_hook_mx;   // REV: ensure_hook (present thread, panel) vs stop_hook (panel, teardown)
@@ -216,7 +226,7 @@ void stop_hook()
     else
     {
         // Cannot reach it: never block. Leave it parked (it only waits for messages).
-        if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; }
+        unhook_once();
         if (g_thread->joinable()) g_thread->detach();
         delete g_thread;
         mgpu::diag::warn("[MGPU][FW1] the mouse hook thread could not be signalled - hook removed, thread left parked.");
@@ -271,16 +281,23 @@ gpu_state G;
 
 // Objects replaced by a rebuild (output resized or a new device) may still be
 // in use by present lists in flight, so they are released a few presents later.
-struct retired { IUnknown *o; unsigned left; };
+// RV1: retired with the present fence value of the list being recorded (the
+// newest list that can use them); released once that value has completed on
+// the GPU - not after a count of presents.
+struct retired { IUnknown *o; unsigned long long gen, value; };
 std::vector<retired> g_retired;
 
-void retire(IUnknown *o) { if (o != nullptr) g_retired.push_back({ o, 8u }); }
+void retire(IUnknown *o)
+{
+    if (o != nullptr)
+        g_retired.push_back({ o, mgpu::gpu1::present_chain_gen(), mgpu::gpu1::present_recording_value() });
+}
 void age_retired()
 {
     size_t w = 0;
     for (size_t i = 0; i < g_retired.size(); ++i)
     {
-        if (--g_retired[i].left == 0u) g_retired[i].o->Release();
+        if (mgpu::gpu1::present_value_done(g_retired[i].gen, g_retired[i].value)) g_retired[i].o->Release();
         else g_retired[w++] = g_retired[i];
     }
     g_retired.resize(w);
@@ -329,8 +346,7 @@ bool build(ID3D12Device *dev, unsigned w, unsigned h, DXGI_FORMAT fmt)
         (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) == 0)
         return fail("the card cannot write this format from a shader", E_FAIL);
 
-    HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
-    pfn_compile cmp = dc ? (pfn_compile)(void *)GetProcAddress(dc, "D3DCompile") : nullptr;
+    pfn_compile cmp = (pfn_compile)mgpu::d3dcompile();   // RV1: one module reference per process
     if (cmp == nullptr) return fail("d3dcompiler_47.dll not available", E_FAIL);
     ID3DBlob *cs = nullptr, *err = nullptr;
     HRESULT hr = cmp(kWarpHLSL, strlen(kWarpHLSL), "framewarp", nullptr, nullptr, "main", "cs_5_1", 0, 0, &cs, &err);
@@ -899,7 +915,7 @@ void emergency_unhook()
     // DllMain (live unload): no joins under the loader lock. Removing the hook
     // stops Windows calling ms_proc once this image is gone; the thread stays
     // parked in GetMessage, which no message will ever wake.
-    if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; }
+    unhook_once();
 }
 
 void release_gpu_now()
@@ -915,8 +931,8 @@ void status(char *out, unsigned n)
     if (!enabled()) { snprintf(out, n, "off"); return; }
     if (G.failed) { snprintf(out, n, "cannot run here (see log [FW1])"); return; }
     snprintf(out, n, "%s | last warp %.2f / %.2f deg",
-             (g_thread == nullptr) ? "waiting"
-                                   : (g_hook == nullptr ? "NO MOUSE HOOK (see log)"
+             (g_tid.load() == 0) ? "waiting"   // RV1: no unguarded read of g_thread
+                                   : (g_hook.load() == nullptr ? "NO MOUSE HOOK (see log)"
                                       : (g_camera_live.load() ? "running" : "paused (menu or not turning yet)")),
              g_last_mdeg_x.load() / 1000.0, g_last_mdeg_y.load() / 1000.0);
 }

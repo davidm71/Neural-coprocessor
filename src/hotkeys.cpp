@@ -366,7 +366,7 @@ void kb_main()
     HMODULE self = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(&kb_proc), &self);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);   // RV1: as Frame Warp's hook
     g_kbhook = SetWindowsHookExW(WH_KEYBOARD_LL, kb_proc, self, 0);
     if (g_kbhook == nullptr)
     {

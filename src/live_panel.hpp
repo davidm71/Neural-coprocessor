@@ -57,4 +57,15 @@ namespace mgpu::live_panel
     // The game chain's present, on its own thread. Blocks the game's input for
     // the next frame while the panel is live AND being drawn (R293).
     void block_game_input(reshade::api::effect_runtime *game_runtime);
+
+    // UX1: the panel in its OWN window on the GPU 1 runtime - wide by default,
+    // never narrower than its content needs, and brought to the front when the
+    // overlay opens, instead of a tab behind ReShade's Home tab. `fn` draws the
+    // panel's content (dllmain's overlay callback).
+    void set_drawer(void (*fn)(reshade::api::effect_runtime *));
+    // True while that window is drawing (the content is being drawn inside it).
+    bool drawing_own();
+    // True while the own window has been shown in the last half second - the
+    // docked ReShade tab then shows a one-line pointer instead of a copy.
+    bool own_window_shown();
 }

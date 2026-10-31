@@ -66,7 +66,7 @@
 #define MGPU_VERSION_STR "0.2.5-dev"
 // VR2: the fork's build tag, shared by the R141 log line and the panel footer
 // so the two can never disagree. Bump it with every shipped change.
-#define MGPU_SOURCE_TAG "FV4"
+#define MGPU_SOURCE_TAG "DG3"
 
 
 // ---- P6.4: the overlay panel ----
@@ -120,6 +120,7 @@
 #include "hotkeys.hpp"   // HK1
 #include "capture.hpp"   // SS1 / VR1 / BM1
 #include "framewarp.hpp" // FW1
+#include "hdr.hpp"       // HD1
 #include "crashlog.hpp"  // CR1
 #include "replay.hpp"    // BM2
 #include "cursormap.hpp" // MC2
@@ -948,6 +949,69 @@ static bool draw_custom_scale_slider(const char *id)
         wrote = true;
     }
     ImGui::TextDisabled("Or any value 33-90%%. 85-90%% keeps nearly all of NR's detail.");
+    // DR1: dynamic neural resolution - the scale follows the load.
+    {
+        bool dr = mgpu::gpu1::ui_dr_on();
+        // DR5: it measures NVIDIA frame generation's delivery, so it only works there.
+        const bool dr_usable = mgpu::gpu1::ui_frame_gen() == 4;
+        char idc[48]; snprintf(idc, sizeof idc, "dynamic##dr%s", id);
+        ImGui::BeginDisabled(!dr_usable);
+        if (ImGui::Checkbox(idc, &dr)) mgpu::gpu1::ui_set_dr_on(dr);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Lowers the neural resolution when the neural card can't keep up\n"
+                              "and raises it again when there is room (NVIDIA frame generation).\n"
+                              "The scale above is where it starts.");
+        if (!dr_usable)
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("NVIDIA frame generation only - fixed scale above in use.");
+        }
+        if (dr && dr_usable)
+        {
+            const float now = mgpu::gpu1::ui_dr_now();
+            const float busy = mgpu::gpu1::ui_dr_busy();
+            ImGui::SameLine();
+            if (now > 0.0f && busy >= 0.0f) ImGui::TextDisabled("now %.0f%% | neural card busy %.0f%%", now, busy);
+            else if (now > 0.0f) ImGui::TextDisabled("now %.0f%%", now);
+            // SM1: smoothness - how even the frame spacing must be.
+            {
+                float sdm = 0.0f, sdp = 0.0f; int hk = 0;
+                if (mgpu::gpu1::ui_sm_spacing(&sdm, &sdp, &hk))
+                    ImGui::TextDisabled("frame spacing varies +/-%.1f ms (%.0f%% of the gap), %d hitch%s in 2 s",
+                                        sdm, sdp, hk, hk == 1 ? "" : "es");
+                int sm = mgpu::gpu1::ui_sm_sens();
+                ImGui::TextUnformatted("smoothness");
+                char ids[4][40];
+                static const char *const kSm[4] = { "off", "relaxed", "normal", "strict" };
+                for (int k = 0; k < 4; ++k)
+                {
+                    ImGui::SameLine();
+                    snprintf(ids[k], sizeof ids[k], "%s##sm%d%s", kSm[k], k, id);
+                    if (ImGui::RadioButton(ids[k], &sm, k)) mgpu::gpu1::ui_set_sm_sens(k);
+                }
+                if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                    ImGui::SetTooltip("How even frames must arrive before the scale is kept or raised.\n"
+                                      "Uneven spacing (the 140-200 bounce) lowers NR a step even when the\n"
+                                      "average frame rate looks fine. Normal is set from your smooth vs\n"
+                                      "uneven runs; strict reacts sooner, relaxed later, off ignores it.");
+            }
+            const char *dst = mgpu::gpu1::ui_dr_status();
+            if (dst[0] != '\0')
+            {
+                if (strncmp(dst, "FG/present", 10) == 0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f), "%s", dst);
+                else ImGui::TextDisabled("Holding: %s.", dst);
+            }
+            int lo = mgpu::gpu1::ui_dr_min(), hi = mgpu::gpu1::ui_dr_max();
+            char idl[48]; snprintf(idl, sizeof idl, "lowest##drl%s", id);
+            if (ImGui::SliderInt(idl, &lo, 33, 90, "%d%%")) mgpu::gpu1::ui_set_dr_min(lo > hi ? hi : lo);
+            char idh[48]; snprintf(idh, sizeof idh, "highest##drh%s", id);
+            if (ImGui::SliderInt(idh, &hi, 33, 90, "%d%%")) mgpu::gpu1::ui_set_dr_max(hi < lo ? lo : hi);
+            const int al = mgpu::gpu1::ui_dr_alloc();
+            if (al > 0 && hi > al)
+                ImGui::TextDisabled("Above %d%% after the next start.", al);
+        }
+        ImGui::EndDisabled();
+    }
     return wrote;
 }
 
@@ -965,6 +1029,18 @@ static void draw_scaler_controls()
     int shp = mgpu::gpu1::ui_scaler_sharp();
     ImGui::BeginDisabled(sc < 2);
     if (ImGui::SliderInt("sharpness##sc", &shp, 0, 100, "%d%%")) mgpu::gpu1::ui_set_scaler_sharp(shp);
+    // MAS1: motion-adaptive sharpening (live).
+    bool mas = mgpu::gpu1::ui_scaler_mas() != 0;
+    if (ImGui::Checkbox("less sharpening in motion##mas", &mas)) mgpu::gpu1::ui_set_scaler_mas(mas ? 1 : 0);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Sharpens still areas fully and fast-moving areas less, using the game's\n"
+                          "motion vectors - calmer edges in motion, same detail when still.");
+    if (mas)
+    {
+        int mm = mgpu::gpu1::ui_scaler_mas_motion();
+        if (ImGui::SliderInt("sharpening kept in motion##mas", &mm, 0, 100, "%d%%"))
+            mgpu::gpu1::ui_set_scaler_mas_motion(mm);
+    }
     ImGui::EndDisabled();
     ImGui::TextDisabled(mgpu::gpu1::ui_scaler_active()
                             ? "Enlarging the game to the monitor."
@@ -973,6 +1049,12 @@ static void draw_scaler_controls()
 
 static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 {
+    // UX1: with the panel in its own window, ReShade's docked tab only points there.
+    if (mgpu::live_panel::own_window_shown() && !mgpu::live_panel::drawing_own())
+    {
+        ImGui::TextDisabled("The MGPU panel is open in its own window.");
+        return;
+    }
     // P7.10: THE UNSUPPORTED-API MESSAGE HAS TO LIVE HERE, and it is worth
     // saying why, because the obvious place was the bridge window's title and
     // that place cannot work. On a D3D11 or Vulkan title no D3D12 render device
@@ -1150,7 +1232,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     if (ImGui::Checkbox("neural stage", &neural))
         mgpu::gpu1::ui_set_neural(neural);
     ImGui::SameLine();
-    ImGui::TextDisabled(st.nr_ok ? "(running)" : "(transport only)");
+    ImGui::TextDisabled(!neural ? "(off - the game's own frames are shown)" : st.nr_ok ? "(running)" : "(transport only)");
 
     // ---- FG1: frame generation, its own section so it is easy to find ----
     {
@@ -1161,6 +1243,23 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             mgpu::gpu1::ui_set_frame_gen(fg_on ? mgpu::gpu1::ui_frame_gen_last() : 0);
         ImGui::SameLine();
         ImGui::TextDisabled("(live - also CTRL+ALT+G in game)");
+        // TF3: the Limiter caps the game on its own, with any generator and
+        // any multiplier - or with frame generation off.
+        {
+            bool cap_on = mgpu::gpu1::ui_tf_cap_on();
+            if (ImGui::Checkbox("Limiter##tf", &cap_on)) mgpu::gpu1::ui_set_tf_cap_on(cap_on);
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!cap_on);
+            int cap = mgpu::gpu1::ui_tf_cap();
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
+            if (ImGui::SliderInt("##tfcap", &cap, 20, 240, "%d fps")) mgpu::gpu1::ui_set_tf_cap(cap);
+            ImGui::EndDisabled();
+            if (cap_on)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(turn the game's own cap off)");
+            }
+        }
         ImGui::BeginDisabled(!fg_on);
         // FSR1: which generator.
         int eng = (fgm == 3) ? 1 : (fgm == 4) ? 2 : 0;
@@ -1186,9 +1285,111 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // 2x only, RTX 50 = 4x, 6x with newer drivers. Until NVIDIA FG has
             // started that is unknown, so every choice is offered; anything
             // above the card's limit then runs at the limit (shown below).
+            // TF1: target frame rate - the game cap plus an automatic multiplier.
+            bool tf = mgpu::gpu1::ui_tf_on();
+            if (ImGui::Checkbox("target frame rate (multiplier picked automatically)##tf", &tf))
+                mgpu::gpu1::ui_set_tf_on(tf);
+            if (tf)
+            {
+                // The monitor's refresh, for the "paces evenly" hint.
+                static int s_hz = 0;
+                static unsigned long long s_hz_t = 0;
+                if (GetTickCount64() - s_hz_t > 2000ull)
+                {
+                    s_hz_t = GetTickCount64();
+                    HWND gw = (HWND)mgpu::gpu1::dcomp_game_hwnd();
+                    HMONITOR mon = MonitorFromWindow(gw != nullptr ? gw : GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+                    MONITORINFOEXW mi{}; mi.cbSize = sizeof mi;
+                    DEVMODEW dm{}; dm.dmSize = sizeof dm;
+                    if (GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
+                        s_hz = (int)dm.dmDisplayFrequency;
+                }
+                const float w = ImGui::GetFontSize() * 12.0f;
+                int tgt = mgpu::gpu1::ui_tf_target();
+                ImGui::SetNextItemWidth(w);
+                if (ImGui::SliderInt("target##tf", &tgt, 30, s_hz > 30 ? (s_hz > 480 ? 480 : s_hz) : 480, "%d fps"))
+                    mgpu::gpu1::ui_set_tf_target(tgt);
+                if (!mgpu::gpu1::ui_tf_cap_on())
+                    ImGui::TextDisabled("Limiter off: the multiplier follows the game's own frame rate.");
+                const float rf = mgpu::gpu1::ui_tf_real_fps();
+                const int maxm_tf = mgpu::gpu1::ui_dlssg_max_mult();
+                const int pk = mgpu::gpu1::ui_tf_pick();
+                // TF4: the overload brake.
+                bool brk = mgpu::gpu1::ui_tf_brake_on();
+                if (ImGui::Checkbox("overload brake (step down when the neural card can't keep up)##tf", &brk))
+                    mgpu::gpu1::ui_set_tf_brake_on(brk);
+                if (rf > 0.0f && pk != 0)
+                {
+                    const float shown = mgpu::gpu1::ui_tf_out_fps();
+                    if (shown > 0.0f)
+                        ImGui::TextDisabled("Now: game %.1f fps x %d - shown %.0f fps (expected %.0f).", rf, pk, shown,
+                                            mgpu::gpu1::ui_tf_expected_fps());
+                    else
+                        ImGui::TextDisabled("Now: game %.1f fps x %d = ~%.0f fps.", rf, pk, rf * (float)pk);
+                    const int ceil_m = mgpu::gpu1::ui_tf_ceiling();
+                    if (brk && ceil_m >= 2)
+                        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
+                                           "Neural card at its limit - held at %dx (retry in %d s).", ceil_m,
+                                           mgpu::gpu1::ui_tf_retry_s());
+                    else if (mgpu::gpu1::ui_tf_short())
+                        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
+                                           "The neural card can't keep up at %dx%s.", pk,
+                                           brk ? "" : " (brake off)");
+                    // Out of reach: already at the card's highest multiplier and
+                    // still clearly short of the target.
+                    const int mx = (maxm_tf >= 2) ? maxm_tf : 6;
+                    if (pk >= mx && rf * (float)pk < (float)tgt * 0.95f)
+                        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
+                                           "Target out of reach: %dx is this card's limit.", mx);
+                }
+                else
+                    ImGui::TextDisabled("Picks the multiplier once the game is running.");
+                if (s_hz > 0 && (s_hz % tgt) != 0)
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
+                                       "%d fps does not divide %d Hz evenly - uneven without G-SYNC.", tgt, s_hz);
+            }
+            // AT1: auto-tune - tries Limiter x multiplier pairs and keeps the best.
+            {
+                const int ast = mgpu::gpu1::ui_at_state();
+                if (ast == 1 || ast == 2)
+                {
+                    if (ImGui::Button("Cancel auto-tune##at")) mgpu::gpu1::ui_at_cancel();
+                    ImGui::SameLine();
+                    int c = 0, m = 0, n = 0, t = 0;
+                    mgpu::gpu1::ui_at_progress(&c, &m, &n, &t);
+                    if (ast == 1) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f), "Close this panel and play - tuning starts then.");
+                    else ImGui::TextDisabled("Testing %d fps x %d (test %d, target %d fps).", c, m, n + 1, t);
+                }
+                else
+                {
+                    if (ImGui::Button("Auto-tune##at"))
+                    {
+                        int hz = 0;
+                        HWND gw = (HWND)mgpu::gpu1::dcomp_game_hwnd();
+                        HMONITOR mon = MonitorFromWindow(gw != nullptr ? gw : GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+                        MONITORINFOEXW mi{}; mi.cbSize = sizeof mi;
+                        DEVMODEW dm{}; dm.dmSize = sizeof dm;
+                        if (GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
+                            hz = (int)dm.dmDisplayFrequency;
+                        mgpu::gpu1::ui_at_start(hz);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Tries Limiter x multiplier pairs while you play (about 1-2 minutes)\n"
+                                          "and keeps the highest smooth output with the fewest generated frames.\n"
+                                          "Close the panel after clicking. Progress shows top-right.");
+                    ImGui::SameLine();
+                    int c = 0, m = 0; float o = 0.0f;
+                    mgpu::gpu1::ui_at_result(&c, &m, &o);
+                    if (ast == 3) ImGui::TextDisabled("Best: Limiter %d x %d = %.0f fps (applied).", c, m, o);
+                    else if (ast == 4) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f), "Auto-tune stopped without a result - the log says why ([MGPU][AT1]).");
+                    else if (ast == 5) ImGui::TextDisabled("Cancelled - nothing changed.");
+                    else ImGui::TextDisabled("Finds the best Limiter and multiplier for you.");
+                }
+            }
             int mult = mgpu::gpu1::ui_fg_mult();
             const int maxm = mgpu::gpu1::ui_dlssg_max_mult();
             const int run  = mgpu::gpu1::ui_fg_mult_running();
+            ImGui::BeginDisabled(tf);   // TF1 picks it
             ImGui::TextUnformatted("multiplier");
             static const char *const kMultLabel[5] = { "2x##fgm", "3x##fgm", "4x##fgm", "5x##fgm", "6x##fgm" };
             for (int m = 2; m <= 6; ++m)
@@ -1201,6 +1402,13 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 if (over && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("This card's driver allows up to %dx.", maxm);
             }
+            ImGui::EndDisabled();   // TF1
+            // TF4: with the multiplier picked by hand, the brake does not touch
+            // it - but say when the card can't deliver it.
+            if (!tf && run != 0 && mgpu::gpu1::ui_tf_short())
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
+                                   "%dx gives ~%.0f of %.0f fps - the neural card can't keep up.", run,
+                                   mgpu::gpu1::ui_tf_out_fps(), mgpu::gpu1::ui_tf_expected_fps());
             // MFG7: a change takes a moment to reach the running frame
             // generation; until then the running value lags the choice. Only
             // name a reason once the choice has stood for 2 s.
@@ -1439,6 +1647,31 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         ImGui::SameLine();
         ImGui::TextDisabled(vs ? "(live)" : "(live - expect tearing)");
 
+        // LP1: one frame of present queue (needs a restart: the chain is made with it).
+        {
+            static int lp1 = -1;
+            if (lp1 < 0) lp1 = mgpu::gpu1::ui_ini_read("PresentLatency1", 0) == 1 ? 1 : 0;
+            bool on = lp1 != 0;
+            if (ImGui::Checkbox("low-latency present##lp1", &on) &&
+                mgpu::gpu1::ui_ini_write("PresentLatency1", on ? 1 : 0))
+                lp1 = on ? 1 : 0;
+            ImGui::SameLine();
+            ImGui::TextDisabled("(restart)");
+            if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                ImGui::SetTooltip("At most one finished frame waits in Windows' queue before the screen,\n"
+                                  "instead of up to three: a few ms less delay. Best with G-SYNC.");
+        }
+        // QD1: queue guard (live).
+        {
+            bool qd = mgpu::gpu1::ui_qd_on();
+            if (ImGui::Checkbox("queue guard (game never runs ahead of the neural card)##qd", &qd))
+                mgpu::gpu1::ui_set_qd_on(qd);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("When the neural card falls 2+ frames behind, the game waits briefly\n"
+                                  "(at most 25 ms) instead of making frames that would be skipped.\n"
+                                  "Rarely acts with a Limiter that fits; logged as [MGPU][QD1].");
+        }
+
         // Copy queue.
         ImGui::TextUnformatted("copy queue");
         ImGui::SameLine();
@@ -1544,6 +1777,33 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         bool sw = mgpu::gpu1::ui_stopwatch();
         if (ImGui::Checkbox("stopwatch", &sw)) mgpu::gpu1::ui_set_stopwatch(sw);
         ImGui::TextDisabled("Top-right. CTRL+ALT+C / CTRL+ALT+S (see Hotkeys). Stopwatch starts at 0.");
+    }
+    // HD1: HDR output. Live; every control writes mgpu.ini.
+    {
+        ImGui::SeparatorText("HDR");
+        bool hd = mgpu::hdr::enabled();
+        if (ImGui::Checkbox("HDR output##hd", &hd)) mgpu::hdr::set_enabled(hd);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Turns the game's SDR picture into HDR10 for an HDR monitor.\n"
+                              "Needs Windows HDR on. Screenshots and video stay SDR.");
+        ImGui::BeginDisabled(!hd);
+        int pk = mgpu::hdr::peak();
+        char pkf[48];
+        if (pk == 0) snprintf(pkf, sizeof pkf, "monitor's (%d nits)", mgpu::hdr::peak_in_use());
+        else snprintf(pkf, sizeof pkf, "%%d nits");
+        if (ImGui::SliderInt("peak##hd", &pk, 0, 2000, pkf)) mgpu::hdr::set_peak(pk < 100 ? 0 : pk);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brightest highlight. Far left = what the monitor reports.");
+        int pw = mgpu::hdr::paper_white();
+        if (ImGui::SliderInt("paper white##hd", &pw, 80, 500, "%d nits")) mgpu::hdr::set_paper_white(pw);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brightness of white walls, paper and menus.");
+        int hl = mgpu::hdr::highlights();
+        if (ImGui::SliderInt("highlights##hd", &hl, 0, 100, "%d%%")) mgpu::hdr::set_highlights(hl);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How far bright areas (sky, lights, fire) reach toward the peak.");
+        int sa = mgpu::hdr::saturation();
+        if (ImGui::SliderInt("saturation##hd", &sa, 50, 150, "%d%%")) mgpu::hdr::set_saturation(sa);
+        ImGui::EndDisabled();
+        const char *why = mgpu::hdr::status();
+        if (why[0] != '\0') ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s", why);
     }
 
     // ---- SS1 / VR1 / BM1 / BM2: screenshots, video, benchmark ----
@@ -2038,6 +2298,11 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         // The restart is now stated where the state is, not left to be
         // inferred from two launches.
         ImGui::SeparatorText("Super resolution");
+        // NO2: with the neural stage off these settings do nothing, so they
+        // are greyed out (the monitor scaling below still applies).
+        if (!st.neural)
+            ImGui::TextDisabled("Neural stage is off - these apply when it is on.");
+        ImGui::BeginDisabled(!st.neural);
         if (!st.sr_requested)
         {
             ImGui::TextDisabled("Off. Tick the box in the DLSS Super Resolution section above.");
@@ -2386,9 +2651,11 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         }
 
 
+        ImGui::EndDisabled();   // NO2
         draw_scaler_controls();
 
         ImGui::SeparatorText("Change quality or preset");
+        ImGui::BeginDisabled(!st.neural);   // NO2
         if (!st.sr_on)
         {
             static const char *qn2[] = { "performance", "balanced", "quality" };
@@ -2758,6 +3025,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         // V24: no longer headed "Experimental". The two experimental things
         // in it are gone and the only control left is the one the box above
         // reports on, so the old heading now warns about nothing.
+            ImGui::EndDisabled();   // NO2
         }   // ---- end of the armed view ----
     }
     ImGui::EndChild();   // ---- end BOX 2 ----
@@ -4098,6 +4366,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // same thread the probe's own register_event calls belong on anyway.
 #if defined(MGPU_HAVE_IMGUI)
         reshade::register_overlay("MGPU Bridge", draw_mgpu_overlay);
+        mgpu::live_panel::set_drawer(draw_mgpu_overlay);   // UX1
         reshade::log::message(reshade::log::level::info,
             "[MGPU][P6.4] overlay panel registered - open the ReShade overlay (Home) over the "
             "BRIDGE window to get passes, the neural on/off and the intensity sliders. The "

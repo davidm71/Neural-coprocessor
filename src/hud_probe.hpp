@@ -43,6 +43,12 @@ void set_copy_hook(void (*fn)(void *cmd_list_native, unsigned long long resource
 // Hotkey / panel. Records the next whole frame.
 void request_capture();
 
+// HL3: milliseconds since the HUD-less scene was last copied (HudLess=1).
+// 0 = it is being copied, HudLess is off, or no copy has happened yet. A gap
+// means the game stopped drawing that scene (a level change, the exit to the
+// main menu) and the frames carry menus or a loading screen with the HUD.
+unsigned scene_gap_ms();
+
 // 0 idle, 1 waiting for the frame, 2 recording, 3 waiting for the GPU,
 // 4 writing files. For the panel.
 int state();

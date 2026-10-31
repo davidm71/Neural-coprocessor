@@ -58,10 +58,15 @@ Research code, not a product. Run games with anti-cheat and online games at your
 - NVIDIA mode does 2x to 6x (`FGMultiplier`, also in the panel), as far as the neural card's
   driver allows (RTX 40: 2x; RTX 50: 4x, 6x on newer drivers - the panel greys out the rest). If a generator cannot
   start, or fails three times, the mod's own takes over and the panel says so in red.
+  Games with an older Streamline (RoboCop: Rogue City) do not report how many in-between
+  frames the driver allows; the mod then tries the multiplier you set and drops to 2x if it
+  is refused.
 - **HUD-less mode** (`HudLess=1`, D3D12): frame generation runs on the scene without the
   HUD and the HUD is laid back on top, so text and markers never warp.
   Full-screen menus are recognised (most of the screen differs from the scene) and shown as
-  the game draws them, so they are never see-through.
+  the game draws them, so they are never see-through. When the game stops drawing its scene
+  (loading, exit to the main menu) its frames are also shown as drawn until the scene is back,
+  so the menu does not shake.
 - NVIDIA mode's camera data is estimated: set `FSRFov` to the game's horizontal FOV if
   nearby objects wobble in generated frames.
 - **Cap the game's frame rate for 3x/4x** - see Recommended setup.
@@ -97,6 +102,42 @@ Research code, not a product. Run games with anti-cheat and online games at your
   frame. The game's native detail (e.g. DLAA) is kept and NR costs a fraction of full
   resolution. Defaults: residual, area down, bilinear up; the filters and the older DLSS SR
   rebuild are under Super resolution > Advanced in the panel.
+- **Dynamic neural resolution** (`SRDynamic=1`, the "dynamic" box under the Custom scale
+  slider): the scale follows the load, between `SRDynMin` (default 50%) and `SRDynMax`
+  (default 80%), starting at `SRScale`. The reduced textures are made at the highest value
+  (a new highest takes effect at the next start); when the scale moves nothing is rebuilt - NR
+  works on part of the reduced texture and its history restarts for that one frame.
+  It works with NVIDIA frame generation only (the box is greyed out otherwise); with FSR 3,
+  the mod's own generator or frame generation off, the fixed `SRScale` is used.
+  - **What it steers by:** every clean 2 s, the frames shown against the game frames counted ×
+    the multiplier (primary), and the neural card's **busy time** - the share of each second it
+    spent executing the mod's work, from GPU timestamps on every list, overlapping work counted
+    once (early warning; shown in the panel). Short by more than 4% → 2% down (8% → 4%); still
+    delivering but busy 98%+ for two windows → 2% down before frames are lost; clean and busy
+    under 90% → 2% up, after a wait that doubles each time a try fails (8 s up to 4 min; kept at
+    8 s while busy is under 80%). Missing frames only lower NR while the neural card is at least
+    75% busy; below that the shortfall is in frame generation or presentation, the resolution is
+    kept, and the log says so (a lower Limiter or multiplier is what helps then).
+  - **Smoothness** (`SRDynSmooth`, the "smoothness" choice under it: off / relaxed / normal /
+    strict, default normal): a steady 180 feels smooth and a 140-200 bounce does not, even at a
+    similar average. Each window also measures how evenly frames arrive - the spacing's spread as
+    a share of the gap, and hitches (gaps over twice the average). Uneven spacing lowers NR a
+    step even when the average looks fine, and the scale only goes up when spacing is steady.
+    Normal (spread over 25% of the gap, or 3+ hitches in 2 s) sits between a smooth 40 × 4 run
+    (12-20%, 0-1 hitch) and uneven runs (24-42%, 4-14 hitches); strict (20%, 2) reacts sooner,
+    relaxed (35%, 6) later. The panel shows the current spacing, so the number can be matched
+    to what you see. Spacing only counts while the neural card is at least 75% busy: below that
+    the unevenness comes from the game or the present path, and lowering NR would only cost detail.
+  - **What it ignores:** a window is thrown away (and a fresh 2 s starts) on alt-tab, the panel,
+    a game menu, the picture stepping aside, a game hitch (loading, shader compiling), a
+    presentation stall over 60 ms, frame generation pausing, or a Limiter / multiplier change.
+    It only runs with NVIDIA frame generation.
+  - **When NR is not the problem:** if two reductions in a row do not raise delivery by at least
+    2 points, the limit is frame generation / presenting, not NR. The scale goes back to where it
+    was, reductions stop for 60 s (or until the multiplier or Limiter changes), the log says
+    `FG/PRESENT BOTTLENECK SUSPECTED - NR SCALING INEFFECTIVE`, the panel says so in amber, and
+    with target frame rate on the overload brake lowers the multiplier instead. Logged as
+    `[MGPU][DR3]` / `[MGPU][GT1]`.
 - **Foveated NR** (`FovNR=1`, off by default): on top of the resolution scale above, a centred
   rectangle (`FovSize`, 30-90% of each side, default 60) is also neural rendered at full
   resolution and blended over the reduced picture with a soft edge (`FovFeather`, 0-50% of the
@@ -117,6 +158,30 @@ Research code, not a product. Run games with anti-cheat and online games at your
   where you are looking, at the cost of one extra evaluate on the box's area. Its strength is
   pass 2's intensity. Note that a second pass changes tone and contrast, not only detail, so a
   larger soft edge helps hide the boundary.
+- **Target frame rate** (`FGAuto=1`, NVIDIA frame generation section of the panel): pick the
+  output rate you want (`FGTarget`) and the frame generation multiplier is chosen
+  automatically from the game's measured frame rate (target ÷ game fps, 2x up to the card's
+  limit, re-picked when the game speeds up or slows down, after 1.5 s). With the mod's
+  **Limiter** (`FGCapOn`, `FGCap`) a 240 fps target runs at 6x with a 40 fps cap, 5x at 48
+  and 4x at 60. The Limiter also works on its own, with a multiplier picked by hand.
+  **Overload brake** (`FGBrake`, on by default): if the frames actually shown fall more than
+  8% short of game fps × multiplier for 2 s, the neural card can't keep up - the multiplier
+  steps down one notch, holds 30 s, then tries again (longer holds if it keeps failing). The
+  panel shows shown-vs-expected fps and warns in amber, also for a hand-picked multiplier.
+  **Auto-tune** (button in the same section, NVIDIA frame generation): click it, close the
+  panel and play for a minute or two. It tries Limiter × multiplier pairs on the running game
+  (2 s to settle, 4 s measured each; progress shows top-right) and keeps the first pair, from
+  2x up, where the game holds the Limiter and the frames shown reach Limiter × multiplier - the
+  highest smooth output with the fewest generated frames. It starts at the target frame rate
+  (or the monitor's refresh rate) and lowers it 10% at a time if nothing passes. The result is
+  applied as Limiter + multiplier (target frame rate switched off) and every test is logged as
+  `[MGPU][AT1]`. Cancel, alt-tab or the panel pausing it changes nothing.
+  Panel settings are written to `mgpu.ini` once a slider has stood still for 0.4 s. Without G-SYNC on the picture, use a target that divides
+  the refresh rate evenly; the panel warns when it does not.
+- **NVIDIA DLSS indicator** (`tools/DLSS-indicator-on.reg` / `-off.reg`): double-click to show or
+  hide NVIDIA's own on-screen DLSS text (version, preset, resolution) for the game's DLSS and
+  the mod's neural rendering and frame generation; restart the game afterwards. It is a
+  Windows-wide driver setting under HKEY_LOCAL_MACHINE, so Windows asks for permission.
 - **NR UI correction** (`NRUICorrection`): the NR DLL's own HUD protection, auto/off/on.
 - **Performance summary in the log**: every 10 s a `[MGPU][PF1]` line gives NR GPU time
   (avg/p95/max, frames over 11 ms), present spacing (avg/sd/p99/max, hitches) and real,
@@ -140,10 +205,39 @@ Research code, not a product. Run games with anti-cheat and online games at your
   contributed there by NO1950): with `DcompOverlay=1` the panel opens on the neural picture
   itself instead of the picture stepping aside. The game's input is blocked while it is open;
   ESC or Home closes it.
+  The panel opens in its own window, in front and wide (it can be resized, never narrower than
+  its content), instead of as a tab behind ReShade's Home tab.
 - **Startup checks**: if there is no second NVIDIA card (integrated graphics do not count), or the
   NVIDIA driver is older than 610.47 (the first with DLSS 5 neural rendering) or NVIDIA's NGX
   reports that it needs updating, the mod stays off and says why in red at the top of the panel
   and in ReShade.log (`[MGPU][T2]`, `[MGPU][DRV1]`). The panel also shows the driver version.
+- **Less sharpening in motion** (`ScalerMAS=1`, checkbox under Scaling to the monitor; live):
+  motion-adaptive sharpening. The neural stage turns the game's motion vectors into a small mask
+  (the fastest motion in each 16×16 cell), and the scaler sharpens each pixel between fully (still)
+  and `ScalerMASMotion` % of it (default 30%) at 8+ px of motion per frame - calmer edges in
+  motion, the same detail when still. Works with NIS (the sharpening term is scaled per pixel;
+  the vendor file is unchanged, the edit is made as the shader is compiled) and FSR 1 (RCAS is
+  blended back toward the unsharpened picture). Generated frames use the latest real frame's
+  mask. Costs a few reads per pixel. Logged as `[MGPU][MAS1]`.
+- **Low-latency present** (`PresentLatency1=1`, "low-latency present" under Latency and display;
+  restart): the bridge's swap chain is made waitable with a maximum frame latency of 1, and each
+  present first waits until the previous frame has left Windows' queue (at most 100 ms). A
+  finished frame then reaches the screen at the next opportunity instead of waiting behind up to
+  three others - a few ms less delay. Best with G-SYNC. Logged as `[MGPU][LP1]`.
+- **Queue guard** (`QueueGuard=1`, live checkbox in the same section): when the neural card falls
+  2 or more frames behind, the game's render thread waits in 0.5 ms steps (at most 25 ms) until
+  it catches up, so the game never makes frames that would be skipped - saving the 3080 Ti's
+  work, the link, and delay. Only fresh readings count (a stopped bridge never slows the game).
+  With a Limiter that fits it rarely acts; `[MGPU][QD1]` reports holds every 30 s.
+- **HDR output** (`HDR=1`, panel View section): turns the game's SDR picture into HDR10 on
+  the neural card for an HDR monitor, as the last step before it is shown (screenshots and
+  video stay SDR). Needs Windows HDR on for that monitor and a 10-bit game picture (Unreal
+  games are); the panel says in amber when either is missing. **Peak** is the brightest
+  highlight (far left = what the monitor reports), **paper white** the brightness of white
+  walls and menus (200 nits is a good start), **highlights** how far bright areas (sky,
+  lamps, fire) reach toward the peak, **saturation** colour strength. Dark and mid tones keep
+  the game's look; only bright areas are lifted. The cost is one small pass and two copies per
+  shown frame. Logged as `[MGPU][HD1]`.
 - **Clock and stopwatch** (top-right of the picture): `CTRL+ALT+C` shows/hides the time
   (12-hour, remembered), `CTRL+ALT+S` shows/hides a stopwatch that counts up from 0 each
   time it is shown. Also checkboxes in the panel's View section; keys can be rebound.
@@ -178,6 +272,11 @@ Research code, not a product. Run games with anti-cheat and online games at your
 what crashed (the module, the place inside it and the call chain) to `mgpu\crash.txt` and to
 ReShade.log as `[MGPU][CR1]`, even when Windows and the game record nothing. Send that line with a
 bug report. It never changes how an error is handled.
+
+**Streamline kept in memory**: some games start NVIDIA Streamline (`sl.*.dll`) and shut it down
+again a few seconds later, leaving a hook behind; a rare later call through that hook crashed
+the game. The add-on keeps Streamline's DLLs loaded until the game exits, so such a call lands
+in real code. It costs a few MB. `PinStreamline=0` in mgpu.ini turns it off.
 
 **Hotkeys**: all of them can be changed in the panel by clicking one and pressing the new
 combination. They only work while the game or the bridge window is in front, so they no

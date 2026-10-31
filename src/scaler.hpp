@@ -32,6 +32,17 @@ namespace scaler
 
 int  mode();            void set_mode(int m);          // 0..3
 int  sharpness();       void set_sharpness(int pct);   // 0..100
+// MAS1: motion-adaptive sharpening. mas_motion: % of the sharpening kept on
+// fast-moving pixels (8+ px per frame); still pixels keep all of it.
+int  mas();             void set_mas(int on);
+int  mas_motion();      void set_mas_motion(int pct);   // 0..100
+
+// MAS1. Neural stage's list, while the motion vectors are a shader resource:
+// builds the motion mask (fastest motion per 16x16 cell, in display pixels per
+// frame). to_px: multiplies a motion vector into display pixels. Does nothing
+// when MAS is off.
+void mas_record(ID3D12Device *dev, ID3D12GraphicsCommandList *cl, ID3D12Resource *mv, DXGI_FORMAT mv_fmt,
+                unsigned mv_w, unsigned mv_h, float to_px_x, float to_px_y, unsigned src_w, unsigned src_h);
 
 // Present thread. src is the finished frame (src_state on entry and exit),
 // bb the back buffer in COPY_DEST (left in COPY_DEST). Records the enlargement

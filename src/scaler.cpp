@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <climits>
+#include <string>
+#include "d3dc.hpp"
 #include <cmath>
 
 #include "scaler.hpp"
@@ -35,6 +37,12 @@ namespace
 std::atomic<int>  g_mode{0};
 std::atomic<int>  g_sharp{50};
 std::atomic<bool> g_failed{false};
+// MAS1: motion-adaptive sharpening. On, the sharpening of each pixel is scaled
+// between full (still) and g_mas_move % of it (moving 8+ px per frame), from a
+// motion mask the neural stage builds out of the game's motion vectors.
+std::atomic<int>  g_mas{0};
+std::atomic<int>  g_mas_move{30};
+const unsigned kMasTile = 16u;     // source pixels per mask cell
 
 // ---- the shaders ----
 
@@ -46,6 +54,7 @@ const char *kFsrHLSL =
     "Texture2D InputTexture : register(t0);\n"
     "RWTexture2D<float4> OutputTexture : register(u0);\n"
     "SamplerState samLinearClamp : register(s0);\n"
+    "RWStructuredBuffer<float> mas_mask : register(u1);\n"   // MAS1
     "#if SC_EASU\n"
     "#define FSR_EASU_F 1\n"
     "AF4 FsrEasuRF(AF2 p) { return InputTexture.GatherRed(samLinearClamp, p, int2(0,0)); }\n"
@@ -64,6 +73,18 @@ const char *kFsrHLSL =
     "  OutputTexture[pos] = AF4(c, 1.0);\n"
     "#else\n"
     "  AF3 c; FsrRcasF(c.r, c.g, c.b, pos, Const0);\n"
+    // MAS1: Const1 = (scale x, on, cells x, cells y), Const2 = (scale y, motion share).
+    "  if (Const1.y != 0u) {\n"
+    "    float2 sp = (float2(pos) + 0.5f) * float2(asfloat(Const1.x), asfloat(Const2.x));\n"
+    "    float2 t = sp / 16.0f - 0.5f; int2 i = int2(floor(t)); float2 f = t - float2(i);\n"
+    "    int2 mx = int2(Const1.z, Const1.w) - 1;\n"
+    "    int2 a = clamp(i, int2(0,0), mx), b = clamp(i + int2(1,1), int2(0,0), mx);\n"
+    "    float m = lerp(lerp(mas_mask[a.y * Const1.z + a.x], mas_mask[a.y * Const1.z + b.x], f.x),\n"
+    "                   lerp(mas_mask[b.y * Const1.z + a.x], mas_mask[b.y * Const1.z + b.x], f.x), f.y);\n"
+    "    float k = lerp(1.0f, asfloat(Const2.y), saturate((m - 1.0f) / 7.0f));\n"
+    "    AF3 soft = InputTexture.Load(int3(pos, 0)).rgb;\n"
+    "    c = lerp(soft, c, k);\n"
+    "  }\n"
     "  OutputTexture[pos] = AF4(c, 1.0);\n"
     "#endif\n"
     "}\n"
@@ -86,13 +107,27 @@ const char *kNisHLSL =
     "  float kDstNormX; float kDstNormY; float kSrcNormX; float kSrcNormY;\n"
     "  uint kInputViewportOriginX; uint kInputViewportOriginY; uint kInputViewportWidth; uint kInputViewportHeight;\n"
     "  uint kOutputViewportOriginX; uint kOutputViewportOriginY; uint kOutputViewportWidth; uint kOutputViewportHeight;\n"
-    "  float reserved0; float reserved1;\n"
+    // MAS1: NIS's two reserved values carry the motion share and on/off; the
+    // two DWORDs after NIS's 30 carry the mask size (the root constants are 32).
+    "  float masMove; float masOn; uint masTW; uint masTH;\n"
     "};\n"
     "SamplerState samplerLinearClamp : register(s0);\n"
     "Texture2D in_texture : register(t0);\n"
     "RWTexture2D<float4> out_texture : register(u0);\n"
     "Texture2D coef_scaler : register(t1);\n"
     "Texture2D coef_usm : register(t2);\n"
+    "RWStructuredBuffer<float> mas_mask : register(u1);\n"
+    "static float g_mas = 1.0f;\n"
+    "float mas_cell(int2 i) { i = clamp(i, int2(0,0), int2(masTW, masTH) - 1); return mas_mask[i.y * masTW + i.x]; }\n"
+    "float mas_weight(float2 sp)\n"
+    "{\n"
+    "  if (masOn < 0.5f) return 1.0f;\n"
+    "  float2 t = sp / 16.0f - 0.5f; int2 i = int2(floor(t)); float2 f = t - float2(i);\n"
+    "  float m = lerp(lerp(mas_cell(i), mas_cell(i + int2(1,0)), f.x), lerp(mas_cell(i + int2(0,1)), mas_cell(i + int2(1,1)), f.x), f.y);\n"
+    "  return lerp(1.0f, masMove, saturate((m - 1.0f) / 7.0f));\n"
+    "}\n"
+    "#define NIS_MAS_SCALE g_mas\n"
+    "#define NIS_MAS_HOOK(dx, dy) g_mas = mas_weight((float2(dx, dy) + 0.5f) * float2(kScaleX, kScaleY))\n"
     "#include \"NIS_Scaler.h\"\n"
     "[numthreads(NIS_THREAD_GROUP_SIZE, 1, 1)]\n"
     "void main(uint3 blockIdx : SV_GroupID, uint3 threadIdx : SV_GroupThreadID)\n"
@@ -129,6 +164,31 @@ const char *kCursorHLSL =
 const unsigned NIS_BW = 32, NIS_BH = 24, NIS_TG = 128;   // NIS's own choice for NVIDIA
 
 // Serves the embedded vendor headers to D3DCompile.
+// MAS1: NIS_Scaler.h as served to the compiler gets two small edits, made
+// here so the vendor file stays as shipped: its sharpening term is scaled per
+// pixel (NIS_MAS_SCALE), and a hook sets that scale for each output pixel just
+// before the directional filters run (NIS_MAS_HOOK). If either spot is not
+// found, the original is served and sharpening stays uniform.
+std::string g_nis_patched;
+bool g_nis_patch_ok = false;
+const std::string &nis_source(const unsigned char *d, size_t n)
+{
+    if (!g_nis_patched.empty()) return g_nis_patched;
+    std::string t((const char *)d, n);
+    const char *a = "y_usm *= y_sharpness;";
+    const char *b = "opY += AddDirFilters(p, fx, fy, fx_int, fy_int, w);";
+    const size_t ia = t.find(a), ib = t.find(b);
+    if (ia != std::string::npos && ib != std::string::npos && t.find(a, ia + 1) == std::string::npos)
+    {
+        t.replace(ib, std::strlen(b), std::string("NIS_MAS_HOOK(dstX, dstY); ") + b);
+        const size_t ia2 = t.find(a);
+        t.replace(ia2, std::strlen(a), "y_usm *= y_sharpness * NIS_MAS_SCALE;");
+        g_nis_patch_ok = true;
+    }
+    g_nis_patched = t;
+    return g_nis_patched;
+}
+
 struct embedded_include : public ID3DInclude
 {
     HRESULT __stdcall Open(D3D_INCLUDE_TYPE, LPCSTR name, LPCVOID, LPCVOID *data, UINT *bytes) override
@@ -139,7 +199,16 @@ struct embedded_include : public ID3DInclude
             const char *b2   = std::strrchr(name, '\\');
             if (b2 > base) base = b2;
             base = base ? base + 1 : name;
-            if (_stricmp(base, f.name) == 0) { *data = f.data; *bytes = f.size; return S_OK; }
+            if (_stricmp(base, f.name) == 0)
+            {
+                if (_stricmp(f.name, "NIS_Scaler.h") == 0)
+                {
+                    const std::string &p = nis_source(f.data, f.size);
+                    *data = p.data(); *bytes = (UINT)p.size();
+                    return S_OK;
+                }
+                *data = f.data; *bytes = f.size; return S_OK;
+            }
         }
         return E_FAIL;
     }
@@ -232,13 +301,12 @@ static_assert(offsetof(NISConfig, reserved1) + 4u <= kRootDwords * 4u, "NIS cons
 
 bool build(ID3D12Device *dev)
 {
-    HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
-    pfn_compile cmp = dc ? (pfn_compile)(void *)GetProcAddress(dc, "D3DCompile") : nullptr;
+    pfn_compile cmp = (pfn_compile)mgpu::d3dcompile();   // RV1
     if (cmp == nullptr) { mgpu::diag::error("[MGPU][SC1] d3dcompiler_47.dll not available - scaler off."); return false; }
 
     D3D12_DESCRIPTOR_RANGE rng[2] = {};
     rng[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rng[0].NumDescriptors = 3; rng[0].OffsetInDescriptorsFromTableStart = 0;
-    rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; rng[1].NumDescriptors = 1; rng[1].OffsetInDescriptorsFromTableStart = 3;
+    rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; rng[1].NumDescriptors = 2; rng[1].OffsetInDescriptorsFromTableStart = 3;   // MAS1: u1 = motion mask
     D3D12_ROOT_PARAMETER rp[2] = {};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rp[0].DescriptorTable.NumDescriptorRanges = 2; rp[0].DescriptorTable.pDescriptorRanges = rng;
@@ -289,7 +357,7 @@ bool build(ID3D12Device *dev)
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 2u * 2u * 4u + 1u;   // 2 back buffers x 2 passes x 4, + the pointer (MC1)
+    hd.NumDescriptors = 2u * 2u * 5u + 1u;   // 2 back buffers x 2 passes x 5 (MAS1: + mask), + the pointer (MC1)
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_s.heap))))
     { mgpu::diag::error("[MGPU][SC1] descriptor heap could not be created."); return false; }
@@ -353,12 +421,55 @@ bool ensure_targets(ID3D12Device *dev, unsigned w, unsigned h, DXGI_FORMAT fmt)
     return true;
 }
 
-// Writes one pass's 4 descriptors (3 SRV + 1 UAV) and returns its GPU handle.
+// ---- MAS1: the motion mask ----
+// One float per 16x16 cell of the game's frame: the fastest motion in it, in
+// display pixels per frame. Written on the neural stage's list from the motion
+// vectors, read by the scaler on every shown frame. A BUFFER, created in
+// COMMON and never transitioned: buffers promote implicitly on each queue, so
+// the two queues can use it without a cross-queue barrier. A read that lands
+// mid-write only mixes two frames' masks for a few cells - harmless.
+struct mask_state
+{
+    std::mutex mx;
+    ID3D12Device *dev = nullptr;
+    bool failed = false;
+    ID3D12RootSignature *rs = nullptr;
+    ID3D12PipelineState *pso = nullptr;
+    ID3D12DescriptorHeap *heap = nullptr;   // 2 x (SRV mv, UAV mask)
+    UINT inc = 0;
+    ID3D12Resource *buf = nullptr;
+    unsigned cw = 0, ch = 0, src_w = 0, src_h = 0;
+    unsigned long long t_ms = 0;            // last write
+    unsigned par = 0;
+};
+mask_state g_m;
+
+const char *kMasHLSL =
+    "Texture2D<float2> gMV : register(t0);\n"
+    "RWStructuredBuffer<float> gMask : register(u0);\n"
+    "cbuffer C : register(b0) { uint2 gMvSz; uint2 gCells; float2 gToPx; uint2 pad; };\n"
+    "[numthreads(64, 1, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID)\n"
+    "{\n"
+    "  uint n = gCells.x * gCells.y; if (id.x >= n) return;\n"
+    "  uint cx = id.x % gCells.x, cy = id.x / gCells.x;\n"
+    "  float m = 0.0f;\n"
+    "  [unroll] for (int y = 0; y < 4; ++y) [unroll] for (int x = 0; x < 4; ++x) {\n"
+    "    float2 uv = (float2(cx, cy) + (float2(x, y) + 0.5f) / 4.0f) / float2(gCells);\n"
+    "    int2 p = clamp(int2(uv * float2(gMvSz)), int2(0,0), int2(gMvSz) - 1);\n"
+    "    m = max(m, length(gMV.Load(int3(p, 0)) * gToPx));\n"
+    "  }\n"
+    "  gMask[id.x] = m;\n"
+    "}\n";
+
+// Writes one pass's 5 descriptors (3 SRV + 2 UAV) and returns its GPU handle.
+// MAS1: u1 is the motion mask, or a null view when there is none.
 D3D12_GPU_DESCRIPTOR_HANDLE table(ID3D12Device *dev, unsigned slot, ID3D12Resource *s0, ID3D12Resource *s1,
-                                  ID3D12Resource *s2, ID3D12Resource *u0)
+                                  ID3D12Resource *s2, ID3D12Resource *u0, ID3D12Resource *mask = nullptr,
+                                  unsigned mask_n = 0)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE c = g_s.heap->GetCPUDescriptorHandleForHeapStart();
-    c.ptr += (SIZE_T)slot * 4u * g_s.inc;
+    c.ptr += (SIZE_T)slot * 5u * g_s.inc;
     ID3D12Resource *srv[3] = { s0, s1, s2 };
     for (unsigned i = 0; i < 3u; ++i)
     {
@@ -372,8 +483,14 @@ D3D12_GPU_DESCRIPTOR_HANDLE table(ID3D12Device *dev, unsigned slot, ID3D12Resour
     D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
     uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; uv.Format = u0->GetDesc().Format;
     dev->CreateUnorderedAccessView(u0, nullptr, &uv, c);
+    c.ptr += g_s.inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC mb{};
+    mb.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; mb.Format = DXGI_FORMAT_UNKNOWN;
+    mb.Buffer.StructureByteStride = 4u;
+    mb.Buffer.NumElements = (mask != nullptr && mask_n != 0u) ? mask_n : 1u;
+    dev->CreateUnorderedAccessView(mask, nullptr, &mb, c);
     D3D12_GPU_DESCRIPTOR_HANDLE g = g_s.heap->GetGPUDescriptorHandleForHeapStart();
-    g.ptr += (UINT64)slot * 4u * g_s.inc;
+    g.ptr += (UINT64)slot * 5u * g_s.inc;
     return g;
 }
 
@@ -382,6 +499,101 @@ D3D12_GPU_DESCRIPTOR_HANDLE table(ID3D12Device *dev, unsigned slot, ID3D12Resour
 int  mode()                 { return g_mode.load(std::memory_order_relaxed); }
 void set_mode(int m)        { if (m < 0 || m > 3) m = 0; g_mode.store(m, std::memory_order_relaxed); }
 int  sharpness()            { return g_sharp.load(std::memory_order_relaxed); }
+int  mas()                  { return g_mas.load(std::memory_order_relaxed); }
+void set_mas(int on)        { g_mas.store(on ? 1 : 0, std::memory_order_relaxed); }
+int  mas_motion()           { return g_mas_move.load(std::memory_order_relaxed); }
+void set_mas_motion(int pct){ if (pct < 0) pct = 0; if (pct > 100) pct = 100; g_mas_move.store(pct, std::memory_order_relaxed); }
+
+void mas_record(ID3D12Device *dev, ID3D12GraphicsCommandList *cl, ID3D12Resource *mv, DXGI_FORMAT mv_fmt,
+                unsigned mv_w, unsigned mv_h, float to_px_x, float to_px_y, unsigned src_w, unsigned src_h)
+{
+    if (g_mas.load(std::memory_order_relaxed) == 0 || dev == nullptr || cl == nullptr || mv == nullptr ||
+        mv_w == 0 || mv_h == 0 || src_w == 0 || src_h == 0)
+        return;
+    std::lock_guard<std::mutex> lk(g_m.mx);
+    if (g_m.failed || (g_m.dev != nullptr && g_m.dev != dev)) return;
+    if (g_m.dev == nullptr)
+    {
+        g_m.dev = dev;
+        auto fail = [](const char *why) { g_m.failed = true; char l[200];
+            snprintf(l, sizeof l, "[MGPU][MAS1] motion-adaptive sharpening unavailable: %s. Sharpening stays uniform.", why);
+            mgpu::diag::warn(l); };
+        pfn_compile cmp = (pfn_compile)mgpu::d3dcompile();   // RV1
+        if (cmp == nullptr) { fail("no d3dcompiler"); return; }
+        D3D12_DESCRIPTOR_RANGE rng[2] = {};
+        rng[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rng[0].NumDescriptors = 1; rng[0].OffsetInDescriptorsFromTableStart = 0;
+        rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; rng[1].NumDescriptors = 1; rng[1].OffsetInDescriptorsFromTableStart = 1;
+        D3D12_ROOT_PARAMETER rp[2] = {};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[0].DescriptorTable.NumDescriptorRanges = 2; rp[0].DescriptorTable.pDescriptorRanges = rng;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[1].Constants.Num32BitValues = 8;
+        D3D12_ROOT_SIGNATURE_DESC rsd{}; rsd.NumParameters = 2; rsd.pParameters = rp;
+        ID3DBlob *sig = nullptr, *err = nullptr;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+        if (err) err->Release();
+        if (SUCCEEDED(hr)) { hr = dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_m.rs)); sig->Release(); }
+        if (FAILED(hr)) { fail("root signature"); return; }
+        ID3DBlob *cs = nullptr;
+        hr = cmp(kMasHLSL, std::strlen(kMasHLSL), "mas", nullptr, nullptr, "main", "cs_5_1", 0, 0, &cs, &err);
+        if (err) err->Release();
+        if (FAILED(hr) || cs == nullptr) { fail("shader compile"); return; }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{}; pd.pRootSignature = g_m.rs;
+        pd.CS.pShaderBytecode = cs->GetBufferPointer(); pd.CS.BytecodeLength = cs->GetBufferSize();
+        hr = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_m.pso));
+        cs->Release();
+        if (FAILED(hr)) { fail("pipeline"); return; }
+        D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 4;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_m.heap)))) { fail("descriptor heap"); return; }
+        g_m.inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        mgpu::diag::info(g_nis_patch_ok || g_nis_patched.empty()
+                             ? "[MGPU][MAS1] motion-adaptive sharpening ready (mask from the game's motion vectors)."
+                             : "[MGPU][MAS1] NIS source not as expected - motion-adaptive sharpening works with FSR 1 only.");
+    }
+    const unsigned cw = (src_w + kMasTile - 1u) / kMasTile, ch = (src_h + kMasTile - 1u) / kMasTile;
+    if (g_m.buf == nullptr || g_m.cw != cw || g_m.ch != ch)
+    {
+        // A size change leaves the old buffer to a reader that may still use it: it
+        // is released only at teardown (it is a few KB).
+        static ID3D12Resource *s_old[8] = {}; static unsigned s_on = 0;
+        if (g_m.buf != nullptr && s_on < 8u) s_old[s_on++] = g_m.buf;
+        g_m.buf = nullptr;
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = (UINT64)cw * ch * 4ull; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                nullptr, IID_PPV_ARGS(&g_m.buf))))
+        { g_m.buf = nullptr; return; }
+        g_m.cw = cw; g_m.ch = ch;
+    }
+    g_m.src_w = src_w; g_m.src_h = src_h;
+    g_m.par ^= 1u;
+    D3D12_CPU_DESCRIPTOR_HANDLE c = g_m.heap->GetCPUDescriptorHandleForHeapStart();
+    c.ptr += (SIZE_T)g_m.par * 2u * g_m.inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1; sv.Format = mv_fmt;
+    dev->CreateShaderResourceView(mv, &sv, c);
+    c.ptr += g_m.inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; uv.Format = DXGI_FORMAT_UNKNOWN;
+    uv.Buffer.NumElements = cw * ch; uv.Buffer.StructureByteStride = 4u;
+    dev->CreateUnorderedAccessView(g_m.buf, nullptr, &uv, c);
+    ID3D12DescriptorHeap *hs[1] = { g_m.heap };
+    cl->SetDescriptorHeaps(1, hs);
+    cl->SetComputeRootSignature(g_m.rs);
+    cl->SetPipelineState(g_m.pso);
+    D3D12_GPU_DESCRIPTOR_HANDLE g = g_m.heap->GetGPUDescriptorHandleForHeapStart();
+    g.ptr += (UINT64)g_m.par * 2u * g_m.inc;
+    cl->SetComputeRootDescriptorTable(0, g);
+    UINT k[8] = { mv_w, mv_h, cw, ch, 0, 0, 0, 0 };
+    std::memcpy(&k[4], &to_px_x, 4); std::memcpy(&k[5], &to_px_y, 4);
+    cl->SetComputeRoot32BitConstants(1, 8, k, 0);
+    cl->Dispatch((cw * ch + 63u) / 64u, 1u, 1u);
+    g_m.t_ms = GetTickCount64();
+}
 void set_sharpness(int pct) { if (pct < 0) pct = 0; if (pct > 100) pct = 100; g_sharp.store(pct, std::memory_order_relaxed); }
 
 bool run(ID3D12Device *dev, ID3D12GraphicsCommandList *cl,
@@ -406,6 +618,17 @@ bool run(ID3D12Device *dev, ID3D12GraphicsCommandList *cl,
     if (m == 3 && g_s.pso_nis == nullptr) m = 1;
     if (m == 0) m = 1;   // the chain is at monitor size: enlarge plainly
     const float sharp = (float)g_sharp.load(std::memory_order_relaxed) / 100.0f;
+    // MAS1: the mask, if it is on, fresh (written in the last 250 ms) and of this frame's size.
+    ID3D12Resource *mbuf = nullptr; unsigned mcw = 0, mch = 0;
+    if (g_mas.load(std::memory_order_relaxed) != 0)
+    {
+        std::lock_guard<std::mutex> ml(g_m.mx);
+        if (g_m.buf != nullptr && g_m.dev == dev && g_m.src_w == sw && g_m.src_h == sh &&
+            GetTickCount64() - g_m.t_ms < 250ull)
+        { mbuf = g_m.buf; mcw = g_m.cw; mch = g_m.ch; }
+    }
+    const float mmove = (float)g_mas_move.load(std::memory_order_relaxed) / 100.0f;
+    const float msx = (float)sw / (float)dw, msy = (float)sh / (float)dh;
 
     if (m == 3 && !g_s.coef_uploaded)
     {
@@ -446,8 +669,13 @@ bool run(ID3D12Device *dev, ID3D12GraphicsCommandList *cl,
         AU1 rc[4];
         FsrRcasCon(rc, (1.0f - sharp) * 2.0f);   // 0 stops = sharpest
         std::memset(k, 0, sizeof k); std::memcpy(k, rc, 16);
+        if (mbuf != nullptr)   // MAS1: Const1 / Const2
+        {
+            std::memcpy(&k[4], &msx, 4); k[5] = 1u; k[6] = mcw; k[7] = mch;
+            std::memcpy(&k[8], &msy, 4); std::memcpy(&k[9], &mmove, 4);
+        }
         cl->SetPipelineState(g_s.pso_rcas);
-        cl->SetComputeRootDescriptorTable(0, table(dev, set + 1u, g_s.tmp, nullptr, nullptr, g_s.out));
+        cl->SetComputeRootDescriptorTable(0, table(dev, set + 1u, g_s.tmp, nullptr, nullptr, g_s.out, mbuf, mcw * mch));
         cl->SetComputeRoot32BitConstants(1, kRootDwords, k, 0);
         cl->Dispatch((dw + 15u) / 16u, (dh + 15u) / 16u, 1u);
         barrier(cl, g_s.tmp, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -457,8 +685,12 @@ bool run(ID3D12Device *dev, ID3D12GraphicsCommandList *cl,
         NISConfig cfg{};
         NVScalerUpdateConfig(cfg, sharp, 0, 0, sw, sh, sw, sh, 0, 0, dw, dh, dw, dh, NISHDRMode::None);
         std::memcpy(k, &cfg, sizeof cfg);
+        {   // MAS1: masMove, masOn, cell counts (DWORDs 28-31)
+            const float on = (mbuf != nullptr && g_nis_patch_ok) ? 1.0f : 0.0f;
+            std::memcpy(&k[28], &mmove, 4); std::memcpy(&k[29], &on, 4); k[30] = mcw; k[31] = mch;
+        }
         cl->SetPipelineState(g_s.pso_nis);
-        cl->SetComputeRootDescriptorTable(0, table(dev, set, src, g_s.coef_s, g_s.coef_u, g_s.out));
+        cl->SetComputeRootDescriptorTable(0, table(dev, set, src, g_s.coef_s, g_s.coef_u, g_s.out, mbuf, mcw * mch));
         cl->SetComputeRoot32BitConstants(1, kRootDwords, k, 0);
         cl->Dispatch((dw + NIS_BW - 1u) / NIS_BW, (dh + NIS_BH - 1u) / NIS_BH, 1u);
     }
@@ -495,8 +727,7 @@ bool build_cursor(ID3D12Device *dev, DXGI_FORMAT fmt)
     if (g_s.cur_pso != nullptr && g_s.cur_fmt == fmt) return true;
     if (g_s.cur_failed) return false;
     relt(g_s.cur_pso);
-    HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
-    pfn_compile cmp = dc ? (pfn_compile)(void *)GetProcAddress(dc, "D3DCompile") : nullptr;
+    pfn_compile cmp = (pfn_compile)mgpu::d3dcompile();   // RV1
     if (cmp == nullptr) { g_s.cur_failed = true; return false; }
     if (g_s.cur_rs == nullptr)
     {
@@ -614,7 +845,7 @@ void draw_cursor(ID3D12Device *dev, ID3D12GraphicsCommandList *cl, ID3D12Resourc
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
         sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         D3D12_CPU_DESCRIPTOR_HANDLE c = g_s.heap->GetCPUDescriptorHandleForHeapStart();
-        c.ptr += (SIZE_T)16u * g_s.inc;
+        c.ptr += (SIZE_T)20u * g_s.inc;   // MAS1: after 4 tables of 5
         dev->CreateShaderResourceView(g_s.cur_tex, &sv, c);
     }
     if (g_s.cur_serial != sp.serial)
@@ -655,7 +886,7 @@ void draw_cursor(ID3D12Device *dev, ID3D12GraphicsCommandList *cl, ID3D12Resourc
     cl->SetGraphicsRootSignature(g_s.cur_rs);
     cl->SetPipelineState(g_s.cur_pso);
     D3D12_GPU_DESCRIPTOR_HANDLE g = g_s.heap->GetGPUDescriptorHandleForHeapStart();
-    g.ptr += (UINT64)16u * g_s.inc;
+    g.ptr += (UINT64)20u * g_s.inc;
     cl->SetGraphicsRootDescriptorTable(0, g);
     const float k[8] = { px, py, (float)sp.w, (float)sp.h, (float)dw, (float)dh, 0.0f, 0.0f };
     cl->SetGraphicsRoot32BitConstants(1, 8, k, 0);
@@ -669,6 +900,11 @@ void release()
     std::lock_guard<std::mutex> lk(g_s.mx);
     relt(g_s.tmp); relt(g_s.out); relt(g_s.coef_s); relt(g_s.coef_u); relt(g_s.coef_up);
     relt(g_s.pso_easu); relt(g_s.pso_rcas); relt(g_s.pso_nis); relt(g_s.pso_bil);
+    {   // MAS1
+        std::lock_guard<std::mutex> ml(g_m.mx);
+        relt(g_m.buf); relt(g_m.pso); relt(g_m.rs); relt(g_m.heap);
+        g_m.dev = nullptr; g_m.failed = false; g_m.cw = g_m.ch = 0;
+    }
     relt(g_s.heap); relt(g_s.rs);
     relt(g_s.cur_pso); relt(g_s.cur_rs); relt(g_s.cur_tex); relt(g_s.cur_up); relt(g_s.rtv);
     g_s.cur_fmt = DXGI_FORMAT_UNKNOWN; g_s.cur_failed = false; g_s.cur_w = g_s.cur_h = g_s.cur_serial = 0;

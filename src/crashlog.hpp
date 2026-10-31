@@ -27,6 +27,7 @@ namespace crashlog
 void install(HMODULE self);   // DllMain, process attach (no file I/O there)
 void uninstall();             // DllMain, process detach
 void announce();              // once, from a normal thread: says it is installed
+void flush_dll_events();      // DW1: bridge thread, a few times a second
 
 } // namespace crashlog
 } // namespace mgpu

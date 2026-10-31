@@ -68,6 +68,11 @@ int read_key(void *module)
 
 // ---- the panel's state ------------------------------------------------------
 std::atomic<int>    g_live{0};            // 1 = the panel is up on the neural layer
+// UX1: the panel's own window.
+void (*g_drawer)(reshade::api::effect_runtime *) = nullptr;
+std::atomic<int>    g_focus_req{0};       // frames left to bring the own window to the front
+std::atomic<unsigned long long> g_own_ms{0};   // last time the own window was drawn
+thread_local bool   t_own = false;
 std::atomic<void *> g_game{nullptr};      // the game's effect runtime
 std::atomic<void *> g_windowless{nullptr};// the GPU 1 runtime with no window = the neural picture
 std::atomic<void *> g_host{nullptr};      // the runtime the panel was actually opened on
@@ -301,6 +306,37 @@ void on_reshade_overlay(reshade::api::effect_runtime *runtime)
 {
     feed_input(runtime);
 
+    // UX1: the panel in its own window on the host runtime, while it is up.
+    // ReShade docks a registered overlay as a tab next to Home, and on the
+    // GPU 1 runtime that tab is neither selected nor sized when the overlay
+    // opens - it opened on Home, narrow, every time. This window is opened
+    // focused, wide on first use and never narrower than the panel needs.
+    if (g_drawer != nullptr && g_live.load(std::memory_order_relaxed) != 0 && is_host((void *)runtime))
+    {
+        const float fs = ImGui::GetFontSize();
+        const ImGuiIO &io = ImGui::GetIO();
+        const float dw = (io.DisplaySize.x > 0.0f) ? io.DisplaySize.x : 1920.0f;
+        const float dh = (io.DisplaySize.y > 0.0f) ? io.DisplaySize.y : 1080.0f;
+        const float want_w = (fs * 58.0f < dw * 0.92f) ? fs * 58.0f : dw * 0.92f;
+        const float min_w  = (fs * 44.0f < dw * 0.92f) ? fs * 44.0f : dw * 0.92f;
+        // UX2: on the RIGHT of the screen. ReShade's own window opens on the
+        // left, so the two no longer stack on top of each other.
+        ImGui::SetNextWindowPos(ImVec2(dw - fs * 1.5f, fs * 3.0f), ImGuiCond_FirstUseEver, ImVec2(1.0f, 0.0f));
+        ImGui::SetNextWindowSize(ImVec2(want_w, dh * 0.82f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(min_w, fs * 16.0f), ImVec2(FLT_MAX, FLT_MAX), nullptr, nullptr);
+        if (g_focus_req.load(std::memory_order_relaxed) > 0)
+        {
+            ImGui::SetNextWindowFocus();
+            g_focus_req.fetch_sub(1, std::memory_order_relaxed);
+        }
+        t_own = true;
+        g_own_ms.store(GetTickCount64(), std::memory_order_relaxed);
+        if (ImGui::Begin("MGPU Bridge###mgpu_panel_own", nullptr, ImGuiWindowFlags_NoDocking))
+            g_drawer(runtime);
+        ImGui::End();
+        t_own = false;
+    }
+
     // Harvest the GAME runtime's pointer. Registering this event keeps ReShade
     // feeding that runtime's ImGuiIO from its own raw-input tracking every
     // present, even though its overlay is refused.
@@ -391,8 +427,17 @@ void runtime_destroyed(reshade::api::effect_runtime *runtime)
 
 bool live() { return g_live.load(std::memory_order_relaxed) != 0; }
 
+void set_drawer(void (*fn)(reshade::api::effect_runtime *)) { g_drawer = fn; }
+bool drawing_own() { return t_own; }
+bool own_window_shown()
+{
+    const unsigned long long t = g_own_ms.load(std::memory_order_relaxed);
+    return t != 0ull && GetTickCount64() - t < 500ull;
+}
+
 void set_live(bool up)
 {
+    if (up && g_live.load(std::memory_order_relaxed) == 0) g_focus_req.store(3, std::memory_order_relaxed);   // UX1
     g_live.store(up ? 1 : 0, std::memory_order_relaxed);
     mgpu::gpu1::sc_set_panel_live(up);   // PP1: the cover takes the clicks while the panel is up
     if (up) g_host_drawn_ms.store(GetTickCount64(), std::memory_order_relaxed);   // R293: grace until the first draw

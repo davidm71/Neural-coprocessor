@@ -49,12 +49,16 @@
 #include <dwmapi.h>       // SC7: DWM_TIMING_INFO (function loaded at run time)
 #include "scaler.hpp"     // SC1: FSR 1 / NIS enlargement to the monitor
 #include "hotkeys.hpp"
+#include "crashlog.hpp"
 #include "cursormap.hpp"  // MC1: the pointer on the enlarged picture
 #include "dx11_producer.hpp"   // 0.3.1 backport: HudLess is D3D12-only
 #include "nr16.hpp"   // 0.3.1 R208: optional FP16 input to DLSS-NR (NRInput16=4)
 #include "capture.hpp"   // SS1 / VR1 / BM1
 #include "framewarp.hpp" // FW1
 #include "replay.hpp"    // BM2
+#include "hdr.hpp"       // HD1
+#include "gputime.hpp"   // GT1
+#include "hud_probe.hpp" // HL3
 // FSR1: AMD FidelityFX API headers (MIT), for FrameGen=3. Types only - the
 // functions come from AMD's signed DLL, loaded at run time from the mgpu folder.
 #include "ffx/ffx_api.h"
@@ -118,6 +122,12 @@ namespace
         // failure").
         ID3D12CommandQueue *queue = nullptr;
         IDXGISwapChain3 *swapchain = nullptr;
+        // LP1: low-latency present. The waitable object of a chain created with
+        // FRAME_LATENCY_WAITABLE_OBJECT and maximum frame latency 1, and the
+        // flags the chain was created with (ResizeBuffers must repeat them).
+        HANDLE lat_wait = nullptr;
+        UINT chain_flags = 0;
+        unsigned long long chain_gen = 0;   // RV1: bumped for every present chain created
         ID3D12DescriptorHeap *rtv_heap = nullptr;
         ID3D12Resource *backbuffer[2] = {};
         // ---- D6: an allocator RING, not a single allocator ----
@@ -369,6 +379,8 @@ static void *g_dcomp_device = nullptr;
 static void *g_dcomp_target = nullptr;
 static void *g_dcomp_visual = nullptr;
 namespace { bool ini_read_flag(const char *key); bool ini_has_key(const char *key); }   // unnamed-namespace readers, defined below
+static bool ini_pending_get(const char *key, int &out);   // SL1, defined with ui_ini_write
+void ini_flush_pending(bool all);                          // SL1
 // R278: how many velocity candidates the census found eligible (probe.cpp), handed
 // over by dllmain each frame - this file names no probe type.
 std::atomic<unsigned> g_mvec_elig_n{0};
@@ -417,6 +429,7 @@ static bool g_dcomp_rooted_fwd() { return g_dcomp_rooted; }
 // 0 = off, 1 = basic neural-output FPS, 2 = detailed MGPU input + NR FPS.
 static int g_fps_hud_mode = 1;
 static int clock_lines(char (*out)[24]);   // CK1, defined with the clock settings
+static bool at_hud_line(char *out, size_t n);   // AT1, defined with the target frame rate
 // SC1: the present chain was sized to the monitor for the scaler (set once,
 // when the window is fitted to the stream).
 static std::atomic<bool> g_sc_active{false};
@@ -464,6 +477,41 @@ static std::atomic<int> g_rs_up{0};      // SRUpFilter: 0 bilinear, 1 bicubic, 2
 // pass, a centred rectangle is ALSO run through NR at full resolution (on the
 // second NR handle, which is otherwise only used by the 2nd pass) and blended
 // over the reduced-scale picture with a soft edge. Live.
+// DR1: dynamic neural resolution. With Custom scale, the reduced textures are
+// made at SRDynMax and each frame NR evaluates only the top-left part of them
+// at the current scale (NR takes a working area per evaluate - FV2 already
+// relies on it), so the scale moves without rebuilding anything. A move resets
+// NR's history for one frame. The scale is steered from what is SHOWN against
+// game fps x multiplier (TF4's measurement, NVIDIA FG only): short -> down,
+// clean -> a slow probe up whose wait doubles each time a probe fails.
+static std::atomic<int> g_dr_on{0};       // SRDynamic
+static std::atomic<int> g_dr_min{50};     // SRDynMin, %
+static std::atomic<int> g_dr_max{80};     // SRDynMax, % (textures are made at this size: restart)
+static std::atomic<int> g_dr_pct_x10{0};  // current scale x10, 0 = not running
+static std::atomic<int> g_dr_alloc{0};    // % the reduced textures were made at
+// DR3: present-gap watch (present thread writes, game thread reads and resets),
+// the bottleneck verdict and why the last window was skipped (for the panel).
+static std::atomic<long long> g_pres_last_qpc{0}, g_pres_max_gap{0};
+// SM1: frame-spacing statistics since the last 0.25 s check (present thread
+// adds, game thread takes): count, sum and sum of squares in microseconds,
+// and hitches = gaps more than twice the running average gap.
+static std::atomic<unsigned long long> g_sm_n{0}, g_sm_sum{0}, g_sm_sq{0}, g_sm_hit{0};
+static std::atomic<int> g_sm_sens{2};          // SRDynSmooth: 0 off, 1 relaxed, 2 normal, 3 strict
+static std::atomic<int> g_sm_sd_x1000{-1};     // last window: spacing sd / average gap x1000 (-1 none)
+static std::atomic<int> g_sm_sd_us{-1};        // last window: spacing sd, microseconds
+static std::atomic<int> g_sm_hits{0};          // last window: hitches
+static std::atomic<int> g_dr_ineff{0};          // 1 = lowering NR did not help: FG/present bound
+// QD1: queue guard. The neural stage's backlog (frames arrived on GPU 1 but
+// not yet taken), written by the bridge thread at every poll; the game's
+// render thread waits briefly while it is 2 or more, so the game never runs
+// ahead of what the neural card can take (those frames would be skipped,
+// wasting the 3080 Ti's work and the link, and adding delay).
+static std::atomic<int> g_nr_backlog{0};
+static std::atomic<unsigned long long> g_nr_backlog_ms{0};   // when it was last written (stale = ignored)
+static std::atomic<int> g_qd_on{-1};            // QueueGuard: -1 not read yet, 0 off, 1 on
+static std::atomic<unsigned long long> g_qd_holds{0}, g_qd_hold_us{0};
+static std::atomic<const char *> g_dr_skip{nullptr};
+static std::atomic<unsigned long long> g_dr_skip_ms{0};
 static std::atomic<int> g_fov_on{0};      // FovNR: 0 off, 1 centre box (FV1), 2 lower band (FV2)
 static std::atomic<int> g_fov_band{50};   // FovBand: FV2 band height, % of the picture
 static std::atomic<int> g_fov_bpos{50};   // FovBandPos: FV3 band position, 0 top .. 50 middle .. 100 bottom
@@ -1074,6 +1122,8 @@ bool create_present_chain(HWND hwnd)
     IDXGIFactory2 *factory = nullptr;
     IDXGISwapChain1 *sc1 = nullptr;
     IDXGISwapChain3 *sc3 = nullptr;
+    bool lp1 = false;            // LP1: chain created waitable
+    UINT chain_flags = 0;        // LP1: the flags it was created with
     ID3D12DescriptorHeap *heap = nullptr;
     ID3D12Resource *back0 = nullptr;
     ID3D12Resource *back1 = nullptr;
@@ -1208,7 +1258,12 @@ bool create_present_chain(HWND hwnd)
         scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         scd.Scaling = DXGI_SCALING_STRETCH;
         scd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-        scd.Flags = 0;
+        // LP1: PresentLatency1=1 creates the chain waitable, so at most one
+        // frame waits in Windows' present queue (see present_frame). Read when
+        // the chain is made: changing it needs a restart.
+        lp1 = ui_ini_read("PresentLatency1", 0) == 1;
+        scd.Flags = lp1 ? (UINT)DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0u;
+        chain_flags = scd.Flags;
 
         // Gotcha 1: the first parameter is the COMMAND QUEUE, not the
         // device. It is named pDevice and typed IUnknown *, so passing
@@ -1564,8 +1619,23 @@ bool create_present_chain(HWND hwnd)
     // readers take the same lock), then log the creation line - one line
     // with the swapchain format, buffer count, client size, and the
     // HRESULT of CreateSwapChainForHwnd (brief T5 "Logging").
+    // LP1: one frame of present queue, and the object that says when it is free.
+    HANDLE lat_wait = nullptr;
+    if (lp1 && sc3 != nullptr)
+    {
+        const HRESULT lh = sc3->SetMaximumFrameLatency(1);
+        if (SUCCEEDED(lh)) lat_wait = sc3->GetFrameLatencyWaitableObject();
+        char ll[240];
+        snprintf(ll, sizeof ll, "[MGPU][LP1] low-latency present %s: maximum frame latency 1 (0x%08X), "
+                 "waitable object %s.", (SUCCEEDED(lh) && lat_wait != nullptr) ? "ON" : "NOT available",
+                 (unsigned)lh, lat_wait != nullptr ? "ready" : "missing - presenting as before");
+        mgpu::diag::info(ll);
+    }
     {
         std::lock_guard<std::mutex> lk(S.cs);
+        S.lat_wait = lat_wait;
+        S.chain_flags = chain_flags;
+        ++S.chain_gen;   // RV1
         S.queue = queue;
         S.hwnd = hwnd;
         S.chain_w = width;
@@ -1726,6 +1796,7 @@ bool present_frame(float r, float g, float b)
     UINT64 fence_value = 0;
     UINT64 slot_prev = 0;
     unsigned slot = 0;
+    HANDLE lat_wait = nullptr;   // LP1
 
     {
         std::lock_guard<std::mutex> lk(S.cs);
@@ -1744,7 +1815,16 @@ bool present_frame(float r, float g, float b)
         allocator = S.allocator[slot];
         cl = S.command_list[slot];
         slot_prev = S.slot_value[slot];
+        lat_wait = S.lat_wait;
     }
+
+    // ---- LP1: WAIT FOR ROOM IN WINDOWS' PRESENT QUEUE, BEFORE DRAWING ----
+    // With maximum frame latency 1 this returns once the previous frame has
+    // left the queue, so the frame drawn next goes to the screen at the next
+    // opportunity instead of waiting behind others. Bounded: a stuck queue
+    // never hangs the present thread (it then presents as before).
+    if (lat_wait != nullptr)
+        (void)WaitForSingleObjectEx(lat_wait, 100, TRUE);
 
     char line[800];   // P5.3 widened: the Present=in banner is longer than 320 and a
                       // truncated banner is a wrong label on a whole run
@@ -1945,6 +2025,7 @@ bool present_frame(float r, float g, float b)
     hr = cl->Reset(allocator, nullptr);
     if (FAILED(hr))
         return fail("CommandList::Reset", static_cast<unsigned>(hr));
+    const int gt_slot = mgpu::gputime::begin(dev, queue, cl);   // GT1: this list's GPU time
 
     // Gotcha 7: barriers are mandatory. PRESENT -> RENDER_TARGET before
     // the clear, RENDER_TARGET -> PRESENT after it. Omitting them is a
@@ -1981,6 +2062,7 @@ bool present_frame(float r, float g, float b)
     DXGI_FORMAT nfmt = DXGI_FORMAT_UNKNOWN;
     D3D12_RESOURCE_STATES nrest = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     ID3D12Resource *nsrc = stream_present_source(nw, nh, nfmt, nrest);
+    bool hdr_applied = false;   // HD1: this frame was converted to HDR10
     // The format check is not paranoia: the copy is silent about a mismatch at
     // record time and would fail at execute, taking the device with it.
     //
@@ -2077,9 +2159,78 @@ bool present_frame(float r, float g, float b)
         if (lsrc == nullptr) pbox.left = left;
         // SC1: game smaller than the (monitor-sized) chain - enlarge instead of copy.
         bool scaled = false;
-        if (lsrc == nullptr && g_sc_active.load(std::memory_order_relaxed) && (nw != bw || nh != bh))
+        bool split_done = false;   // SP2: the split was composed and enlarged here
+        const bool want_scale = g_sc_active.load(std::memory_order_relaxed) && (nw != bw || nh != bh);
+        if (lsrc == nullptr && want_scale)
             scaled = mgpu::scaler::run(dev, cl, nsrc, D3D12_RESOURCE_STATE_COPY_SOURCE, nw, nh,
                                        backbuffer[index], bw, bh, bbfmt, index);
+        else if (lsrc != nullptr && want_scale)
+        {
+            // SP2: SPLIT ON THE ENLARGED PICTURE. The split used to be copied
+            // 1:1 into the monitor-sized chain, so it showed at the game's size
+            // in the top-left corner with grey bars right and below. Now both
+            // halves are composed at the game's size into one scratch texture
+            // (same seam, same pixels) and that is enlarged like the normal view.
+            static ID3D12Resource *s_sp_tex = nullptr;
+            static ID3D12Device   *s_sp_dev = nullptr;
+            static UINT s_sp_w = 0, s_sp_h = 0;
+            static DXGI_FORMAT s_sp_fmt = DXGI_FORMAT_UNKNOWN;
+            if (s_sp_tex != nullptr && (s_sp_dev != dev || s_sp_w != nw || s_sp_h != nh || s_sp_fmt != bbfmt))
+            { s_sp_tex->Release(); s_sp_tex = nullptr; }
+            if (s_sp_tex == nullptr)
+            {
+                D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                D3D12_RESOURCE_DESC rd{};
+                rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                rd.Width = nw; rd.Height = nh; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+                rd.Format = bbfmt; rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+                if (SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                           D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+                                                           IID_PPV_ARGS(&s_sp_tex))))
+                { s_sp_dev = dev; s_sp_w = nw; s_sp_h = nh; s_sp_fmt = bbfmt; }
+                else s_sp_tex = nullptr;
+            }
+            if (s_sp_tex != nullptr)
+            {
+                D3D12_RESOURCE_BARRIER tb{};
+                tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                tb.Transition.pResource = s_sp_tex;
+                tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                cl->ResourceBarrier(1, &tb);
+                D3D12_TEXTURE_COPY_LOCATION td{};
+                td.pResource = s_sp_tex;
+                td.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                td.SubresourceIndex = 0;
+                // Right of the seam: the output.
+                D3D12_BOX rbox{ halfw, 0, 0, nw, nh, 1 };
+                cl->CopyTextureRegion(&td, halfw, 0, 0, &ps, &rbox);
+                // Left of the seam: the input.
+                D3D12_RESOURCE_BARRIER lb{};
+                lb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                lb.Transition.pResource = lsrc;
+                lb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                lb.Transition.StateBefore = lrest;
+                lb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                cl->ResourceBarrier(1, &lb);
+                D3D12_TEXTURE_COPY_LOCATION ls{};
+                ls.pResource = lsrc;
+                ls.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                ls.SubresourceIndex = 0;
+                D3D12_BOX lbox{ 0, 0, 0, halfw, nh, 1 };
+                cl->CopyTextureRegion(&td, 0, 0, 0, &ls, &lbox);
+                lb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                lb.Transition.StateAfter = lrest;
+                cl->ResourceBarrier(1, &lb);
+                tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                cl->ResourceBarrier(1, &tb);
+                scaled = mgpu::scaler::run(dev, cl, s_sp_tex, D3D12_RESOURCE_STATE_COPY_SOURCE, nw, nh,
+                                           backbuffer[index], bw, bh, bbfmt, index);
+                split_done = true;   // the left half is in the enlarged picture already
+            }
+        }
         if (!scaled)
             cl->CopyTextureRegion(&pd, (lsrc != nullptr) ? halfw : 0u, 0, 0, &ps, &pbox);
 
@@ -2087,7 +2238,7 @@ bool present_frame(float r, float g, float b)
         nb.Transition.StateAfter = nrest;
         cl->ResourceBarrier(1, &nb);
 
-        if (lsrc != nullptr)
+        if (lsrc != nullptr && !(split_done && scaled))
         {
             D3D12_RESOURCE_BARRIER lb{};
             lb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -2139,13 +2290,18 @@ bool present_frame(float r, float g, float b)
 
         if (lsrc != nullptr)
         {
-            // The seam, drawn before the HUD.
+            // The seam, drawn before the HUD. SP3: on the enlarged split it sits
+            // at the enlarged position and runs the full height of the screen.
+            const bool big = split_done && scaled && nw != 0u && nh != 0u;
+            const UINT sx  = big ? (UINT)(((unsigned long long)halfw * bw + nw / 2u) / nw) : halfw;
+            const UINT sh  = big ? bh : ch;
+            const UINT sw  = big ? ((bw / nw >= 2u) ? 4u : 3u) : 3u;
             const float seam[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
             D3D12_RECT sr{};
-            sr.left   = (LONG)((halfw >= 2u) ? (halfw - 2u) : 0u);
+            sr.left   = (LONG)((sx >= sw - 1u) ? (sx - (sw - 1u)) : 0u);
             sr.top    = 0;
-            sr.right  = (LONG)(halfw + 1u);
-            sr.bottom = (LONG)ch;
+            sr.right  = (LONG)(sx + 1u);
+            sr.bottom = (LONG)sh;
             cl->ClearRenderTargetView(rtv, seam, 1, &sr);
         }
 
@@ -2178,6 +2334,11 @@ bool present_frame(float r, float g, float b)
 
         // SS1/VR1: captures that include the FPS HUD - exactly what is on screen.
         mgpu::capture::on_present_final(dev, cl, backbuffer[index], bw, bh, bbfmt);
+
+        // HD1: HDR output - the very last step, so everything drawn above
+        // (scaler, Frame Warp, pointer, seam, HUD, clock) is converted together.
+        // Captures above stay SDR. The chain's colour space follows below.
+        hdr_applied = mgpu::hdr::apply(dev, cl, backbuffer[index], bw, bh, bbfmt);
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -2293,9 +2454,13 @@ bool present_frame(float r, float g, float b)
         cl->ResourceBarrier(1, &barrier);
     }
 
+    mgpu::gputime::end(cl, gt_slot);   // GT1
     hr = cl->Close();
     if (FAILED(hr))
+    {
+        mgpu::gputime::cancel(gt_slot);   // GT4: a list that failed to close is never executed
         return fail("Close", static_cast<unsigned>(hr));
+    }
 
     ID3D12CommandList *const lists[1] = { cl };
     queue->ExecuteCommandLists(1, lists);
@@ -2306,6 +2471,7 @@ bool present_frame(float r, float g, float b)
     // for a clear - and only then wait for the GPU to finish this frame.
     fence_value++;
     hr = queue->Signal(fence, fence_value);
+    mgpu::gputime::submitted(gt_slot, SUCCEEDED(hr) ? fence : nullptr, fence_value);   // GT1
     if (FAILED(hr))
         return fail("Signal", static_cast<unsigned>(hr));
 
@@ -2340,6 +2506,7 @@ bool present_frame(float r, float g, float b)
     // PresentVsync=0 asks for the immediate present. Expect tearing - that is
     // the trade, and it is the user's to make, not ours to make silently.
     const UINT pi_interval = (g_present_vsync.load(std::memory_order_relaxed) != 0u) ? 1u : 0u;
+    (void)mgpu::hdr::sync_colour_space(sc, hdr_applied);   // HD1: HDR10 only for a converted frame
     hr = sc->Present(pi_interval, 0);
     if (FAILED(hr))
         return fail("Present", static_cast<unsigned>(hr));
@@ -2349,6 +2516,29 @@ bool present_frame(float r, float g, float b)
     // treating it as displayed output would inflate the final FPS score.
     if (hr == S_OK)
     {
+        {   // DR3: the longest gap between shown frames since the last check
+            LARGE_INTEGER pq{}; QueryPerformanceCounter(&pq);
+            const long long prev = g_pres_last_qpc.exchange(pq.QuadPart, std::memory_order_relaxed);
+            if (prev != 0)
+            {
+                const long long gap = pq.QuadPart - prev;
+                long long cur = g_pres_max_gap.load(std::memory_order_relaxed);
+                while (gap > cur && !g_pres_max_gap.compare_exchange_weak(cur, gap, std::memory_order_relaxed)) {}
+                // SM1: spacing statistics (present thread only writes the EMA)
+                static LONGLONG s_qf = 0;
+                if (s_qf == 0) { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); s_qf = f.QuadPart ? f.QuadPart : 1; }
+                const unsigned long long us = (unsigned long long)(gap * 1000000LL / s_qf);
+                if (us < 500000ull)   // over 0.5 s is a pause, not spacing
+                {
+                    static double s_ema = 0.0;
+                    if (s_ema > 0.0 && (double)us > 2.0 * s_ema) g_sm_hit.fetch_add(1, std::memory_order_relaxed);
+                    s_ema = (s_ema <= 0.0) ? (double)us : s_ema * 0.97 + (double)us * 0.03;
+                    g_sm_n.fetch_add(1, std::memory_order_relaxed);
+                    g_sm_sum.fetch_add(us, std::memory_order_relaxed);
+                    g_sm_sq.fetch_add(us * us, std::memory_order_relaxed);
+                }
+            }
+        }
         g_hud_present_count.fetch_add(1ull, std::memory_order_relaxed);
         mgpu::capture::on_present_shown();   // BM1
         perf_present(g_hud_nr_ok_count.load(std::memory_order_relaxed),
@@ -2418,6 +2608,30 @@ bool present_frame(float r, float g, float b)
 // file's lock). T6 will need the native device / queue / swapchain
 // pointers for create_effect_runtime; the accessor for those is written
 // with T6, not now.
+// RV1: fence-based retirement for objects the present lists use (Frame Warp,
+// HDR). The value the list being recorded on the present thread will be
+// signalled with, and whether a value has completed. A value from an older
+// chain counts as done: a chain is drained before it is released.
+unsigned long long present_chain_gen()
+{
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+    return S.chain_gen;
+}
+unsigned long long present_recording_value()
+{
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+    return S.fence_value + 1ull;
+}
+bool present_value_done(unsigned long long gen, unsigned long long v)
+{
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+    if (gen != S.chain_gen || S.fence == nullptr) return true;
+    return S.fence->GetCompletedValue() >= v;   // a removed device reads UINT64_MAX: done
+}
+
 bool has_present_chain()
 {
     auto &S = st();
@@ -2433,6 +2647,7 @@ bool has_present_chain()
 void shutdown()
 {
     auto &S = st();
+    ini_flush_pending(true);   // SL1: nothing the panel queued is lost
 
     // MC2: put the game's SetCursor/ShowCursor imports back and release the
     // pointer clip FIRST - the game keeps running its message loop after this
@@ -2455,6 +2670,7 @@ void shutdown()
     HANDLE event = nullptr;
     UINT64 fence_value = 0;
     ID3D12Device *dev = nullptr;   // REV: only to ask whether it was removed
+    HANDLE lat_wait_close = nullptr;   // LP1
     {
         std::lock_guard<std::mutex> lk(S.cs);
         dev = S.device;
@@ -2476,6 +2692,8 @@ void shutdown()
         fence_value = S.fence_value;
         S.queue = nullptr;
         S.swapchain = nullptr;
+        lat_wait_close = S.lat_wait;   // LP1: closed once the chain is gone
+        S.lat_wait = nullptr; S.chain_flags = 0;
         S.rtv_heap = nullptr;
         S.backbuffer[0] = nullptr;
         S.backbuffer[1] = nullptr;
@@ -2540,6 +2758,8 @@ void shutdown()
             backbuffer[0]->Release();
         heap->Release();
         sc->Release();
+        if (lat_wait_close != nullptr) CloseHandle(lat_wait_close);   // LP1
+        mgpu::gputime::forget(queue);   // GT2: before the queue goes
         queue->Release();
         mgpu::diag::info("[MGPU][T5] present chain released (GPU drained, reverse creation order)");
     }
@@ -9141,9 +9361,11 @@ namespace
         UINT fov_rect[4] = {0, 0, 0, 0};        // FV1: x0,y0,x1,y1 of the last centre evaluate
         bool fov_first = true;                  // FV1: reset the centre feature's history
         bool fov_said = false;
+        bool no1_said = false;                  // NO1
         int  fov_src_mode = 0;                  // FV4: which input the centre's history is of
         UINT fov_base_h = 0;                    // FV2: rows of R the base evaluate covers (0 = all)
         bool fov_base_reset = false;
+        UINT dr_w = 0, dr_h = 0;                // DR1: the part of R evaluated this frame (= R when off)
         ID3D12Resource *sr_expose   = nullptr;   // 1x1 R32_FLOAT = 1.0
         ID3D12RootSignature *ds_rs  = nullptr;
         ID3D12PipelineState *ds_pso = nullptr;
@@ -9587,6 +9809,8 @@ namespace
         // show through the menu: it looked transparent).
         ID3D12Resource *ui_cnt = nullptr, *ui_cnt_read = nullptr;
         bool ui_cnt_pending = false, ui_menu = false;
+        bool hl3_on = false;   // HL3: the scene copy stopped - the game's frames are shown
+        unsigned long long hl3_resumed_ms = 0;   // HL3b: when copies started firing again
         unsigned ui_cnt_last = 0, ui_menu_ev = 0, ui_game_ev = 0;
         unsigned long long hud_eval = 0, hud_plain = 0, hud_report_at = 0;
         // CS1: Color Strength. 1.0 = the neural output as it is (no pass at
@@ -10076,6 +10300,7 @@ namespace
         // and the split's left half must show THAT one, not whichever half the
         // copy queue is filling next.
         ID3D12Resource *tex_in_show = nullptr;
+        ID3D12Resource *tex_ui_show = nullptr;   // SP3: the same frame WITH its HUD/menus (HUD-less mode)
         ID3D12Resource *tex_out = nullptr, *tex_pong = nullptr,
                        *nr_final = nullptr, *nr_read = nullptr;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT nr_fp{};   // the 64x4 liveness sample
@@ -10654,7 +10879,7 @@ namespace
             // transition that only the debug layer would catch.
             if (s.tex_in_show == nullptr) return nullptr;
             rest = s.tex_in_rest;
-            return s.tex_in_show;
+            return (s.tex_ui_show != nullptr) ? s.tex_ui_show : s.tex_in_show;   // SP3
         }
         // P6.0: the LAST pass's output, not tex_out unconditionally. With
         // Passes=1 nr_final is tex_out and this is the P5 behaviour exactly.
@@ -10686,9 +10911,9 @@ namespace
         if (s.present_mode != 2) return nullptr;
         if (!s.nr_ok || s.profile) return nullptr;
         if (s.tex_in_show == nullptr || s.nr_final == nullptr) return nullptr;
-        rest = s.tex_in_rest;   // R26, see stream_present_source
+        rest = s.tex_in_rest;   // R26, see stream_present_source (tex_ui shares it, HL1)
         pos = s.split_pos;
-        return s.tex_in_show;
+        return (s.tex_ui_show != nullptr) ? s.tex_ui_show : s.tex_in_show;   // SP3
     }
 
     // P5.2 / DEFECT C. Declared up beside ngx_probe; defined here, where the
@@ -11512,6 +11737,10 @@ namespace
 
     int ini_read_sr_int(const char *key, int dflt, int lo, int hi)
     {
+        {   // SL1: a value queued by the panel and not yet on disk
+            int pv = 0;
+            if (ini_pending_get(key, pv)) return (pv < lo || pv > hi) ? dflt : pv;
+        }
         char buf[INI_BYTES];
         if (!ini_slurp(buf, sizeof buf)) return dflt;
         const char *k = ini_find(buf, key);
@@ -11788,6 +12017,7 @@ struct dg_state
     NVSDK_NGX_Handle       *handle = nullptr;
     UINT w = 0, h = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
     unsigned mfc_max = 0;
+    bool mfc_assumed = false;       // DLSSG3: count not reported - tried, dropped to 2x if refused
     unsigned cur_mfc = 0;           // DLSSG2: in-between frames per pair in use
     float v2c[16] = {}, c2v[16] = {}, ident[16] = {};
     // FrameGen=4
@@ -11999,6 +12229,13 @@ bool dg_ensure(stream_state &s, ID3D12GraphicsCommandList *cl, ID3D12Resource *l
                 (void)cap->Get("FrameGeneration.FeatureInitResult", &fir);
                 (void)cap->Get("DLSSG.MultiFrameCountMax", &mfc);
                 g_dg.mfc_max = mfc;
+                // DLSSG3: an older Streamline in the game (RoboCop: Rogue City ships
+                // 2.4.15) leaves the count unreported even though the driver's
+                // snippet we run supports it (Unfinished Business, same snippet,
+                // reports 5). Try what FGMultiplier asks; the first refusal drops
+                // to 2x for the run instead of counting toward the failure limit.
+                g_dg.mfc_assumed = (mfc == 0u && avail == 1);
+                if (g_dg.mfc_assumed) g_dg.mfc_max = 5u;
                 snprintf(line, sizeof line,
                          "[MGPU][%s] Init_Ext 0x%08X (%s) | FrameGeneration.Available=%d NeedsUpdatedDriver=%d "
                          "FeatureInitResult=0x%08X MultiFrameCountMax=%u (%s)", who, (unsigned)ri, ngx_result_name(ri),
@@ -12006,6 +12243,9 @@ bool dg_ensure(stream_state &s, ID3D12GraphicsCommandList *cl, ID3D12Resource *l
                          mfc >= 5u ? "up to 6x supported" : mfc == 4u ? "up to 5x supported" :
                          mfc == 3u ? "up to 4x supported" : mfc == 2u ? "up to 3x supported" : "2x only or not reported");
                 mgpu::diag::info(line);
+                if (g_dg.mfc_assumed)
+                    mgpu::diag::info("[MGPU][DLSSG3] the multi-frame count is not reported here (the game's older "
+                                     "Streamline) - trying FGMultiplier as set; if the driver refuses, 2x for this run.");
             }
         }
     }
@@ -12187,6 +12427,18 @@ unsigned fg_extras_ensure(stream_state &s, unsigned want)
     return want;
 }
 
+
+// DLSSG3: the assumed multi-frame count was refused - 2x for the rest of the run.
+static void dg_mfc_refused(NVSDK_NGX_Result r)
+{
+    g_dg.mfc_assumed = false;
+    g_dg.mfc_max = 1u;
+    char line[300];
+    snprintf(line, sizeof line, "[MGPU][DLSSG3] multi-frame generation refused (0x%08X %s) - 2x for this run.",
+             (unsigned)r, ngx_result_name(r));
+    mgpu::diag::warn(line);
+}
+
 bool dg_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
                ID3D12Resource *real, float mv_el)
 {
@@ -12223,6 +12475,11 @@ bool dg_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
     g_dg.cur_mfc = mfc;
     const NVSDK_NGX_Result r = dg_evaluate(s, cl, ii, real, s.fsr_out, mv_el, reset || mfc_changed, fid, mfc, 1u);
     ++g_dg.evals;
+    if (r != NVSDK_NGX_Result_Success && g_dg.mfc_assumed && mfc > 1u)
+    {
+        dg_mfc_refused(r);   // DLSSG3: not a failure of frame generation itself
+        return false;
+    }
     if (r != NVSDK_NGX_Result_Success)
     {
         ++g_dg.errors;
@@ -12248,6 +12505,11 @@ bool dg_record_extra(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii
     const NVSDK_NGX_Result r = dg_evaluate(s, cl, ii, real, s.fsr_out, mv_el, false, g_dg.last_fid,
                                            g_dg.cur_mfc, idx);
     ++g_dg.evals;
+    if (r != NVSDK_NGX_Result_Success && g_dg.mfc_assumed)
+    {
+        dg_mfc_refused(r);   // DLSSG3
+        return false;
+    }
     if (r != NVSDK_NGX_Result_Success)
     {
         ++g_dg.errors;
@@ -12908,6 +13170,7 @@ static void g0_stage_release(stream_state &s)
         if (s.tex_pong != nullptr) { s.tex_pong->Release(); s.tex_pong = nullptr; }
         if (s.tex_out != nullptr) { s.tex_out->Release(); s.tex_out = nullptr; }
         s.tex_in_show = nullptr;   // borrowed; released with the pair below
+        s.tex_ui_show = nullptr;   // SP3
         for (int ti = 1; ti >= 0; --ti)
             if (s.tex_in[ti] != nullptr) { s.tex_in[ti]->Release(); s.tex_in[ti] = nullptr; }
         for (unsigned ui = 0; ui < 2u; ++ui)   // HL1
@@ -12923,6 +13186,7 @@ static void g0_stage_release(stream_state &s)
         if (s.ui_cnt != nullptr) { s.ui_cnt->Release(); s.ui_cnt = nullptr; }              // HL2
         if (s.ui_cnt_read != nullptr) { s.ui_cnt_read->Release(); s.ui_cnt_read = nullptr; }
         s.ui_cnt_pending = false; s.ui_menu = false; s.ui_cnt_last = 0; s.ui_menu_ev = s.ui_game_ev = 0;
+        s.hl3_on = false;
         g_ui_menu.store(false, std::memory_order_relaxed);
         s.ui_built = false; s.ui_failed = false;
         if (s.cs_pso  != nullptr) { s.cs_pso->Release();  s.cs_pso  = nullptr; }   // CS1
@@ -12959,7 +13223,7 @@ static void g0_stage_release(stream_state &s)
         if (s.nf  != nullptr) { s.nf->Release();  s.nf = nullptr; }
         if (s.nl  != nullptr) { s.nl->Release();  s.nl = nullptr; }
         if (s.na  != nullptr) { s.na->Release();  s.na = nullptr; }
-        if (s.nq  != nullptr) { s.nq->Release();  s.nq = nullptr; }
+        if (s.nq  != nullptr) { mgpu::gputime::forget(s.nq); s.nq->Release();  s.nq = nullptr; }   // GT2
         if (s.gate_ev != nullptr) { CloseHandle(s.gate_ev); s.gate_ev = nullptr; }
         if (s.tsread != nullptr) { s.tsread->Release(); s.tsread = nullptr; }
         if (s.tsheap != nullptr) { s.tsheap->Release(); s.tsheap = nullptr; }
@@ -13854,6 +14118,69 @@ namespace
         return true;
     }
 
+    // HL3: when the game stops drawing the HUD-less scene (a level change, the
+    // exit to the main menu) the frames that follow carry a loading screen or a
+    // menu with the HUD in it, and nothing marks them as a menu: HL2 can only
+    // count on frames that have the HUD-less copy, and a new scene texture is
+    // locked only after 60 frames. Run through the neural stage and frame
+    // generation, the menu text moved with the motion vectors of the scene
+    // behind it - the main menu shook for a moment after "exit to menu".
+    // Now those frames are shown as the game drew them (the NO1 path: no
+    // evaluate, no generation) and the state counts as a menu until the copy
+    // comes back; HL2 then decides from the first frames with the copy (a menu
+    // stays a menu, gameplay closes it after two frames). Histories restart
+    // there. After 60 s without a copy the frames run as before.
+    static bool hl3_frame(stream_state &s, bool fr_hud)
+    {
+        if (s.hud_off == 0) return false;   // HudLess off
+        if (fr_hud)
+        {
+            s.hl3_resumed_ms = 0;
+            if (s.hl3_on)
+            {
+                s.hl3_on = false;
+                s.nr_first = true; s.fov_first = true; s.sr_first = true;
+                mgpu::diag::info("[MGPU][HL3] scene copy back - the menu check decides from here.");
+            }
+            return false;
+        }
+        const unsigned gap = mgpu::hudprobe::scene_gap_ms();
+        // HL3b: a fresh copy (gap under 100 ms) on a frame that does not carry
+        // one yet is the new lock's first frames still in flight - keep
+        // holding for them (up to 1 s) instead of reading it as the timeout.
+        // Measured (710af332): the hold ended 30 ms after the new lock, ahead
+        // of HL2's first count, with the timeout's message.
+        bool hold = gap >= 100u && gap < 60000u;
+        if (s.hl3_on && gap < 100u)
+        {
+            const unsigned long long now_ms = GetTickCount64();
+            if (s.hl3_resumed_ms == 0) s.hl3_resumed_ms = now_ms;
+            hold = now_ms - s.hl3_resumed_ms < 1000ull;
+        }
+        else s.hl3_resumed_ms = 0;
+        if (hold && !s.hl3_on)
+        {
+            s.hl3_on = true;
+            s.ui_menu = true;
+            g_ui_menu.store(true, std::memory_order_relaxed);
+            s.ui_menu_ev = s.ui_game_ev = 0;
+            mgpu::diag::info("[MGPU][HL3] the game stopped drawing its scene (level change or main menu) - "
+                             "showing the game's own frames until it is back.");
+        }
+        else if (!hold && s.hl3_on)
+        {
+            s.hl3_on = false;
+            s.nr_first = true; s.fov_first = true; s.sr_first = true;
+            s.ui_menu = false;
+            g_ui_menu.store(false, std::memory_order_relaxed);
+            s.ui_menu_ev = s.ui_game_ev = 0;
+            mgpu::diag::info(gap >= 60000u
+                ? "[MGPU][HL3] no scene copy for 60 s - neural output on the frames as they are."
+                : "[MGPU][HL3] scene copy back but not reaching the neural card - neural output on the frames as they are.");
+        }
+        return s.hl3_on;
+    }
+
     // dst must be in UNORDERED_ACCESS; tex_in[ii] / tex_ui[ii] in
     // NON_PIXEL_SHADER_RESOURCE. set = 0..3 (which descriptor set; MFG1).
     static bool ui_apply(stream_state &s, ID3D12GraphicsCommandList *cl, ID3D12Resource *dst,
@@ -14700,8 +15027,13 @@ namespace
         const char *r_from = "SRScale";
         if (s.sr_scale_pct != 0u)
         {
-            s.sr_w = (UINT)(((unsigned long long)s.width  * s.sr_scale_pct) / 100ull) & ~7u;
-            s.sr_h = (UINT)(((unsigned long long)s.height * s.sr_scale_pct) / 100ull) & ~7u;
+            // DR1: with dynamic resolution the textures are made at the top of
+            // its range, so the scale can move up as well as down.
+            unsigned apct = s.sr_scale_pct;
+            if (g_dr_on.load() != 0 && (unsigned)g_dr_max.load() > apct) apct = (unsigned)g_dr_max.load();
+            g_dr_alloc.store((int)apct);
+            s.sr_w = (UINT)(((unsigned long long)s.width  * apct) / 100ull) & ~7u;
+            s.sr_h = (UINT)(((unsigned long long)s.height * apct) / 100ull) & ~7u;
         }
         else
         {
@@ -16222,7 +16554,9 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
     }
 
     // want_fmt, not a constant. This is DEFECT H's actual repair.
-    const HRESULT rb = sc->ResizeBuffers(2, buf_w, buf_h, want_fmt, 0);
+    UINT rflags = 0;
+    { std::lock_guard<std::mutex> lk(st().cs); rflags = st().chain_flags; }   // LP1: same flags as at creation
+    const HRESULT rb = sc->ResizeBuffers(2, buf_w, buf_h, want_fmt, rflags);
 
     // ---- V69: A COMPOSITION SWAPCHAIN NEEDS A COMMIT AFTER A RESIZE ----
     //
@@ -17693,9 +18027,58 @@ void ui_set_sr_request(int quality, int preset, int scale)
 // driver mode engaged once on the game's first frame, and the DLAA lever moves
 // R before the feature exists. Rather than pretend either is a toggle, the
 // panel edits the file and says the next launch will pick it up.
+// SL1: panel writes are COALESCED. A slider used to rewrite mgpu.ini on every
+// notch while dragged (~30 writes in 2 s on the Limiter). Now the value is
+// queued and written once the key has stood still for 400 ms (bridge thread,
+// stream_poll; everything left is flushed at shutdown). Readers of these keys
+// (ini_read_sr_int, the mirror) see the queued value at once, so nothing
+// reads the old number in between.
+namespace {
+struct ini_pend { char key[48]; int v; ULONGLONG t; bool used; };
+ini_pend g_ini_pend[32];
+std::mutex g_ini_pend_mx;
+}
+static bool ini_pending_get(const char *key, int &out)
+{
+    std::lock_guard<std::mutex> lk(g_ini_pend_mx);
+    for (const ini_pend &p : g_ini_pend)
+        if (p.used && strcmp(p.key, key) == 0) { out = p.v; return true; }
+    return false;
+}
+void ini_flush_pending(bool all)
+{
+    ini_pend todo[32];
+    unsigned n = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_ini_pend_mx);
+        const ULONGLONG now = GetTickCount64();
+        for (ini_pend &p : g_ini_pend)
+            if (p.used && (all || now - p.t >= 400ull)) { todo[n++] = p; p.used = false; }
+    }
+    for (unsigned i = 0; i < n; ++i) (void)ini_write_int(todo[i].key, todo[i].v);
+}
 bool ui_ini_write(const char *key, int value)
 {
-    const bool ok = ini_write_int(key, value);
+    if (key != nullptr && strlen(key) < sizeof(g_ini_pend[0].key))
+    {
+        bool queued = false;
+        {
+            std::lock_guard<std::mutex> lk(g_ini_pend_mx);
+            ini_pend *slot = nullptr;
+            for (ini_pend &p : g_ini_pend)
+                if (p.used && strcmp(p.key, key) == 0) { slot = &p; break; }
+            if (slot == nullptr)
+                for (ini_pend &p : g_ini_pend) if (!p.used) { slot = &p; break; }
+            if (slot != nullptr)
+            {
+                snprintf(slot->key, sizeof slot->key, "%s", key);
+                slot->v = value; slot->t = GetTickCount64(); slot->used = true;
+                queued = true;
+            }
+        }
+        if (queued) { ini_mirror_set(key, value); return true; }
+    }
+    const bool ok = ini_write_int(key, value);   // queue full: write now, as before
     if (ok) ini_mirror_set(key, value);
     return ok;
 }
@@ -17914,6 +18297,10 @@ int  ui_scaler()               { return mgpu::scaler::mode(); }
 void ui_set_scaler(int m)      { mgpu::scaler::set_mode(m); (void)ui_ini_write("Scaler", mgpu::scaler::mode()); }
 int  ui_scaler_sharp()         { return mgpu::scaler::sharpness(); }
 void ui_set_scaler_sharp(int p){ mgpu::scaler::set_sharpness(p); (void)ui_ini_write("ScalerSharpness", mgpu::scaler::sharpness()); }
+int  ui_scaler_mas()           { return mgpu::scaler::mas(); }
+void ui_set_scaler_mas(int on) { mgpu::scaler::set_mas(on); (void)ui_ini_write("ScalerMAS", mgpu::scaler::mas()); }
+int  ui_scaler_mas_motion()    { return mgpu::scaler::mas_motion(); }
+void ui_set_scaler_mas_motion(int p) { mgpu::scaler::set_mas_motion(p); (void)ui_ini_write("ScalerMASMotion", mgpu::scaler::mas_motion()); }
 bool ui_scaler_active()        { return g_sc_active.load(); }
 // PP1 (PanelOverPicture support, as upstream 0.4.0 has them, plus the scaled case)
 bool dcomp_visual_rooted()      { return g_dcomp_rooted; }
@@ -18054,6 +18441,7 @@ void ui_set_stopwatch(bool on)
 static int clock_lines(char (*out)[24])
 {
     int n = 0;
+    if (at_hud_line(out[n], 24)) ++n;   // AT1: auto-tune progress (panel is closed while it runs)
     if (ui_clock())
     {
         SYSTEMTIME t{};
@@ -18062,7 +18450,7 @@ static int clock_lines(char (*out)[24])
         if (h == 0) h = 12;
         snprintf(out[n++], 24, "%d:%02d %s", h, t.wMinute, t.wHour < 12 ? "AM" : "PM");
     }
-    if (ui_stopwatch())
+    if (ui_stopwatch() && n < 2)
     {
         const unsigned long long s = (GetTickCount64() - g_sw_t0.load(std::memory_order_relaxed)) / 1000ull;
         const unsigned hh = (unsigned)(s / 3600ull), mm = (unsigned)((s / 60ull) % 60ull), ss = (unsigned)(s % 60ull);
@@ -19433,11 +19821,12 @@ void ui_set_neural(bool on)
         // nr_ok is NOT cleared: the feature handles stay alive so this can be
         // switched back without a 400 ms stall. The consume loop tests `neural`.
         s.neural = on;
+        if (on) { s.nr_first = true; s.fov_first = true; }   // NO1: no stale history from before the pause
         ++s.intensity_edits;
     }
     char l[260];
     snprintf(l, sizeof l, "[MGPU][P6.4] neural stage %s (handles kept alive either way)",
-             on ? "ON" : "OFF - transport only, the window shows the last neural frame");
+             on ? "ON" : "OFF - the game's own frames are shown (frame generation and scaling carry on)");
     mgpu::diag::info(l);
 }
 
@@ -19747,6 +20136,11 @@ void stream_request()
             s.sf_path.store(ini_read_sr_int("SFPath", -2, 0, 1),
                             std::memory_order_relaxed);
             s.sr_scale_pct = (unsigned)ini_read_sr_int("SRScale", 0, 0, 99);
+            g_dr_on.store(ini_read_sr_int("SRDynamic", 0, 0, 1));            // DR1
+            g_dr_min.store(ini_read_sr_int("SRDynMin", 50, 33, 90));
+            g_dr_max.store(ini_read_sr_int("SRDynMax", 80, 33, 90));
+            g_sm_sens.store(ini_read_sr_int("SRDynSmooth", 2, 0, 3));          // SM1
+            g_dr_pct_x10.store((int)s.sr_scale_pct * 10);                  // starts at SRScale
             g_rs_recon.store(ini_read_sr_int("SRRecon", 1, 0, 1));          // RS1
             g_rs_down.store(ini_read_sr_int("SRDownFilter", 0, 0, 2));
             g_rs_up.store(ini_read_sr_int("SRUpFilter", 0, 0, 2));
@@ -19761,6 +20155,8 @@ void stream_request()
             g_pf_on.store(ini_read_sr_int("PerfLog", 0, 0, 1) != 0);
             mgpu::scaler::set_mode(ini_read_sr_int("Scaler", 0, 0, 3));                 // SC1
             mgpu::scaler::set_sharpness(ini_read_sr_int("ScalerSharpness", 50, 0, 100));
+            mgpu::scaler::set_mas(ini_read_sr_int("ScalerMAS", 0, 0, 1));              // MAS1
+            mgpu::scaler::set_mas_motion(ini_read_sr_int("ScalerMASMotion", 30, 0, 100));
 
             if (s.sr_on != 0u && s.passes != 1u)
             {
@@ -20927,6 +21323,847 @@ unsigned long long game_effects_frames()
 // must not re-pick a different buffer on its own after this - the ring is laid out.
 bool stream_producing() { return str().produced_a.load(std::memory_order_acquire) != 0ull; }
 
+// ===========================================================================
+// TF1: target frame rate - a game frame cap plus an automatically chosen
+// frame generation multiplier (NVIDIA DLSS FG, FrameGen=4).
+//
+// One switch (FGAuto) turns it on. FGTarget is the output rate wanted; the
+// multiplier is picked from the game's MEASURED real frame rate as
+// floor(target / real fps), within 2x .. the card's limit, so the output
+// stays at or just under the target. FGCapOn/FGCap optionally cap the game
+// itself, here on its render thread just before it presents (the same place
+// a frame limiter like RTSS waits). With the cap on, real fps holds at the
+// cap and the multiplier follows target/cap; if the game cannot hold the
+// cap, the measured rate drops and the multiplier rises to compensate.
+// A change is applied only after the new pick has stood for 1.5 s, so a
+// brief dip never flips it back and forth.
+// ===========================================================================
+static std::atomic<int>   g_tf_on{0}, g_tf_target{240}, g_tf_cap_on{0}, g_tf_cap{40};
+static std::atomic<int>   g_tf_pick{0};          // multiplier TF1 last applied, 0 = none yet
+static std::atomic<int>   g_tf_real_x10{0};      // measured game fps x10
+static std::atomic<void*> g_tf_game_queue{nullptr};
+static std::atomic<bool>  g_tf_loaded{false};
+// TF4: the overload brake. The frames actually shown are compared with what
+// the multiplier should give (game fps x multiplier). Short by more than 8%
+// over 2 s = the neural card cannot keep up.
+static std::atomic<int>   g_tf_brake{1};          // FGBrake
+static std::atomic<int>   g_tf_out_x10{0}, g_tf_exp_x10{0};   // shown / expected fps x10 (last 2 s)
+static std::atomic<int>   g_tf_short{0};          // 1 = shown is short of expected
+static std::atomic<int>   g_tf_ceiling{0};        // brake's multiplier ceiling, 0 = none
+static std::atomic<long long> g_tf_ceiling_until{0};   // QPC
+static std::atomic<int>   g_tf_retry_s{0};        // seconds until the ceiling lifts (for the panel)
+
+// ===========================================================================
+// AT1: auto-tune. Tries Limiter x multiplier pairs on the running game and
+// keeps the one that gives the highest output up to a target with the FEWEST
+// generated frames (more real frames = less delay, fewer made-up pixels).
+//
+// A pair passes when, over 4 s of play after 2 s to settle:
+//   - the game holds the Limiter (real fps >= 97% of it),
+//   - NVIDIA FG runs the asked multiplier the whole time, and
+//   - the frames shown are >= 96% of Limiter x multiplier.
+// Pairs are tried from 2x up (Limiter = target / multiplier, at least 30 fps);
+// the first pair that passes wins. If none does, the target drops by 10% and
+// the round repeats (4 rounds). The target starts at FGTarget when target
+// frame rate is on, otherwise at the monitor's refresh rate.
+//
+// It only counts time with the game in front and the MGPU panel closed; it
+// waits (and restarts the pair) otherwise. It never writes the ini until the
+// end: the result is applied as Limiter on at the pair's rate and that
+// multiplier (target frame rate switched off). Cancel or failure = nothing
+// changed. Game render thread (tf_game_frame), 4 times a second.
+// ===========================================================================
+static std::atomic<int>  g_at_req{0};        // UI -> game thread: 1 start, 2 cancel
+static std::atomic<int>  g_at_state{0};      // 0 idle, 1 waiting, 2 testing, 3 done, 4 failed, 5 cancelled
+static std::atomic<int>  g_at_cap{0};        // the Limiter rate under test (overrides FGCap)
+static std::atomic<int>  g_at_mult{0};       // the multiplier under test
+static std::atomic<int>  g_at_idx{0}, g_at_tested{0};
+static std::atomic<int>  g_at_target{0};     // this round's target output
+static std::atomic<int>  g_at_res_cap{0}, g_at_res_mult{0};
+static std::atomic<int>  g_at_res_out_x10{0};
+static std::atomic<int>  g_at_monitor_hz{0};   // panel -> tuner (the monitor's refresh)
+static bool at_active() { const int st = g_at_state.load(std::memory_order_relaxed); return st == 1 || st == 2; }
+
+void ui_at_start(int monitor_hz) { g_at_monitor_hz.store(monitor_hz); g_at_req.store(1); }
+void ui_at_cancel()              { g_at_req.store(2); }
+int  ui_at_state()               { return g_at_state.load(); }
+void ui_at_progress(int *cap, int *mult, int *tested, int *target)
+{
+    if (cap) *cap = g_at_cap.load();
+    if (mult) *mult = g_at_mult.load();
+    if (tested) *tested = g_at_tested.load();
+    if (target) *target = g_at_target.load();
+}
+void ui_at_result(int *cap, int *mult, float *out)
+{
+    if (cap) *cap = g_at_res_cap.load();
+    if (mult) *mult = g_at_res_mult.load();
+    if (out) *out = (float)g_at_res_out_x10.load() / 10.0f;
+}
+// Present path: one line for the clock box while tuning ("" = none).
+static bool at_hud_line(char *out, size_t n)
+{
+    const int st = g_at_state.load(std::memory_order_relaxed);
+    if (st == 1) { snprintf(out, n, "Auto-tune: waiting"); return true; }
+    if (st == 2) { snprintf(out, n, "Tune %d x%d (%d)", g_at_cap.load(), g_at_mult.load(), g_at_tested.load() + 1); return true; }
+    return false;
+}
+
+static void tf_load()
+{
+    if (g_tf_loaded.load(std::memory_order_acquire)) return;
+    g_tf_on.store(ini_read_sr_int("FGAuto", 0, 0, 1));
+    g_tf_target.store(ini_read_sr_int("FGTarget", 240, 30, 480));
+    g_tf_cap_on.store(ini_read_sr_int("FGCapOn", 0, 0, 1));
+    g_tf_cap.store(ini_read_sr_int("FGCap", 40, 20, 240));
+    g_tf_brake.store(ini_read_sr_int("FGBrake", 1, 0, 1));
+    g_tf_loaded.store(true, std::memory_order_release);
+}
+
+bool ui_tf_on()                { tf_load(); return g_tf_on.load() != 0; }
+static void tf_apply_mult(unsigned m);
+void ui_set_tf_on(bool on)
+{
+    tf_load();
+    g_tf_on.store(on ? 1 : 0);
+    g_tf_pick.store(0);
+    (void)ui_ini_write("FGAuto", on ? 1 : 0);
+    // Off: back to the multiplier the user chose by hand.
+    if (!on) tf_apply_mult((unsigned)ini_read_sr_int("FGMultiplier", 2, 2, 6));
+}
+int  ui_tf_target()            { tf_load(); return g_tf_target.load(); }
+void ui_set_tf_target(int v)   { if (v < 30) v = 30; if (v > 480) v = 480; g_tf_target.store(v); (void)ui_ini_write("FGTarget", v); }
+bool ui_tf_cap_on()            { tf_load(); return g_tf_cap_on.load() != 0; }
+void ui_set_tf_cap_on(bool on) { g_tf_cap_on.store(on ? 1 : 0); (void)ui_ini_write("FGCapOn", on ? 1 : 0); }
+int  ui_tf_cap()               { tf_load(); return g_tf_cap.load(); }
+void ui_set_tf_cap(int v)      { if (v < 20) v = 20; if (v > 240) v = 240; g_tf_cap.store(v); (void)ui_ini_write("FGCap", v); }
+float ui_tf_real_fps()         { return (float)g_tf_real_x10.load() / 10.0f; }
+bool ui_tf_brake_on()          { tf_load(); return g_tf_brake.load() != 0; }
+void ui_set_tf_brake_on(bool on){ g_tf_brake.store(on ? 1 : 0); if (!on) g_tf_ceiling.store(0); (void)ui_ini_write("FGBrake", on ? 1 : 0); }
+float ui_tf_out_fps()          { return (float)g_tf_out_x10.load() / 10.0f; }
+float ui_tf_expected_fps()     { return (float)g_tf_exp_x10.load() / 10.0f; }
+bool ui_tf_short()             { return g_tf_short.load() != 0; }
+int  ui_tf_ceiling()           { return g_tf_ceiling.load(); }
+int  ui_tf_retry_s()           { return g_tf_retry_s.load(); }
+int  ui_tf_pick()              { return g_tf_pick.load(); }
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+// Game render thread: wait until `deadline` (QPC ticks). A high-resolution
+// waitable timer covers all but the last ~0.6 ms, which is spun.
+static void tf_wait_until(LONGLONG deadline, LONGLONG freq)
+{
+    static thread_local HANDLE t = nullptr;
+    static thread_local bool tried = false;
+    if (!tried)
+    {
+        tried = true;
+        t = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (t == nullptr) t = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+    }
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    const LONGLONG spin = freq * 6 / 10000;   // 0.6 ms
+    if (t != nullptr && deadline - now.QuadPart > spin)
+    {
+        const LONGLONG ticks100ns = (deadline - now.QuadPart - spin) * 10000000LL / freq;
+        LARGE_INTEGER due{}; due.QuadPart = -ticks100ns;
+        if (SetWaitableTimer(t, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(t, 100);
+    }
+    for (;;)
+    {
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart >= deadline) break;
+        YieldProcessor();
+    }
+}
+
+// Applies a multiplier without writing the ini (the user's own choice stays
+// in FGMultiplier for when TF1 is switched off).
+static void tf_apply_mult(unsigned m)
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (m != s.fg_mult) s.fsr_frame_id += 2ull;   // as ui_set_fg_mult: NVIDIA resets on the change
+    s.fg_mult = m;
+}
+
+// QD1: queue guard - panel side (live).
+bool ui_qd_on()
+{
+    int v = g_qd_on.load();
+    if (v < 0) { v = ini_read_sr_int("QueueGuard", 0, 0, 1); g_qd_on.store(v); }
+    return v != 0;
+}
+void ui_set_qd_on(bool on) { g_qd_on.store(on ? 1 : 0); (void)ui_ini_write("QueueGuard", on ? 1 : 0); }
+
+// ---- DR1: dynamic neural resolution - panel side ----
+bool ui_dr_on()           { return g_dr_on.load() != 0; }
+void ui_set_dr_on(bool on)
+{
+    g_dr_on.store(on ? 1 : 0);
+    if (on && g_dr_pct_x10.load() <= 0) g_dr_pct_x10.store(ini_read_sr_int("SRScale", 67, 33, 90) * 10);
+    (void)ui_ini_write("SRDynamic", on ? 1 : 0);
+}
+int  ui_dr_min()          { return g_dr_min.load(); }
+void ui_set_dr_min(int v) { if (v < 33) v = 33; if (v > 90) v = 90; g_dr_min.store(v); (void)ui_ini_write("SRDynMin", v); }
+int  ui_dr_max()          { return g_dr_max.load(); }
+void ui_set_dr_max(int v) { if (v < 33) v = 33; if (v > 90) v = 90; g_dr_max.store(v); (void)ui_ini_write("SRDynMax", v); }
+float ui_dr_now()         { return (float)g_dr_pct_x10.load() / 10.0f; }
+int  ui_dr_alloc()        { return g_dr_alloc.load(); }
+static bool dr_at_min()   { return g_dr_pct_x10.load() <= g_dr_min.load() * 10; }
+
+// DR3: one fresh, clean 2 s window of shown vs expected (see the exclusion
+// gate in tf_game_frame). Returns true when the scale moved, so the caller
+// starts a new window. Game render thread.
+//
+// Two signals:
+//   delivery (primary): frames shown / (game frames counted x multiplier).
+//   busy (early warning, GT1): the share of each second the neural card spent
+//     executing the mod's work, from GPU timestamps, overlaps counted once.
+// Rules:
+//   delivery < 92% -> 4% down; < 96% -> 2% down.
+//   delivery fine but busy >= 98% two windows running -> 2% down before frames drop.
+//   delivery >= 98.5% and busy < 90% (or unknown) -> 2% up, after a wait that
+//     doubles when a probe fails (8 s .. 240 s); busy < 80% keeps the wait at 8 s.
+//   Effectiveness: if two reductions in a row do not lift delivery by at least
+//     2 points, NR is not what is short - the scale goes back to where the
+//     streak started, reductions stop for 60 s (or until the multiplier or the
+//     Limiter changes), and the overload brake may lower the multiplier.
+// SM1: the smoothness thresholds for SRDynSmooth 1 relaxed / 2 normal / 3 strict.
+// Spacing sd as a share of the average gap, and hitches (gaps over twice the
+// average) per 2 s window. Normal sits between the user's own runs: 40 x 4
+// with the Limiter (smooth) read 0.12-0.20 and 0-1 hitch per 2 s; the uneven
+// runs read 0.24-0.42 and 4-14.
+static void sm_thresholds(int sens, double *rel, int *hits)
+{
+    switch (sens)
+    {
+    case 1:  *rel = 0.35; *hits = 6; break;
+    case 3:  *rel = 0.20; *hits = 2; break;
+    default: *rel = 0.25; *hits = 3; break;
+    }
+}
+
+static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, int mult, int cap,
+                         double sd_rel, int hits)
+{
+    if (g_dr_on.load() == 0 || expct <= 0.0 || g_dr_pct_x10.load() <= 0) return false;
+    static LONGLONG up_at = 0, last_up = 0, last_down = 0, ineff_until = 0;
+    static int up_hold_s = 8;
+    static int streak = 0, streak_start = 0, no_effect = 0, hot = 0;
+    static double ratio_before = -1.0;
+    static double expct_before = -1.0;           // DR4: the target the last verdict was taken at
+    static double sd_before = -1.0;              // SM1: spacing before a smoothness-led reduction
+    static int hits_before = 0;
+    // SM1: is the spacing uneven by the user's chosen standard?
+    const int sens = g_sm_sens.load();
+    double thr_rel = 0.25; int thr_hits = 3;
+    sm_thresholds(sens, &thr_rel, &thr_hits);
+    const bool have_sm = sens != 0 && sd_rel >= 0.0;
+    const bool uneven = have_sm && (sd_rel > thr_rel || hits >= thr_hits);
+    const bool steady = !have_sm || (sd_rel < thr_rel * 0.8 && hits < thr_hits);
+    static int last_mult = 0, last_cap = -1;
+    const int lo = g_dr_min.load() * 10;
+    int hi = g_dr_max.load() * 10;
+    const int al = g_dr_alloc.load() * 10;
+    if (al > 0 && hi > al) hi = al;               // cannot go above the textures
+    const int cur = g_dr_pct_x10.load();
+    const double ratio = out / expct;
+    double busy = -1.0;
+    (void)mgpu::gputime::busy(&busy);
+    // SM2: uneven spacing is only NR's doing when NR fills the card. Measured
+    // (257577c9): 67% -> 50% in eight spacing-led steps with the card 51-64%
+    // busy and the spread unchanged (25-29% of the gap at every step) - the
+    // unevenness came from the game and the present path, and each step just
+    // cost detail. Below 75% busy, spacing neither lowers NR nor blocks a try up.
+    const bool nr_loaded = busy < 0.0 || busy >= 0.75;
+    static LONGLONG sm_said_at = 0;
+    char l[320];
+
+    // A new multiplier or Limiter is a new situation: forget the verdict.
+    if (mult != last_mult || cap != last_cap)
+    {
+        last_mult = mult; last_cap = cap;
+        streak = 0; no_effect = 0; ratio_before = -1.0; sd_before = -1.0; hot = 0;
+        if (g_dr_ineff.exchange(0) != 0)
+            mgpu::diag::info("[MGPU][DR3] multiplier or Limiter changed - NR scaling allowed again.");
+        ineff_until = 0;
+    }
+    if (g_dr_ineff.load() != 0 && now >= ineff_until) g_dr_ineff.store(0);
+
+    // Did the last reduction help? Judged by what triggered it: delivery for a
+    // short window, spacing (SM1) for an uneven one.
+    if (ratio_before >= 0.0 || sd_before >= 0.0)
+    {
+        // DR4: when the target itself moved (the game fell below the Limiter),
+        // the ratio moves with it and says nothing about the step: no verdict
+        // either way (the count stands).
+        const bool same_target = expct_before <= 0.0 || fabs(expct - expct_before) <= expct_before * 0.03;
+        if (same_target)
+        {
+            bool helped;
+            if (ratio_before >= 0.0) helped = ratio - ratio_before >= 0.02;
+            else helped = sd_rel >= 0.0 && (sd_rel <= sd_before * 0.85 || steady ||
+                                            (hits_before >= 4 && hits * 2 <= hits_before));
+            if (!helped) ++no_effect; else no_effect = 0;
+        }
+        ratio_before = -1.0; sd_before = -1.0; expct_before = -1.0;
+        if (no_effect >= 2)
+        {
+            char bb[24] = "unknown";
+            if (busy >= 0.0) snprintf(bb, sizeof bb, "%.0f%%", busy * 100.0);
+            snprintf(l, sizeof l, "[MGPU][DR3] FG/PRESENT BOTTLENECK SUSPECTED - NR SCALING INEFFECTIVE: %d "
+                     "reductions (%.1f%% -> %.1f%%) left shown at %.0f of %.0f fps (neural card busy %s). Scale "
+                     "restored to %.1f%%; held for 60 s. Lower the multiplier or the Limiter (the overload brake "
+                     "may now do it).", streak, streak_start / 10.0, cur / 10.0, out, expct, bb, streak_start / 10.0);
+            mgpu::diag::warn(l);
+            g_dr_pct_x10.store(streak_start > 0 ? streak_start : cur);
+            g_dr_ineff.store(1);
+            ineff_until = now + freq * 60;
+            streak = 0; no_effect = 0;
+            return true;
+        }
+    }
+
+    int next = cur;
+    bool reduction = false, by_spacing = false;
+    const char *why = "";
+    if (ratio < 0.96 && !nr_loaded)
+    {
+        // DR4: frames are missing but the neural card has room - the shortfall
+        // is in frame generation / presentation, which a lower NR does not
+        // touch. Measured (710af332): 67% -> 50% in 10 s at 55 x 4 with the
+        // card 58-66% busy, and delivery stayed short at 50%.
+        if (sm_said_at == 0 || now - sm_said_at > freq * 60)
+        {
+            sm_said_at = now;
+            snprintf(l, sizeof l, "[MGPU][DR3] shown %.0f of %.0f fps with the neural card only %.0f%% busy - "
+                     "the output side is the limit, not NR; resolution kept at %.1f%%. A lower Limiter or "
+                     "multiplier is what helps here.", out, expct, busy * 100.0, cur / 10.0);
+            mgpu::diag::info(l);
+        }
+        return false;
+    }
+    else if (ratio < 0.96)
+    {
+        if (g_dr_ineff.load() != 0) return false;  // known: not NR - hold
+        next = cur - (ratio < 0.92 ? 40 : 20);
+        reduction = true; why = "short";
+        hot = 0;
+    }
+    else if (uneven && !nr_loaded)
+    {
+        // SM2: not NR - keep the resolution (said at most once a minute).
+        if (sm_said_at == 0 || now - sm_said_at > freq * 60)
+        {
+            sm_said_at = now;
+            snprintf(l, sizeof l, "[MGPU][DR3] uneven spacing (sd %.0f%% of the gap, %d hitch(es)) with the neural "
+                     "card only %.0f%% busy - not NR, resolution kept at %.1f%%.",
+                     sd_rel * 100.0, hits, busy * 100.0, cur / 10.0);
+            mgpu::diag::info(l);
+        }
+        return false;
+    }
+    else if (uneven)
+    {
+        // SM1: every frame arrives, but unevenly - the stutter the user feels.
+        if (g_dr_ineff.load() != 0) return false;
+        next = cur - 20;
+        reduction = true; by_spacing = true; why = "uneven spacing";
+        hot = 0;
+    }
+    else
+    {
+        // SM2: a window that is merely not uneven does not end a streak - only a
+        // steady one does. Before, the in-between windows reset the count, so
+        // the effectiveness check never saw two failed steps in a row.
+        if (steady) { streak = 0; no_effect = 0; }
+        if (busy >= 0.98) ++hot; else hot = 0;
+        if (hot >= 2 && g_dr_ineff.load() == 0)
+        {
+            next = cur - 20; why = "early warning: neural card nearly full"; hot = 0;
+        }
+        else if (ratio >= 0.985 && (steady || !nr_loaded) && now >= up_at && (busy < 0.0 || busy < 0.90))
+            next = cur + 20;
+    }
+    if (last_down != 0 && now - last_down > freq * 120) up_hold_s = 8;   // settled: probe sooner again
+    if (next < lo) next = lo;
+    if (next > hi) next = hi;
+    if (next == cur) return false;
+
+    char bs[24] = "unknown";
+    if (busy >= 0.0) snprintf(bs, sizeof bs, "%.0f%%", busy * 100.0);
+    if (next < cur)
+    {
+        if (last_up != 0 && now - last_up < freq * 6)                       // the probe failed
+            up_hold_s = (up_hold_s * 2 > 240) ? 240 : up_hold_s * 2;
+        last_down = now;
+        up_at = now + freq * up_hold_s;
+        if (reduction)
+        {
+            if (streak == 0) streak_start = cur;
+            ++streak;
+            if (by_spacing) { sd_before = sd_rel; hits_before = hits; }
+            else ratio_before = ratio;
+            expct_before = expct;
+        }
+        snprintf(l, sizeof l, "[MGPU][DR3] neural resolution %.1f%% -> %.1f%% (%s): shown %.0f of %.0f fps, "
+                 "spacing sd %.0f%% of the gap, %d hitch(es), neural card busy %s. Next try up in %d s.",
+                 cur / 10.0, next / 10.0, why, out, expct, sd_rel >= 0.0 ? sd_rel * 100.0 : -1.0, hits, bs, up_hold_s);
+    }
+    else
+    {
+        last_up = now;
+        const int wait_s = (busy >= 0.0 && busy < 0.80) ? 8 : up_hold_s;
+        up_at = now + freq * wait_s;
+        snprintf(l, sizeof l, "[MGPU][DR3] neural resolution %.1f%% -> %.1f%%: headroom (shown %.0f of %.0f fps, "
+                 "spacing sd %.0f%% of the gap, neural card busy %s).", cur / 10.0, next / 10.0, out, expct,
+                 sd_rel >= 0.0 ? sd_rel * 100.0 : -1.0, bs);
+    }
+    g_dr_pct_x10.store(next);
+    mgpu::diag::info(l);
+    return true;
+}
+
+// SM1: panel - sensitivity and the last window's spacing.
+int  ui_sm_sens()           { return g_sm_sens.load(); }
+void ui_set_sm_sens(int v)  { if (v < 0) v = 0; if (v > 3) v = 3; g_sm_sens.store(v); (void)ui_ini_write("SRDynSmooth", v); }
+bool ui_sm_spacing(float *sd_ms, float *sd_pct, int *hits)
+{
+    const int us = g_sm_sd_us.load(), rel = g_sm_sd_x1000.load();
+    if (us < 0 || rel < 0) return false;
+    if (sd_ms) *sd_ms = (float)us / 1000.0f;
+    if (sd_pct) *sd_pct = (float)rel / 10.0f;
+    if (hits) *hits = g_sm_hits.load();
+    return true;
+}
+
+// DR3: panel readouts.
+float ui_dr_busy() { double b = -1.0; return mgpu::gputime::busy(&b) ? (float)(b * 100.0) : -1.0f; }
+const char *ui_dr_status()
+{
+    if (g_dr_ineff.load() != 0) return "FG/present is the limit - lowering NR does not help. Lower the multiplier or Limiter.";
+    const char *w = g_dr_skip.load();
+    if (w != nullptr && GetTickCount64() - g_dr_skip_ms.load() < 3000ull) return w;
+    return "";
+}
+
+// AT1: the tuner, 4 times a second from tf_game_frame.
+static void at_end(int st, const char *why)
+{
+    g_at_state.store(st);
+    g_at_cap.store(0);
+    // Back to what was running before (target frame rate re-picks by itself).
+    g_tf_pick.store(0);
+    if (g_tf_on.load() == 0) tf_apply_mult((unsigned)ini_read_sr_int("FGMultiplier", 2, 2, 6));
+    char l[200];
+    snprintf(l, sizeof l, "[MGPU][AT1] auto-tune %s - settings unchanged.", why);
+    mgpu::diag::info(l);
+}
+
+static void at_step(LONGLONG now, LONGLONG freq, double fps)
+{
+    static int phase = 0;              // 0 settle, 1 measure
+    static LONGLONG phase_t = 0;       // when the phase started
+    static unsigned long long p0 = 0;  // present count at measure start
+    static double fps_sum = 0.0;
+    static int fps_n = 0;
+    static bool mult_ok = true;
+    static int round = 0, maxm = 6;
+    static int tgt0 = 0;
+
+    const int req = g_at_req.exchange(0);
+    int st = g_at_state.load();
+    if (req == 2 && (st == 1 || st == 2)) { at_end(5, "cancelled"); return; }
+    if (req == 1 && st != 1 && st != 2)
+    {
+        if (ui_frame_gen() != 4)
+        {
+            g_at_state.store(4);
+            mgpu::diag::warn("[MGPU][AT1] auto-tune needs NVIDIA DLSS frame generation (FrameGen=4) running.");
+            return;
+        }
+        maxm = ui_dlssg_max_mult();
+        if (maxm < 2) maxm = 6;
+        const int hz = g_at_monitor_hz.load();
+        tgt0 = (g_tf_on.load() != 0) ? g_tf_target.load() : (hz >= 60 ? hz : 240);
+        if (tgt0 > 480) tgt0 = 480;
+        round = 0;
+        g_at_target.store(tgt0);
+        g_at_idx.store(0); g_at_tested.store(0);
+        g_at_mult.store(0); g_at_cap.store(0);
+        g_at_state.store(1);
+        st = 1;
+        char l[200];
+        snprintf(l, sizeof l, "[MGPU][AT1] auto-tune started: target %d fps, multipliers 2x-%dx. Play normally; "
+                 "the panel must be closed.", tgt0, maxm);
+        mgpu::diag::info(l);
+    }
+    if (st != 1 && st != 2) return;
+
+    // Only count time with the picture in front and the panel closed.
+    bool ok_now = true;
+    {
+        HWND fg = GetForegroundWindow();
+        DWORD pid = 0;
+        if (fg != nullptr) GetWindowThreadProcessId(fg, &pid);
+        if (pid != GetCurrentProcessId() || g_sc_panel.load()) ok_now = false;
+    }
+    if (ui_frame_gen() != 4) { at_end(4, "stopped: NVIDIA frame generation is no longer running"); return; }
+
+    // Choose the pair for the current index: multiplier 2 + idx, Limiter = target / multiplier.
+    auto load_pair = [&]() -> bool {
+        for (;;)
+        {
+            const int m = 2 + g_at_idx.load();
+            if (m > maxm)
+            {
+                // No pair passed at this target: lower it by 10% and start again.
+                if (++round >= 4) return false;
+                const int was = g_at_target.load();
+                const int t = was * 9 / 10;
+                g_at_target.store(t);
+                g_at_idx.store(0);
+                char l[160];
+                snprintf(l, sizeof l, "[MGPU][AT1] nothing clean at %d fps - trying %d fps.", was, t);
+                mgpu::diag::info(l);
+                continue;
+            }
+            const int c = g_at_target.load() / m;
+            if (c < 30) { g_at_idx.fetch_add(1); continue; }   // too few real frames for clean generation
+            if (c > 240) { g_at_idx.fetch_add(1); continue; }
+            g_at_mult.store(m); g_at_cap.store(c);
+            tf_apply_mult((unsigned)m);
+            return true;
+        }
+    };
+
+    if (st == 1)
+    {
+        if (!ok_now) return;
+        if (!load_pair()) { at_end(4, "found no pair that runs cleanly"); return; }
+        g_at_state.store(2);
+        phase = 0; phase_t = now;
+        return;
+    }
+
+    // st == 2: testing
+    if (!ok_now) { phase = 0; phase_t = now; return; }   // paused: settle again when back
+    if (phase == 0)
+    {
+        if (now - phase_t < freq * 2) return;   // 2 s to settle (multiplier change, cap re-anchor)
+        phase = 1; phase_t = now;
+        p0 = g_hud_present_count.load(std::memory_order_relaxed);
+        fps_sum = 0.0; fps_n = 0; mult_ok = true;
+        return;
+    }
+    fps_sum += fps; ++fps_n;
+    if (ui_fg_mult_running() != g_at_mult.load()) mult_ok = false;
+    if (now - phase_t < freq * 4) return;      // 4 s of measuring
+
+    const double dt = (double)(now - phase_t) / (double)freq;
+    const double out = (double)(g_hud_present_count.load(std::memory_order_relaxed) - p0) / dt;
+    const double real = (fps_n > 0) ? fps_sum / fps_n : 0.0;
+    const int c = g_at_cap.load(), m = g_at_mult.load();
+    const double expct = (double)c * (double)m;
+    const bool holds = real >= (double)c * 0.97;
+    const bool shows = out >= expct * 0.96;
+    const bool pass = holds && shows && mult_ok;
+    g_at_tested.fetch_add(1);
+    {
+        char l[260];
+        snprintf(l, sizeof l, "[MGPU][AT1] %d fps x %dx: game %.1f fps%s, shown %.0f of %.0f fps%s%s -> %s",
+                 c, m, real, holds ? "" : " (cannot hold the Limiter)", out, expct,
+                 shows ? "" : " (neural card short)", mult_ok ? "" : " (multiplier not reached)",
+                 pass ? "PASS" : "fail");
+        mgpu::diag::info(l);
+    }
+    if (pass)
+    {
+        g_at_res_cap.store(c); g_at_res_mult.store(m); g_at_res_out_x10.store((int)(out * 10.0 + 0.5));
+        // Apply: Limiter on at c, multiplier m, target frame rate off.
+        g_at_state.store(3);
+        g_at_cap.store(0);
+        if (g_tf_on.load() != 0) { g_tf_on.store(0); (void)ui_ini_write("FGAuto", 0); }
+        g_tf_pick.store(0);
+        g_tf_cap.store(c);   (void)ui_ini_write("FGCap", c);
+        g_tf_cap_on.store(1); (void)ui_ini_write("FGCapOn", 1);
+        tf_apply_mult((unsigned)m); (void)ui_ini_write("FGMultiplier", m);
+        char l[220];
+        snprintf(l, sizeof l, "[MGPU][AT1] auto-tune done after %d test(s): Limiter %d fps x %dx = %.0f fps shown. "
+                 "Applied (Limiter on, target frame rate off).", g_at_tested.load(), c, m, out);
+        mgpu::diag::info(l);
+        return;
+    }
+    g_at_idx.fetch_add(1);
+    if (!load_pair()) { at_end(4, "found no pair that runs cleanly"); return; }
+    phase = 0; phase_t = now;
+}
+
+// Once per game frame, on the game's render thread, before any lock.
+static void tf_game_frame()
+{
+    tf_load();
+    static LONGLONG freq = 0;
+    if (freq == 0) { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); freq = f.QuadPart ? f.QuadPart : 1; }
+    LARGE_INTEGER q{};
+    QueryPerformanceCounter(&q);
+    LONGLONG now = q.QuadPart;
+    const bool on = g_tf_on.load(std::memory_order_relaxed) != 0;
+
+    // ---- the cap ----
+    static LONGLONG next = 0;
+    const bool at_on = at_active() && g_at_cap.load(std::memory_order_relaxed) > 0;   // AT1
+    if (at_on || g_tf_cap_on.load(std::memory_order_relaxed) != 0)   // TF3: independent of FGAuto
+    {
+        const int cap = at_on ? g_at_cap.load(std::memory_order_relaxed) : g_tf_cap.load(std::memory_order_relaxed);
+        const LONGLONG interval = freq / (cap > 0 ? cap : 1);
+        if (next == 0 || now > next + interval) next = now;    // first frame, or late: re-anchor, no wait
+        else if (now < next) { tf_wait_until(next, freq); QueryPerformanceCounter(&q); now = q.QuadPart; }
+        next += interval;
+    }
+    else next = 0;
+
+    // ---- QD1: queue guard - do not run ahead of the neural card ----
+    {
+        int qd = g_qd_on.load(std::memory_order_relaxed);
+        if (qd < 0) { qd = ini_read_sr_int("QueueGuard", 0, 0, 1); g_qd_on.store(qd); }
+        // Only a fresh reading counts: a stopped or stalled bridge must never
+        // slow the game (older than 50 ms = ignored).
+        const bool fresh = GetTickCount64() - g_nr_backlog_ms.load(std::memory_order_relaxed) < 50ull;
+        if (qd != 0 && fresh && g_nr_backlog.load(std::memory_order_relaxed) >= 2)
+        {
+            // Wait in 0.5 ms steps until the neural stage has taken a frame,
+            // at most 25 ms (a stuck stage must never freeze the game).
+            const LONGLONG t0 = now, step = freq / 2000, cap_t = freq * 25 / 1000;
+            while (g_nr_backlog.load(std::memory_order_relaxed) >= 2 && now - t0 < cap_t &&
+                   GetTickCount64() - g_nr_backlog_ms.load(std::memory_order_relaxed) < 50ull)
+            {
+                tf_wait_until(now + step, freq);
+                QueryPerformanceCounter(&q); now = q.QuadPart;
+            }
+            g_qd_holds.fetch_add(1, std::memory_order_relaxed);
+            g_qd_hold_us.fetch_add((unsigned long long)((now - t0) * 1000000LL / freq), std::memory_order_relaxed);
+            next = 0;   // the Limiter re-anchors after a hold instead of rushing to catch up
+        }
+        static LONGLONG qd_report = 0;
+        if (qd != 0 && (qd_report == 0 || now - qd_report > freq * 30))
+        {
+            const unsigned long long h = g_qd_holds.exchange(0), us = g_qd_hold_us.exchange(0);
+            if (qd_report != 0 && h != 0)
+            {
+                char l[220];
+                snprintf(l, sizeof l, "[MGPU][QD1] last 30 s: held the game %llu time(s), %.1f ms on average - the "
+                         "neural card was 2+ frames behind. Many holds = the Limiter is set above what it can take.",
+                         h, (double)us / 1000.0 / (double)h);
+                mgpu::diag::info(l);
+            }
+            qd_report = now;
+        }
+    }
+
+    // ---- the measured real frame rate (after the cap) ----
+    static LONGLONG last = 0;
+    static double ema_ms = 0.0;
+    static unsigned long long game_frames = 0;   // DR3: counted, for expected output
+    static double max_dt_ms = 0.0;               // DR3: longest game frame since the last check
+    ++game_frames;
+    if (last != 0)
+    {
+        const double dt = (double)(now - last) * 1000.0 / (double)freq;
+        if (dt > max_dt_ms) max_dt_ms = dt;
+        if (dt > 0.0 && dt < 500.0) ema_ms = (ema_ms <= 0.0) ? dt : ema_ms * 0.95 + dt * 0.05;
+    }
+    last = now;
+    if (ema_ms > 0.0) g_tf_real_x10.store((int)(10000.0 / ema_ms + 0.5), std::memory_order_relaxed);
+
+    // ---- checked 4x a second from here on ----
+    static LONGLONG next_check = 0, cand_t = 0;
+    static int cand = 0;
+    if (ema_ms <= 0.0 || now < next_check) return;
+    next_check = now + freq / 4;
+    const double fps = 1000.0 / ema_ms;
+    at_step(now, freq, fps);   // AT1
+
+    // ---- TF4: shown vs expected, over the last 2 s ----
+    // Nine samples, 0.25 s apart = eight intervals, 2 s (GT2; was 1.75 s). Only judged while the picture is shown
+    // (this process in front, MGPU panel closed), NVIDIA FG generating, and the
+    // multiplier and game rate steady across the window - so alt-tab, loading
+    // screens, the panel and a multiplier change never count as overload.
+    static unsigned long long smp_cnt[9] = {};
+    static LONGLONG smp_t[9] = {};
+    static int smp_m[9] = {};
+    static double smp_fps[9] = {};
+    static unsigned long long smp_frames[9] = {};   // DR3: game frames counted
+    static int smp_cap[9] = {};                      // DR3: Limiter rate in force (0 = off)
+    static unsigned long long smp_sn[9] = {}, smp_ssum[9] = {}, smp_ssq[9] = {}, smp_shit[9] = {};   // SM1
+    static unsigned long long prev_gen = 0;
+    static unsigned smp_n = 0, smp_i = 0;
+    static LONGLONG trip_last = 0;
+    static int hold_s = 30;
+    const int mrun = ui_fg_mult_running();
+    // DR2: NVIDIA FG must be the generator NOW. ui_fg_mult_running() keeps its
+    // last value after frame generation is switched off or to AMD, and a
+    // window judged against it read "shown 40 of 160" as an overload.
+    bool valid_now = (mrun >= 2) && ui_frame_gen() == 4;
+    {
+        HWND fg = GetForegroundWindow();
+        DWORD pid = 0;
+        if (fg != nullptr) GetWindowThreadProcessId(fg, &pid);
+        if (pid != GetCurrentProcessId() || g_sc_panel.load()) valid_now = false;
+    }
+    // DR3: temporary causes that have nothing to do with GPU load. Any of
+    // them throws the window away (a fresh 2 s starts), so a stall is never
+    // read as "the neural card can't keep up".
+    {
+        const char *why = nullptr;
+        const double gap_ms = (double)g_pres_max_gap.exchange(0, std::memory_order_relaxed) * 1000.0 / (double)freq;
+        const double game_ms = max_dt_ms;
+        max_dt_ms = 0.0;
+        const unsigned long long gen = g_hud_gen_count.load(std::memory_order_relaxed);
+        // SM1: spacing since the last check - taken every tick, so a skipped
+        // window never leaks its stalls into the next one.
+        const unsigned long long sn = g_sm_n.exchange(0, std::memory_order_relaxed);
+        const unsigned long long ssum = g_sm_sum.exchange(0, std::memory_order_relaxed);
+        const unsigned long long ssq = g_sm_sq.exchange(0, std::memory_order_relaxed);
+        const unsigned long long shit = g_sm_hit.exchange(0, std::memory_order_relaxed);
+        const bool gen_moved = gen != prev_gen;
+        prev_gen = gen;
+        const int cap_now = at_on ? g_at_cap.load() : (g_tf_cap_on.load() != 0 ? g_tf_cap.load() : 0);
+        if (!valid_now) why = "not in front, panel open or NVIDIA FG not running";
+        else if (g_ui_menu.load(std::memory_order_relaxed)) why = "menu";
+        else if (g_sc_cover != nullptr && !g_sc_cover_shown.load()) why = "picture hidden";
+        else if (game_ms > 100.0 && game_ms > ema_ms * 4.0) why = "game hitch (loading / shader compile)";
+        else if (gap_ms > 60.0) why = "presentation stall";
+        else if (!gen_moved) why = "frame generation paused";
+        else if (smp_n > 0 && smp_cap[(smp_i + 8u) % 9u] != cap_now) why = "Limiter changed";
+        if (why != nullptr)
+        {
+            smp_n = 0;
+            if (valid_now) { g_dr_skip.store(why); g_dr_skip_ms.store(GetTickCount64()); }
+        }
+        else
+        {
+            smp_cnt[smp_i] = g_hud_present_count.load(std::memory_order_relaxed);
+            smp_t[smp_i] = now; smp_m[smp_i] = mrun; smp_fps[smp_i] = fps;
+            smp_frames[smp_i] = game_frames; smp_cap[smp_i] = cap_now;
+            smp_sn[smp_i] = sn; smp_ssum[smp_i] = ssum; smp_ssq[smp_i] = ssq; smp_shit[smp_i] = shit;
+            smp_i = (smp_i + 1u) % 9u;
+            if (smp_n < 9u) ++smp_n;
+        }
+    }
+    if (smp_n == 9u)
+    {
+        const unsigned oldest = smp_i, newest = (smp_i + 8u) % 9u;
+        bool steady = true;
+        double fmin = smp_fps[0], fmax = smp_fps[0];
+        for (unsigned k = 0; k < 9u; ++k)
+        {
+            if (smp_m[k] != smp_m[newest]) steady = false;
+            if (smp_fps[k] < fmin) fmin = smp_fps[k];
+            if (smp_fps[k] > fmax) fmax = smp_fps[k];
+        }
+        if (fmax > fmin * 1.08) steady = false;
+        const double dt = (double)(smp_t[newest] - smp_t[oldest]) / (double)freq;
+        if (steady && dt > 1.0)
+        {
+            const double out = (double)(smp_cnt[newest] - smp_cnt[oldest]) / dt;
+            // DR3: expected = the game frames actually counted in the window
+            // x the multiplier in force for all of them (the window is thrown
+            // away if the multiplier, the Limiter or generation changed).
+            const double expct = (double)(smp_frames[newest] - smp_frames[oldest]) * (double)smp_m[newest] / dt;
+            g_tf_out_x10.store((int)(out * 10.0 + 0.5));
+            g_tf_exp_x10.store((int)(expct * 10.0 + 0.5));
+            const bool shrt = out < expct * 0.92;
+            g_tf_short.store(shrt ? 1 : 0);
+            // DR1: lower the neural resolution first; the multiplier brake only
+            // steps in once the scale is at its floor. Frozen while auto-tuning.
+            // SM1: spacing over the window (the 8 newest samples = the 8 intervals).
+            double sd_rel = -1.0; int hits = 0;
+            {
+                unsigned long long n = 0, sum = 0, sq = 0, h = 0;
+                for (unsigned k = 1; k < 9u; ++k)
+                {
+                    const unsigned j = (oldest + k) % 9u;
+                    n += smp_sn[j]; sum += smp_ssum[j]; sq += smp_ssq[j]; h += smp_shit[j];
+                }
+                if (n >= 16ull)
+                {
+                    const double mean = (double)sum / (double)n;
+                    double var = (double)sq / (double)n - mean * mean;
+                    if (var < 0.0) var = 0.0;
+                    const double sd = std::sqrt(var);
+                    sd_rel = (mean > 0.0) ? sd / mean : -1.0;
+                    hits = (int)h;
+                    g_sm_sd_x1000.store((int)(sd_rel * 1000.0 + 0.5));
+                    g_sm_sd_us.store((int)(sd + 0.5));
+                    g_sm_hits.store(hits);
+                }
+            }
+            if (!at_active() && dr_on_window(now, freq, out, expct, smp_m[newest], smp_cap[newest], sd_rel, hits))
+            { smp_n = 0; return; }
+            // The brake: only with target frame rate on, and only one notch at a time.
+            // DR3: also when lowering NR was found not to help (FG/present bound).
+            if (shrt && on && !at_active() && (g_dr_on.load() == 0 || dr_at_min() || g_dr_ineff.load() != 0) &&
+                g_tf_brake.load() != 0 && ui_frame_gen() == 4 && smp_m[newest] > 2)
+            {
+                const int ceil_m = smp_m[newest] - 1;
+                hold_s = (trip_last != 0 && now - trip_last < freq * 600) ? (hold_s * 2 > 240 ? 240 : hold_s * 2) : 30;
+                trip_last = now;
+                g_tf_ceiling.store(ceil_m);
+                g_tf_ceiling_until.store((long long)(now + freq * hold_s));
+                tf_apply_mult((unsigned)ceil_m);
+                g_tf_pick.store(ceil_m);
+                cand = 0;
+                smp_n = 0;   // judge the new multiplier from scratch
+                char l[260];
+                snprintf(l, sizeof l, "[MGPU][TF4] overload brake: %dx showed %.0f of %.0f fps (game %.1f) - "
+                         "neural card at its limit, now %dx; retry in %d s.",
+                         ceil_m + 1, out, expct, fps, ceil_m, hold_s);
+                mgpu::diag::warn(l);
+            }
+        }
+    }
+    else if (!valid_now) g_tf_short.store(0);
+    {   // the ceiling lifts when its hold runs out
+        const long long until = g_tf_ceiling_until.load();
+        if (g_tf_ceiling.load() != 0)
+        {
+            if (now >= until) { g_tf_ceiling.store(0); g_tf_retry_s.store(0); }
+            else g_tf_retry_s.store((int)((until - now) / freq) + 1);
+        }
+    }
+
+    // ---- the multiplier ----
+    if (!on || at_active()) return;   // AT1 sets it while tuning
+    if (ui_frame_gen() != 4) { g_tf_pick.store(0); return; }   // NVIDIA FG only
+    int maxm = ui_dlssg_max_mult();
+    if (maxm < 2) maxm = 6;
+    int want = (int)((double)g_tf_target.load() * 1.02 / fps);   // 2% slack: 39.8 fps x6 still reads as 240
+    if (want < 2) want = 2;
+    if (want > maxm) want = maxm;
+    if (g_tf_brake.load() != 0 && g_tf_ceiling.load() >= 2 && want > g_tf_ceiling.load())
+        want = g_tf_ceiling.load();   // TF4: held below the limit the brake found
+    // Compared with what is RUNNING (a rearm re-reads the ini), not only with
+    // what TF1 last applied.
+    const int cur = ui_fg_mult();
+    const bool first = (g_tf_pick.load() == 0);
+    if (want == cur && !first) { cand = 0; return; }
+    if (!first && want != cand) { cand = want; cand_t = now; return; }
+    if (!first && now - cand_t < freq * 3 / 2) return;          // must stand 1.5 s (the first pick is immediate)
+    tf_apply_mult((unsigned)want);
+    g_tf_pick.store(want);
+    cand = 0;
+    char l[220];
+    snprintf(l, sizeof l, "[MGPU][TF1] target %d fps: game at %.1f fps%s -> %dx (output ~%.0f fps).",
+             g_tf_target.load(), fps,
+             g_tf_cap_on.load() ? " (capped)" : "", want, fps * want);
+    mgpu::diag::info(l);
+}
+
 void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                               unsigned long long rtv_handle,
                               unsigned long long depth_handle,
@@ -20935,6 +22172,9 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // R246: counted before anything else, armed or not - the deferred startup
     // probe waits on this.
     g_game_effects_frames.fetch_add(1, std::memory_order_relaxed);
+    // TF1: the frame cap and the real-fps measurement, on the game's queue only.
+    if (cmd_queue_v != nullptr && cmd_queue_v == g_tf_game_queue.load(std::memory_order_relaxed))
+        tf_game_frame();
     // ---- REFLEX, BEFORE ANY LOCK, ON THE GAME'S OWN RENDER THREAD ----
     //
     // The first attempt put this in stream_on_present and it crashed on arm.
@@ -20989,6 +22229,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
 
                 if (is_game)
                 {
+                    g_tf_game_queue.store(cmd_queue_v, std::memory_order_relaxed);   // TF1
                     if (!rfx_once)
                     {
                         rfx_once = true;
@@ -23960,6 +25201,24 @@ static DWORD ll_wait_and_latch(stream_state &s, std::unique_lock<std::mutex> &lk
 
 void stream_poll()
 {
+    {   // SL1: write panel settings that have stood still for 400 ms
+        static ULONGLONG last_fl = 0;
+        const ULONGLONG nfl = GetTickCount64();
+        if (nfl - last_fl >= 100ull) { last_fl = nfl; ini_flush_pending(false); mgpu::crashlog::flush_dll_events(); }
+        mgpu::gputime::poll();   // GT1: collect finished lists (cheap)
+        // HD1: every 2 s while HDR is on - is Windows HDR on for the monitor
+        // the picture is on (the cover, the game's window, or the bridge's).
+        static ULONGLONG last_hd = 0;
+        if (mgpu::hdr::enabled() && nfl - last_hd >= 2000ull)
+        {
+            last_hd = nfl;
+            HWND w = (g_sc_cover != nullptr && g_sc_cover_shown.load()) ? g_sc_cover : nullptr;
+            if (w == nullptr && g_dcomp_rooted) w = g_game_hwnd;
+            if (w == nullptr) { std::lock_guard<std::mutex> g(st().cs); w = st().hwnd; }
+            if (w == nullptr) w = g_game_hwnd;
+            mgpu::hdr::poll_display(w);
+        }
+    }
     // SC5: re-check focus and menus for the scaled-picture cover (~10x a second).
     if (g_sc_cover != nullptr)
     {
@@ -24130,7 +25389,11 @@ void stream_poll()
             // input pair and the SR input from R, and stream_sr_release_only
             // frees exactly those. The two are each other's inverse and that
             // is the only reason changing R here is safe.
-            if (s.sr_req_scale   >= 0) s.sr_scale_pct = (unsigned)s.sr_req_scale;
+            if (s.sr_req_scale   >= 0)
+            {
+                s.sr_scale_pct = (unsigned)s.sr_req_scale;
+                g_dr_pct_x10.store((int)s.sr_scale_pct * 10);   // DR1: a new scale is the new start
+            }
             s.sr_req_quality = -1; s.sr_req_preset = -1; s.sr_req_scale = -1;
             (void)osc;
 
@@ -24267,6 +25530,8 @@ void stream_poll()
     // f+1, so a speculative f+1 copy would never be read.
     const unsigned long long poll_backlog =
         (completed_raw > s.consumed) ? (completed_raw - s.consumed) : 0ull;
+    g_nr_backlog.store(poll_backlog > 100ull ? 100 : (int)poll_backlog, std::memory_order_relaxed);   // QD1
+    g_nr_backlog_ms.store(GetTickCount64(), std::memory_order_relaxed);
 
     // OPT2: use the late-latched frame if it has arrived and is fresh enough.
     unsigned long long completed = completed_raw;
@@ -24592,7 +25857,7 @@ void stream_poll()
         const bool mvec_fresh =
             (s.mvec_mode == 3 && s.mvec_bytes2 != 0 &&
              s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u);
-        const bool run_nr = s.nr_ok && newest && s.neural;
+        const bool run_nr = s.nr_ok && newest;   // NO1: also with the neural stage off (pass-through)
         if (!newest) ++s.nr_skipped;
 
         // ---- R26: the unpack goes to the COPY queue, one frame ahead when
@@ -24697,10 +25962,14 @@ void stream_poll()
 
         // REV6: see the bulk path - not while the previous list may still run.
         if (s.nf != nullptr && s.nf->GetCompletedValue() < s.nf_value) return;
+        const bool hl3 = hl3_frame(s, fr_hud);   // HL3: game's own frame, no NR / generation
+        const bool nr_on = s.neural && !hl3;
         HRESULT h = s.na->Reset();
         if (SUCCEEDED(h)) h = s.nl->Reset(s.na, nullptr);
+        int gt_slot = -1;   // GT1
         if (SUCCEEDED(h))
         {
+            gt_slot = mgpu::gputime::begin(s.ndev_b, s.nq, s.nl);
             if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
 
             s.nl->CopyBufferRegion(s.nseal, (UINT64)slot * SEAL_STRIDE,
@@ -25412,9 +26681,35 @@ void stream_poll()
                 // are overridden here and not merged into the subrect maths -
                 // Subrect and SRUpscale are different ideas and mixing them in
                 // one expression is how a run ends up measuring neither.
-                if (s.sr_ready)
+                // DR1: the part of R this frame evaluates. The whole of R when
+                // dynamic resolution is off, so everything below is unchanged then.
                 {
-                    ew = s.sr_w; eh = s.sr_h;
+                    UINT dw = s.sr_w, dh = s.sr_h;
+                    int dp = g_dr_pct_x10.load(std::memory_order_relaxed);
+                    // DR5: the controller runs only with NVIDIA frame generation.
+                    // Otherwise - or with dynamic switched off after a start that
+                    // made the textures at its top - the fixed SRScale is used
+                    // inside them, not the last dynamic value or the texture size.
+                    const bool dr_live = g_dr_on.load(std::memory_order_relaxed) != 0 && dp > 0 && s.fg_on == 4u;
+                    if (!dr_live) dp = (int)s.sr_scale_pct * 10;
+                    if (s.sr_scale_pct != 0u && (dr_live || g_dr_alloc.load(std::memory_order_relaxed) > (int)s.sr_scale_pct))
+                    {
+                        dw = (UINT)(((unsigned long long)s.width  * (unsigned)dp) / 1000ull) & ~7u;
+                        dh = (UINT)(((unsigned long long)s.height * (unsigned)dp) / 1000ull) & ~7u;
+                        if (dw > s.sr_w) dw = s.sr_w;
+                        if (dh > s.sr_h) dh = s.sr_h;
+                        if (dw < 64u) dw = 64u;
+                        if (dh < 64u) dh = 64u;
+                    }
+                    if (dw != s.dr_w || dh != s.dr_h)
+                    {
+                        if (s.dr_w != 0u) s.fov_base_reset = true;   // NR's history was at the old size
+                        s.dr_w = dw; s.dr_h = dh;
+                    }
+                }
+                if (s.sr_ready && nr_on)   // NO1: no reduce with the neural stage off
+                {
+                    ew = s.dr_w; eh = s.dr_h;
 
                     sr_write_descriptors(s, s.ndev_b, ii, s.tex_in[ii],
                                          (s.depth_mode == 1) ? s.tex_depth[ii] : nullptr);
@@ -25430,10 +26725,10 @@ void stream_poll()
                         s.ds_heap->GetGPUDescriptorHandleForHeapStart();
                     gh.ptr += (UINT64)(ii * 15u) * s.ds_inc;   // RS1/FV4: 15 per parity
                     s.nl->SetComputeRootDescriptorTable(0, gh);
-                    const UINT cnst[5] = { s.width, s.height, s.sr_w, s.sr_h,
+                    const UINT cnst[5] = { s.width, s.height, s.dr_w, s.dr_h,
                                            (UINT)g_rs_down.load(std::memory_order_relaxed) };
                     s.nl->SetComputeRoot32BitConstants(1, 5, cnst, 0);
-                    s.nl->Dispatch((s.sr_w + 7u) / 8u, (s.sr_h + 7u) / 8u, 1u);
+                    s.nl->Dispatch((s.dr_w + 7u) / 8u, (s.dr_h + 7u) / 8u, 1u);
 
                     barrier(s.nl, s.sr_color[ii], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -25448,7 +26743,7 @@ void stream_poll()
                 // that and the part of the picture the band covers is not
                 // evaluated twice.
                 const int fv_mode = g_fov_on.load(std::memory_order_relaxed);
-                const bool fv_plan = fv_mode != 0 && s.sr_ready && s.rs_pso != nullptr &&
+                const bool fv_plan = fv_mode != 0 && nr_on && s.sr_ready && s.rs_pso != nullptr &&
                                      g_rs_recon.load(std::memory_order_relaxed) == 1 &&
                                      s.passes == 1u && s.fov_out != nullptr && s.nr_handle[1] != nullptr;
                 UINT pcx = 0, pcy = 0, pcw = 0, pch = 0, base_h = 0;
@@ -25496,10 +26791,10 @@ void stream_poll()
                         const float fth = (float)pch * 0.5f *
                                           (float)g_fov_feather.load(std::memory_order_relaxed) / 100.0f;
                         const unsigned long long need = (unsigned long long)pcy + (unsigned long long)fth + 16ull;
-                        UINT bh = (UINT)((need * s.sr_h + s.height - 1ull) / s.height);
+                        UINT bh = (UINT)((need * s.dr_h + s.height - 1ull) / s.height);
                         bh = (bh + 7u) & ~7u;
                         if (bh < 64u) bh = 64u;
-                        if (bh < s.sr_h) base_h = bh;
+                        if (bh < s.dr_h) base_h = bh;
                     }
                 }
                 if (base_h != 0u)
@@ -25510,7 +26805,7 @@ void stream_poll()
                 else if (s.fov_base_h != 0u) { s.fov_base_h = 0u; s.fov_base_reset = true; }
 
                 bool final_pass_ok = false;
-                for (unsigned pi = 0; pi < s.passes; ++pi)
+                for (unsigned pi = 0; nr_on && pi < s.passes; ++pi)   // NO1
                 {
                     ID3D12Resource *src = (pi == 0)
                                             ? s.tex_in[ii]
@@ -25664,9 +26959,9 @@ void stream_poll()
                     }
                     // FV2: the base evaluate covers only the top strip of R; motion
                     // and depth are cut to the same share of their own heights.
-                    if (base_h != 0u && s.sr_h != 0u)
+                    if (base_h != 0u && s.dr_h != 0u)
                     {
-                        auto cut = [&](UINT full) { return (unsigned int)(((unsigned long long)full * base_h + s.sr_h - 1ull) / s.sr_h); };
+                        auto cut = [&](UINT full) { return (unsigned int)(((unsigned long long)full * base_h + s.dr_h - 1ull) / s.dr_h); };
                         if (s.mvec_mode == 3) s.nr_params->Set("DLSSNR.MVecSubrectHeight", cut(s.mvec_h));
                         else if (s.mvec_mode != 0) s.nr_params->Set("DLSSNR.MVecSubrectHeight", cut(s.height));
                         if (s.depth_mode == 1) s.nr_params->Set("DLSSNR.DepthSubrectHeight", cut(s.depth_h));
@@ -25746,6 +27041,41 @@ void stream_poll()
                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
                 s.nr_first = false;
+                // ---- NO1: neural stage OFF - the game's own frame goes through ----
+                //
+                // It used to skip this whole block, so nothing new reached the
+                // screen: the picture froze on the last neural frame while the
+                // game kept running underneath - with the scaled picture over
+                // the monitor that looked like the game had stopped responding.
+                // Now only the evaluate is skipped: the frame is copied straight
+                // into the texture the rest of the chain reads (HUD, frame
+                // generation, Color Strength, present), so frame generation and
+                // scaling carry on and you see the game without neural rendering.
+                if (!nr_on)
+                {
+                    ID3D12Resource *pt_dst = s.sr_ready ? s.tex_out
+                                                        : ((s.passes % 2u == 1u) ? s.tex_out : s.tex_pong);
+                    if (pt_dst != nullptr && s.tex_in[ii] != nullptr &&
+                        pt_dst->GetDesc().Format == s.tex_in[ii]->GetDesc().Format)
+                    {
+                        barrier(s.nl, s.tex_in[ii], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        barrier(s.nl, pt_dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+                        s.nl->CopyResource(pt_dst, s.tex_in[ii]);
+                        barrier(s.nl, pt_dst, D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        barrier(s.nl, s.tex_in[ii], D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        final_pass_ok = true;
+                    }
+                    else if (!s.no1_said)
+                    {
+                        s.no1_said = true;
+                        mgpu::diag::warn("[MGPU][NO1] neural stage off: the game's frame and the output texture "
+                                         "differ in format, so the picture holds the last neural frame.");
+                    }
+                }
                 // P6.4: `passes` can change between frames now, so the final
                 // texture is recomputed here rather than fixed at arm time.
                 //
@@ -25761,6 +27091,11 @@ void stream_poll()
                 // last iteration (want == f when completed == f), so no copy is
                 // ever in flight into the half the presenter is about to show.
                 s.tex_in_show = s.tex_in[ii];
+                // SP3: in HUD-less mode tex_in is the scene WITHOUT the HUD and
+                // menus; the frame as the game drew it is tex_ui. The "input"
+                // view and the split's left half show that one, so menus and
+                // the HUD do not vanish from them.
+                s.tex_ui_show = fr_hud ? s.tex_ui[ii] : nullptr;
 
                 // ---- C2-SR: enlarge R -> D with a real upscaler ----
                 //
@@ -25773,7 +27108,7 @@ void stream_poll()
                 // doing it here: SR is upscaling a TONE-MAPPED image, which
                 // costs it headroom above white. It is a trade, not a free win.
                 // RS1: residual reconstruction instead of DLSS SR when chosen.
-                const bool rs_on = s.sr_ready && final_pass_ok && s.rs_pso != nullptr &&
+                const bool rs_on = nr_on && s.sr_ready && final_pass_ok && s.rs_pso != nullptr &&
                                    g_rs_recon.load(std::memory_order_relaxed) == 1;
                 // ---- FV1/FV2/FV4: foveation - a rectangle again, at full resolution ----
                 //
@@ -25904,7 +27239,7 @@ void stream_poll()
                             r0 = fx0; r1 = fy0; r2 = fx1; r3 = fy1;
                         }
                         UINT fbits; memcpy(&fbits, &feather, 4);
-                        const UINT rc[10] = { s.width, s.height, s.sr_w, s.sr_h, r0, r1, r2, r3,
+                        const UINT rc[10] = { s.width, s.height, s.dr_w, s.dr_h, r0, r1, r2, r3,
                                               (UINT)g_rs_up.load(std::memory_order_relaxed), fbits };
                         s.nl->SetComputeRoot32BitConstants(1, 10, rc, 0);
                         s.nl->Dispatch((s.width + 7u) / 8u, (s.height + 7u) / 8u, 1u);
@@ -25944,7 +27279,7 @@ void stream_poll()
                         mgpu::diag::info(rl2);
                     }
                 }
-                else if (s.sr_ready && final_pass_ok)
+                else if (nr_on && s.sr_ready && final_pass_ok)
                 {
                     barrier(s.nl, s.sr_nrout, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -26001,9 +27336,9 @@ void stream_poll()
                     s.sr_params->Set(NVSDK_NGX_Parameter_Reset,
                                      (s.sr_first || mv_el >= 8.0f) ? 1u : 0u);
                     s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
-                                     (unsigned int)s.sr_w);
+                                     (unsigned int)s.dr_w);   // DR1
                     s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
-                                     (unsigned int)s.sr_h);
+                                     (unsigned int)s.dr_h);
                     s.sr_first = false;
 
                     const NVSDK_NGX_Result sres =
@@ -26100,7 +27435,7 @@ void stream_poll()
                 // depth are still readable. Only when the final pass wrote.
                 bool ui_done = false;   // HL1
                 if (s.fg_on != 0u && !s.fg_failed && final_pass_ok && !s.profile &&
-                    s.present_mode == 0)
+                    s.present_mode == 0 && !hl3)
                     ui_done = fg_record(s, s.nl, ii,
                               s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
                                   s.mvec_bytes2 != 0 && fr_mvec,
@@ -26152,6 +27487,15 @@ void stream_poll()
                 if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
                     s.mvec_bytes2 != 0 && fr_mvec && mgpu::framewarp::sampling())
                     fwc_record(s, s.nl, ii, (unsigned)(mv_el + 0.5f));
+                // MAS1: the motion mask for motion-adaptive sharpening (scaler on).
+                if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr && s.mvec_bytes2 != 0 && fr_mvec &&
+                    s.mvec_w != 0u && s.mvec_h != 0u && g_sc_active.load(std::memory_order_relaxed) &&
+                    mgpu::scaler::mas() != 0)
+                    mgpu::scaler::mas_record(s.ndev_b, s.nl, s.tex_mvec_r[ii], (DXGI_FORMAT)s.mvec_format,
+                                             s.mvec_w, s.mvec_h,
+                                             s.mvec_scale_x / (float)s.mvec_w * (float)s.width,
+                                             s.mvec_scale_y / (float)s.mvec_h * (float)s.height,
+                                             s.width, s.height);
                 if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
                     s.mvec_bytes2 != 0 && fr_mvec)
                     barrier(s.nl, s.tex_mvec_r[ii],
@@ -26167,8 +27511,10 @@ void stream_poll()
                 s.nl->ResolveQueryData(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0,
                                        stream_state::TS_MARKS, s.tsread, 0);
 
+            mgpu::gputime::end(s.nl, gt_slot);   // GT1
             h = s.nl->Close();
         }
+        if (FAILED(h)) { mgpu::gputime::cancel(gt_slot); gt_slot = -1; }   // GT4: never executed
         if (SUCCEEDED(h))
         {
             // R26. A QUEUE wait, not a list command, and it must be issued
@@ -26201,6 +27547,7 @@ void stream_poll()
             s.nq->ExecuteCommandLists(1, ls);
             ++s.nf_value;
             h = s.nq->Signal(s.nf, s.nf_value);
+            mgpu::gputime::submitted(gt_slot, SUCCEEDED(h) ? s.nf : nullptr, s.nf_value);   // GT1
             if (SUCCEEDED(h))
             {
                 const HRESULT eh = s.nf->SetEventOnCompletion(s.nf_value, s.nev);   // HARDEN1
