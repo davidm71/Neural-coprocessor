@@ -357,7 +357,7 @@ bool build(ID3D12Device *dev)
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 2u * 2u * 5u + 1u;   // 2 back buffers x 2 passes x 5 (MAS1: + mask), + the pointer (MC1)
+    hd.NumDescriptors = kMaxBackBuffers * 2u * 5u + 1u;   // BB1: kMaxBackBuffers back buffers x 2 passes x 5 (MAS1: + mask), + the pointer (MC1)
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_s.heap))))
     { mgpu::diag::error("[MGPU][SC1] descriptor heap could not be created."); return false; }
@@ -653,7 +653,7 @@ bool run(ID3D12Device *dev, ID3D12GraphicsCommandList *cl,
     ID3D12DescriptorHeap *heaps[1] = { g_s.heap };
     cl->SetDescriptorHeaps(1, heaps);
     cl->SetComputeRootSignature(g_s.rs);
-    const unsigned set = (bb_index & 1u) * 2u;
+    const unsigned set = (bb_index % kMaxBackBuffers) * 2u;   // BB1: a set per buffer, or a frame still on the GPU loses its descriptors
     UINT k[64] = {};
 
     if (m == 2)
@@ -845,7 +845,7 @@ void draw_cursor(ID3D12Device *dev, ID3D12GraphicsCommandList *cl, ID3D12Resourc
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
         sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         D3D12_CPU_DESCRIPTOR_HANDLE c = g_s.heap->GetCPUDescriptorHandleForHeapStart();
-        c.ptr += (SIZE_T)20u * g_s.inc;   // MAS1: after 4 tables of 5
+        c.ptr += (SIZE_T)(kMaxBackBuffers * 2u * 5u) * g_s.inc;   // MAS1, BB1: after every table of 5
         dev->CreateShaderResourceView(g_s.cur_tex, &sv, c);
     }
     if (g_s.cur_serial != sp.serial)
@@ -886,7 +886,7 @@ void draw_cursor(ID3D12Device *dev, ID3D12GraphicsCommandList *cl, ID3D12Resourc
     cl->SetGraphicsRootSignature(g_s.cur_rs);
     cl->SetPipelineState(g_s.cur_pso);
     D3D12_GPU_DESCRIPTOR_HANDLE g = g_s.heap->GetGPUDescriptorHandleForHeapStart();
-    g.ptr += (UINT64)20u * g_s.inc;
+    g.ptr += (UINT64)(kMaxBackBuffers * 2u * 5u) * g_s.inc;
     cl->SetGraphicsRootDescriptorTable(0, g);
     const float k[8] = { px, py, (float)sp.w, (float)sp.h, (float)dw, (float)dh, 0.0f, 0.0f };
     cl->SetGraphicsRoot32BitConstants(1, 8, k, 0);
