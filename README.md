@@ -224,6 +224,12 @@ Research code, not a product. Run games with anti-cheat and online games at your
   present first waits until the previous frame has left Windows' queue (at most 100 ms). A
   finished frame then reaches the screen at the next opportunity instead of waiting behind up to
   three others - a few ms less delay. Best with G-SYNC. Logged as `[MGPU][LP1]`.
+- **Present buffers** (`PresentBuffers`, 2-6, default 6, "present buffers" under Latency and
+  display; restart): how many buffers the bridge's swap chain rotates through. With frame
+  generation, a focused game gets immediate flips, and with 2 buffers the screen was caught
+  reading the buffer being written: horizontal bands of whatever stage it had reached. Fewer
+  buffers save about 33 MB each at 4K. `PresentRaceProbe=1` is the diagnostic: every frame's
+  back buffer is cleared to magenta first, so any such read shows as a magenta band.
 - **Queue guard** (`QueueGuard=1`, live checkbox in the same section): when the neural card falls
   2 or more frames behind, the game's render thread waits in 0.5 ms steps (at most 25 ms) until
   it catches up, so the game never makes frames that would be skipped - saving the 3080 Ti's

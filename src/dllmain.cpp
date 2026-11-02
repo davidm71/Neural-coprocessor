@@ -66,7 +66,7 @@
 #define MGPU_VERSION_STR "0.2.5-dev"
 // VR2: the fork's build tag, shared by the R141 log line and the panel footer
 // so the two can never disagree. Bump it with every shipped change.
-#define MGPU_SOURCE_TAG "DG3"
+#define MGPU_SOURCE_TAG "BB1"
 
 
 // ---- P6.4: the overlay panel ----
@@ -1660,6 +1660,20 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered() || ImGui::IsItemActive())
                 ImGui::SetTooltip("At most one finished frame waits in Windows' queue before the screen,\n"
                                   "instead of up to three: a few ms less delay. Best with G-SYNC.");
+        }
+        // BB1: back buffers the picture rotates through (needs a restart: the chain is made with it).
+        {
+            static int bb = -1;
+            if (bb < 0) bb = mgpu::gpu1::ui_ini_read("PresentBuffers", 6);
+            int v = bb;
+            if (ImGui::SliderInt("present buffers##bb", &v, 2, 6) &&
+                mgpu::gpu1::ui_ini_write("PresentBuffers", v))
+                bb = v;
+            ImGui::SameLine();
+            ImGui::TextDisabled("(restart)");
+            if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                ImGui::SetTooltip("How many buffers the bridge window rotates through. If this panel or the\n"
+                                  "picture flickers in horizontal bands with frame generation on, raise it.");
         }
         // QD1: queue guard (live).
         {

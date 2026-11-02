@@ -44,6 +44,10 @@ int  mas_motion();      void set_mas_motion(int pct);   // 0..100
 void mas_record(ID3D12Device *dev, ID3D12GraphicsCommandList *cl, ID3D12Resource *mv, DXGI_FORMAT mv_fmt,
                 unsigned mv_w, unsigned mv_h, float to_px_x, float to_px_y, unsigned src_w, unsigned src_h);
 
+// BB1: back buffers run()'s per-buffer descriptor sets are sized for.
+// gpu1_context.cpp static_asserts its own maximum against this.
+constexpr unsigned kMaxBackBuffers = 6u;
+
 // Present thread. src is the finished frame (src_state on entry and exit),
 // bb the back buffer in COPY_DEST (left in COPY_DEST). Records the enlargement
 // of src (sw x sh) to bb (dw x dh). Returns false (nothing recorded) when the
