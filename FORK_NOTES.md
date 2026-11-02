@@ -117,6 +117,14 @@ consumer counters advance on different threads.
   was (upstream R87). Without it SR reprojected its history by a fraction of the real
   motion whenever the consumer fell behind, which showed as flicker while moving. A gap
   of 8+ frames resets SR's history instead.
+- **Panel pointer left on screen (PP4):** closing the panel left ImGui's pointer drawn on
+  the picture where the panel last had it. Nothing clears `MouseDrawCursor` on a runtime
+  ReShade does not feed, and `reshade_overlay` keeps its ImGui frames running. It is now
+  cleared while the panel is closed.
+- **Panel pointer that does not move (PP4):** the mouse hook won as soon as it had seen
+  one event. A title can keep it nearly silent: on Stellar Blade, of eight openings five
+  saw no hook event, and in three a few events pinned the pointer for the whole opening
+  while the game runtime's pointer kept moving. Whichever moved last is now used.
 
 ## Measured (RTX 3080 Ti render + RTX 5060 Ti neural on PCIe 4.0 x4, 2560x1440,
 RoboCop Rogue City - Unfinished Business, same spot)

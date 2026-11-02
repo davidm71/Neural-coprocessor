@@ -118,6 +118,29 @@ inline void unpack2(unsigned long long v, float &a, float &b)
 // The pointer is normalised over the GAME runtime's display and scaled into
 // this runtime's display, so the two may differ in size. GetCursorPos is the
 // fallback only (frozen under raw input).
+// PP4: WHICH POINTER IS LIVE. The mouse hook used to win as soon as it had seen
+// one event, but a title can keep it nearly silent. Measured on Stellar Blade
+// over eight openings: five saw no hook event at all, and in the other three a
+// few events pinned the panel's pointer for the whole opening while the game
+// runtime's pointer went on moving ("it does not move; reopen until it does").
+// So whichever moved last is the one in use. A title whose game runtime freezes
+// under ReShade's input block never moves that pointer, and keeps the hook.
+bool hook_pointer_live(bool game_ok, float gx, float gy)
+{
+    static bool use_hook = false, have_hook = false;
+    static int hx = 0, hy = 0;
+    static float last_gx = 0.0f, last_gy = 0.0f;
+    const bool game_moved = game_ok && (gx != last_gx || gy != last_gy);
+    if (game_ok) { last_gx = gx; last_gy = gy; }
+    int mx = 0, my = 0;
+    if (!mgpu::hotkeys::panel_mouse_get(&mx, &my, nullptr, nullptr)) return false;
+    const bool hook_moved = !have_hook || mx != hx || my != hy;
+    have_hook = true; hx = mx; hy = my;
+    if (hook_moved) use_hook = true;
+    else if (game_moved) use_hook = false;
+    return use_hook;
+}
+
 void feed_input(reshade::api::effect_runtime *runtime)
 {
     // Every exit carries a reason; a change of reason is logged at once.
@@ -128,7 +151,15 @@ void feed_input(reshade::api::effect_runtime *runtime)
     {
         if (runtime == nullptr) { why = "no runtime"; break; }
         if (!mgpu::gpu1::dcomp_overlay_mode()) { why = "DcompOverlay off"; break; }
-        if (g_live.load(std::memory_order_relaxed) == 0) { why = "panel not live"; break; }
+        if (g_live.load(std::memory_order_relaxed) == 0)
+        {
+            // PP4: nothing else writes this runtime's io (see above), and this
+            // event keeps its ImGui frames running with the panel closed, so
+            // ImGui's pointer stayed on the picture where the panel last had it.
+            if (is_host((void *)runtime)) ImGui::GetIO().MouseDrawCursor = false;
+            why = "panel not live";
+            break;
+        }
 
         void *host = g_host.load(std::memory_order_relaxed);
         if (host == nullptr) host = g_windowless.load(std::memory_order_relaxed);
@@ -177,7 +208,7 @@ void feed_input(reshade::api::effect_runtime *runtime)
             mdown = (b & 4u) != 0u;
         }
         else if (HWND gh = (HWND)mgpu::gpu1::dcomp_game_hwnd();
-                 gh != nullptr && mgpu::hotkeys::panel_mouse_get(nullptr, nullptr, nullptr, nullptr))
+                 gh != nullptr && hook_pointer_live(from_game, gx, gy))
         {
             // PP3: no cover window (scaler off). The picture is the game
             // window's client area; the mouse comes from the low-level hook,
