@@ -552,6 +552,14 @@ int  ui_fsr_state();               // FSR1: 0 not tried, 1 up, -1 failed
 int  ui_dlssg_state();             // DLSSG1: 0 not tried, 1 up, -1 failed
 int  ui_fg_mult();                 // DLSSG2: 2..6, what FGMultiplier asks for
 int  ui_fg_mult_running();         // MFG6: what NVIDIA FG is producing now, 0 = not generating
+// DMF1: dynamic multiplier (NVIDIA FG): per-pair count toward a target fps.
+bool ui_fg_dyn_on();
+void ui_set_fg_dyn_on(bool on);
+int  ui_fg_dyn_target();
+void ui_set_fg_dyn_target(int v);
+float ui_fg_dyn_avg();
+bool ui_fg_clock();             // FC1: the even frame clock (FGClock)
+void ui_set_fg_clock(bool on);
 bool ui_fg_extras_failed();        // MFG7: the 5x/6x buffers could not be made (out of video memory)
 void ui_set_fg_mult(int m);
 float ui_color_strength();          // CS1: 0..1, 1 = neural output untouched
@@ -562,6 +570,16 @@ void ui_set_status_hud(bool on);
 // visibility is saved (Clock in mgpu.ini); the stopwatch restarts from 0
 // every time it is shown and is not saved.
 bool ui_clock();       void ui_set_clock(bool on);
+// SV1: screen saver. Minutes without input (0 = off), style 0 black / 1 drifting logo.
+int  ui_screensaver_minutes(); void ui_set_screensaver_minutes(int m);
+int  ui_screensaver_style();   void ui_set_screensaver_style(int s);
+bool ui_screensaver_active();
+// BW1: GB/s sent by the 3080 Ti and received by the neural card, last full second.
+void ui_bus_rates(double &sent_gbs, double &recv_gbs);
+// BW5: the game's own frames Windows copies to the monitor's card (estimate), and the
+// driver's total for the render card's link out and the neural card's link in (-1 = n/a).
+void ui_bus_more(double &game_gbs, double &total_out, double &total_in);
+bool ui_bus_hud();     void ui_set_bus_hud(bool on);   // HUD3: log the bus traffic every 10 s (BusLog)
 // NM1: NR network: 0 = the DLL's default, 1 = A (original), 2 = B (fast).
 // Read when NR is created, so a change applies from the next launch.
 int  ui_nr_model();    void ui_set_nr_model(int m);
@@ -619,6 +637,8 @@ int  ui_scaler();        void ui_set_scaler(int m);
 int  ui_scaler_sharp();  void ui_set_scaler_sharp(int pct);
 int  ui_scaler_mas();        void ui_set_scaler_mas(int on);          // MAS1
 int  ui_scaler_mas_motion(); void ui_set_scaler_mas_motion(int pct);
+int  ui_scaler_half();       void ui_set_scaler_half(int on);         // NH1
+int  ui_scaler_half_state(); // 0 not compiled yet, 1 unavailable, 2 card runs it as full, 3 in effect, 4 preparing
 bool ui_scaler_active();
 // PP1: PanelOverPicture support (upstream 0.4.0) and the scaled-picture case.
 bool dcomp_visual_rooted();

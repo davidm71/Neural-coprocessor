@@ -39,6 +39,8 @@ void note_frame(void *effect_runtime_ptr, void *command_list_ptr);
 // HL1. dllmain installs the transport's copy (gpu1 stream_hud_copy). Called
 // on the game's recording thread with the scene texture in COPY_SOURCE.
 void set_copy_hook(void (*fn)(void *cmd_list_native, unsigned long long resource));
+// HL5d: the menu check's verdict on a HUD-less copy, by its source texture.
+void report_copy(unsigned long long handle, double frac);
 
 // Hotkey / panel. Records the next whole frame.
 void request_capture();

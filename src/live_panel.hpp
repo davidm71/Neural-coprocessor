@@ -44,6 +44,9 @@ namespace mgpu::live_panel
 
     // The panel's state (1 = up on the neural layer).
     bool live();
+// UI4: true once after the panel's host was rebuilt while the panel was open -
+// the caller reopens it on the new host.
+bool take_reopen();
     void set_live(bool up);
 
     // The GPU 1 runtime to open the overlay on: the windowless one, or

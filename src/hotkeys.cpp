@@ -80,6 +80,26 @@ std::atomic<unsigned> g_swallow_vk{0};
 // ReShade and is not affected. Generic VK_CONTROL / VK_MENU / VK_SHIFT are
 // derived from the left/right keys the hook reports.
 std::atomic<bool> g_hk_down[256] = {};
+std::atomic<unsigned long long> g_act_key{0}, g_act_mouse{0};   // SV3: real input times (see act_proc)
+// HK6: when each key last went down (or auto-repeated) as the hook saw it.
+std::atomic<unsigned long long> g_hk_t[256] = {};
+
+// HK6: is a key held, for the CAPTURE field. The hook's table can keep a key
+// "down" for ever when its release never reaches the hook - HOME, the panel
+// key, after ReShade toggles its overlay (2026-11-08 08:54:43: "HOME (0x24)
+// still reads as held"); the capture then waited for all keys to be released,
+// and once armed it found HOME first and refused it (the panel key) - for
+// ever. A held key auto-repeats every few dozen ms after the first ~0.25-1 s,
+// so a key not seen going down for over 1.5 s is taken as released. Modifiers
+// do not repeat while another key is pressed, so they are checked as before.
+bool cap_key(int vk)
+{
+    if (vk <= 0 || vk >= 256) return false;
+    if (g_hk_down[vk].load(std::memory_order_relaxed) &&
+        GetTickCount64() - g_hk_t[vk].load(std::memory_order_relaxed) < 1500ull)
+        return true;
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
 
 bool key(int vk)
 {
@@ -270,8 +290,20 @@ LRESULT CALLBACK kb_proc(int code, WPARAM wp, LPARAM lp)
         const KBDLLHOOKSTRUCT *k = reinterpret_cast<const KBDLLHOOKSTRUCT *>(lp);
         const DWORD vk = k->vkCode;
         const bool up = (k->flags & LLKHF_UP) != 0;
-        if (vk < 256 && (k->flags & LLKHF_INJECTED) == 0)
+        const bool inj = (k->flags & LLKHF_INJECTED) != 0;
+        // HK7: while a hotkey is being captured, keys marked "injected" count too.
+        // Some keyboard software (remappers, macro tools, Steam Input) sends every
+        // key that way, and the hook used to ignore them - the capture then saw
+        // nothing at all. (Input replay is not running during a capture.)
+        if (vk < 256 && inj && g_cap.load() >= 0)
         {
+            g_hk_down[vk].store(!up, std::memory_order_relaxed);
+            if (!up) g_hk_t[vk].store(GetTickCount64(), std::memory_order_relaxed);
+        }
+        if (vk < 256 && !inj)
+        {
+            if (!up) g_act_key.store(GetTickCount64(), std::memory_order_relaxed);   // SV3
+            if (!up) g_hk_t[vk].store(GetTickCount64(), std::memory_order_relaxed);  // HK6
             // HK3: record the key's state for key() / the capture field.
             g_hk_down[vk].store(!up, std::memory_order_relaxed);
             auto pair = [](int l, int r, int g) {
@@ -332,6 +364,38 @@ std::atomic<int>  g_ms_x{0}, g_ms_y{0}, g_ms_wheel{0};
 std::atomic<unsigned> g_ms_btn{0};
 const UINT WM_MS_ON  = WM_APP + 0x31;
 const UINT WM_MS_OFF = WM_APP + 0x32;
+const UINT WM_KB_REHOOK = WM_APP + 0x33;   // HK8
+
+// SV3: real input only, for the screen saver. Windows' own idle timer
+// (GetLastInputInfo) was reset every 45-65 s with nobody at the PC (2026-11-07):
+// injected input or mouse jitter. These record a key press or mouse action
+// that is not injected; a move counts only once the pointer is 4 px or more
+// from where the last counted one left it, so sensor jitter does not.
+std::atomic<bool> g_act_hooked{false};
+HHOOK g_acthook = nullptr;
+LONG g_act_x = 0, g_act_y = 0;   // hook thread only
+LRESULT CALLBACK act_proc(int code, WPARAM wp, LPARAM lp)
+{
+    if (code == HC_ACTION)
+    {
+        const MSLLHOOKSTRUCT *m = reinterpret_cast<const MSLLHOOKSTRUCT *>(lp);
+        if ((m->flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) == 0)
+        {
+            bool real = wp != WM_MOUSEMOVE;
+            if (!real)
+            {
+                const LONG dx = m->pt.x - g_act_x, dy = m->pt.y - g_act_y;
+                real = dx > 3 || dx < -3 || dy > 3 || dy < -3;
+            }
+            if (real)
+            {
+                g_act_x = m->pt.x; g_act_y = m->pt.y;
+                g_act_mouse.store(GetTickCount64(), std::memory_order_relaxed);
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
 
 LRESULT CALLBACK ms_proc(int code, WPARAM wp, LPARAM lp)
 {
@@ -368,6 +432,8 @@ void kb_main()
                        reinterpret_cast<LPCWSTR>(&kb_proc), &self);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);   // RV1: as Frame Warp's hook
     g_kbhook = SetWindowsHookExW(WH_KEYBOARD_LL, kb_proc, self, 0);
+    g_acthook = SetWindowsHookExW(WH_MOUSE_LL, act_proc, self, 0);   // SV3
+    g_act_hooked.store(g_kbhook != nullptr && g_acthook != nullptr);
     if (g_kbhook == nullptr)
     {
         char l[200];
@@ -377,6 +443,15 @@ void kb_main()
     }
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
     {
+        // HK8: put the keyboard hook back. Windows removes a low-level hook
+        // without telling anyone when it is slow to answer a few times.
+        // Re-installed when the panel opens and when a capture starts.
+        if (msg.hwnd == nullptr && (msg.message == WM_KB_REHOOK || msg.message == WM_MS_ON))
+        {
+            if (g_kbhook) UnhookWindowsHookEx(g_kbhook);
+            g_kbhook = SetWindowsHookExW(WH_KEYBOARD_LL, kb_proc, self, 0);
+            if (msg.message == WM_KB_REHOOK) continue;
+        }
         if (msg.hwnd == nullptr && msg.message == WM_MS_ON)   // PP3
         {
             if (g_mshook == nullptr)
@@ -401,6 +476,8 @@ void kb_main()
         TranslateMessage(&msg); DispatchMessageW(&msg);
     }
     if (g_mshook) { UnhookWindowsHookEx(g_mshook); g_mshook = nullptr; }
+    if (g_acthook) { UnhookWindowsHookEx(g_acthook); g_acthook = nullptr; }   // SV3
+    g_act_hooked.store(false);
     if (g_kbhook) { UnhookWindowsHookEx(g_kbhook); g_kbhook = nullptr; }
 }
 
@@ -434,14 +511,53 @@ bool panel_mouse_get(int *x, int *y, unsigned *btn, int *wheel)
     return true;
 }
 bool key_down(int vk) { return key(vk); }
+bool real_input_ages(unsigned long long &key_ms, unsigned long long &mouse_ms)   // SV3
+{
+    if (!g_act_hooked.load(std::memory_order_relaxed)) return false;
+    const unsigned long long now = GetTickCount64();
+    const unsigned long long k = g_act_key.load(std::memory_order_relaxed), m = g_act_mouse.load(std::memory_order_relaxed);
+    key_ms = k ? now - k : ~0ull;
+    mouse_ms = m ? now - m : ~0ull;
+    return true;
+}
+
+// HK5: ReShade's overlay key (the one that opens this panel) can never be one
+// of ours. Read from ReShade.ini next to the game (KeyOverlay=vk,ctrl,shift,alt);
+// HOME when it is not there.
+binding g_overlay{ 0, VK_HOME };
+void read_overlay_key()
+{
+    wchar_t path[MAX_PATH * 2] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH * 2);
+    wchar_t *slash = (n != 0 && n < MAX_PATH * 2) ? wcsrchr(path, L'\\') : nullptr;
+    if (slash == nullptr) return;
+    wcscpy_s(slash + 1, (MAX_PATH * 2) - (size_t)(slash + 1 - path), L"ReShade.ini");
+    wchar_t v[64] = {};
+    if (GetPrivateProfileStringW(L"INPUT", L"KeyOverlay", L"", v, 64, path) == 0) return;
+    int vk = 0, c = 0, s = 0, al = 0;
+    if (swscanf_s(v, L"%d,%d,%d,%d", &vk, &c, &s, &al) < 1 || vk <= 0 || vk > 0xFE) return;
+    g_overlay.vk = (unsigned char)vk;
+    g_overlay.mods = (unsigned char)((c ? M_CTRL : 0) | (al ? M_ALT : 0) | (s ? M_SHIFT : 0));
+}
+bool is_overlay(const binding &b) { return b.vk == g_overlay.vk && b.mods == g_overlay.mods; }
 
 void init()
 {
     std::lock_guard<std::mutex> lk(g_mx);
+    read_overlay_key();   // HK5
     for (unsigned a = 0; a < A_COUNT; ++a)
     {
         binding b{};
         g_bind[a] = decode(mgpu::gpu1::ui_ini_read(DEFS[a].key, -1), b) ? b : DEFS[a].dflt;
+        if (is_overlay(g_bind[a]))   // HK5: an earlier capture took the panel key - put the default back
+        {
+            g_bind[a] = DEFS[a].dflt;
+            save(a);
+            char nm[48], l[200];
+            bind_name(g_bind[a], nm, sizeof nm);
+            snprintf(l, sizeof l, "[MGPU][HK5] %s was bound to ReShade's overlay key - back to %s.", DEFS[a].label, nm);
+            mgpu::diag::warn(l);
+        }
     }
     g_inited = true;
     recheck_locked(true);
@@ -453,6 +569,28 @@ void init()
         mgpu::diag::info("[MGPU][HK2] hotkey keys are kept from the game (a CTRL/ALT combination of ours "
                          "never reaches it).");
     }
+}
+
+// HK7: the one place a captured combination becomes a binding.
+void commit_capture(int cap, unsigned char mods, int vk, const char *src)
+{
+    char nm[48];
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_bind[cap].mods = mods;
+        g_bind[cap].vk = (unsigned char)vk;
+        save((unsigned)cap);
+        guard_refresh_locked();   // HK2
+        bind_name(g_bind[cap], nm, sizeof nm);
+        recheck_locked(false);
+    }
+    g_cap.store(-1);
+    // The key that was just bound must not also fire.
+    g_down[cap] = true;
+    char l[220];
+    snprintf(l, sizeof l, "[MGPU][HK1] %s is now %s (saved to mgpu.ini; seen by the %s).", DEFS[cap].label, nm, src);
+    mgpu::diag::info(l);
+    g_recheck.store(true);
 }
 
 bool poll(presses &out)
@@ -483,6 +621,20 @@ bool poll(presses &out)
     }
     if (!own_foreground())
     {
+        if (g_cap.load() >= 0)   // HK4: say why a capture sees no keys
+        {
+            static ULONGLONG said = 0;
+            if (said == 0 || GetTickCount64() - said > 10000)
+            {
+                said = GetTickCount64();
+                char cls[96] = "?";
+                if (HWND fg = GetForegroundWindow()) GetClassNameA(fg, cls, sizeof cls);
+                char l[220];
+                snprintf(l, sizeof l, "[MGPU][HK4] capturing a hotkey, but another program's window is in front "
+                         "(class \"%s\") - keys are not read until the game is.", cls);
+                mgpu::diag::warn(l);
+            }
+        }
         // Nothing is held while another program is in front.
         memset(g_down, 0, sizeof g_down);
         g_down_coarse[0] = g_down_coarse[1] = false;
@@ -495,26 +647,37 @@ bool poll(presses &out)
     {
         int hit = 0;
         for (int vk = 0x08; vk <= 0xFE; ++vk)
-            if (!is_modifier_or_mouse(vk) && key(vk)) { hit = vk; break; }
-        if (!g_cap_armed) { if (hit == 0) g_cap_armed = true; return false; }
+            if (!is_modifier_or_mouse(vk) && cap_key(vk)) { hit = vk; break; }   // HK6: stale "held" keys skipped
+        static ULONGLONG cap_t0 = 0; static int cap_for = -1; static bool said_wait = false;
+        if (cap_for != cap) { cap_for = cap; cap_t0 = GetTickCount64(); said_wait = false; }
+        if (!g_cap_armed)
+        {
+            if (hit == 0) g_cap_armed = true;
+            else if (!said_wait && GetTickCount64() - cap_t0 > 3000)
+            {   // HK4: a key that never reads as released blocks the capture
+                said_wait = true;
+                char nm[32], l[200];
+                key_name(hit, nm, sizeof nm);
+                snprintf(l, sizeof l, "[MGPU][HK4] waiting for every key to be released before capturing - %s "
+                         "(0x%02X) still reads as held.", nm, hit);
+                mgpu::diag::warn(l);
+            }
+            return false;
+        }
         if (hit == 0) return false;
         if (hit == VK_ESCAPE) { g_cap.store(-1); return false; }
-        char nm[48];
+        // HK4/HK5: ReShade's overlay key (it opens and closes this panel) is never a binding.
+        if (is_overlay(binding{ mods_now(), (unsigned char)hit }))
         {
-            std::lock_guard<std::mutex> lk(g_mx);
-            g_bind[cap].mods = mods_now();
-            g_bind[cap].vk = (unsigned char)hit;
-            save((unsigned)cap);
-            guard_refresh_locked();   // HK2
-            bind_name(g_bind[cap], nm, sizeof nm);
-            recheck_locked(false);
+            static ULONGLONG said_ov = 0;   // HK6: say so, at most every 5 s
+            if (said_ov == 0 || GetTickCount64() - said_ov > 5000)
+            {
+                said_ov = GetTickCount64();
+                mgpu::diag::warn("[MGPU][HK6] that combination is ReShade's panel key - not taken. Select another below the list.");
+            }
+            return false;
         }
-        g_cap.store(-1);
-        // The key that was just bound must not also fire.
-        g_down[cap] = true;
-        char l[200];
-        snprintf(l, sizeof l, "[MGPU][HK1] %s is now %s (saved to mgpu.ini).", DEFS[cap].label, nm);
-        mgpu::diag::info(l);
+        commit_capture(cap, mods_now(), hit, "keyboard hook");
         g_recheck.store(true);
         return false;
     }
@@ -573,11 +736,30 @@ int conflict(unsigned a)
 void begin_capture(unsigned a)
 {
     if (a >= A_COUNT) return;
+    // HK6: start from a clean slate. Rebind is clicked with the mouse, so no
+    // key should be held; a key the table still shows as down missed its
+    // release (see cap_key) and would block the capture.
+    for (int vk = 0; vk < 256; ++vk) g_hk_down[vk].store(false, std::memory_order_relaxed);
     g_cap_armed = false;
+    if (const DWORD t = g_kb_tid.load()) PostThreadMessageW(t, WM_KB_REHOOK, 0, 0);   // HK8
     g_cap.store((int)a);
 }
 
 void cancel_capture() { g_cap.store(-1); }
+
+bool capture_from_panel(unsigned char mods, int vk)
+{
+    const int cap = g_cap.load();
+    if (cap < 0 || cap >= (int)A_COUNT || vk <= 0 || vk >= 256 || is_modifier_or_mouse(vk)) return false;
+    if (vk == VK_ESCAPE) { g_cap.store(-1); return false; }
+    if (is_overlay(binding{ (unsigned char)(mods & 7u), (unsigned char)vk }))
+    {
+        mgpu::diag::warn("[MGPU][HK6] that combination is ReShade's panel key - not taken. Select another below the list.");
+        return false;
+    }
+    commit_capture(cap, (unsigned char)(mods & 7u), vk, "panel");
+    return true;
+}
 
 int capturing() { return g_cap.load(); }
 

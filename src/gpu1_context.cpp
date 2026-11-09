@@ -45,6 +45,7 @@
 #include "calibrator.hpp"   // R104: jitter compensation
 #include "mgpu_ini_parser.hpp"
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
+#include "live_panel.hpp"   // SV1: no screen saver while the panel is open
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
 #include <dwmapi.h>       // SC7: DWM_TIMING_INFO (function loaded at run time)
 #include "scaler.hpp"     // SC1: FSR 1 / NIS enlargement to the monitor
@@ -59,6 +60,7 @@
 #include "hdr.hpp"       // HD1
 #include "gputime.hpp"   // GT1
 #include "hud_probe.hpp" // HL3
+#include "fg_clock.hpp"  // FC1: the even frame clock (tests/fg_clock_test.cpp)
 // FSR1: AMD FidelityFX API headers (MIT), for FrameGen=3. Types only - the
 // functions come from AMD's signed DLL, loaded at run time from the mgpu folder.
 #include "ffx/ffx_api.h"
@@ -429,6 +431,12 @@ static bool g_dcomp_rooted_fwd() { return g_dcomp_rooted; }
 // 0 = off, 1 = basic neural-output FPS, 2 = detailed MGPU input + NR FPS.
 static int g_fps_hud_mode = 1;
 static int clock_lines(char (*out)[24]);   // CK1, defined with the clock settings
+static bool screensaver_tick();            // SV1, defined with the clock settings
+static void bus_sample();                  // BW1, defined with the clock settings
+bool ui_bus_hud();                         // BW3
+extern std::atomic<unsigned long long> g_bus_tx;   // BW1, defined with the clock settings
+extern std::atomic<unsigned long long> g_bus_game;   // BW5
+extern std::atomic<unsigned long long> g_bus_rx;
 static bool at_hud_line(char *out, size_t n);   // AT1, defined with the target frame rate
 // SC1: the present chain was sized to the monitor for the scaler (set once,
 // when the window is fitted to the stream).
@@ -468,6 +476,9 @@ static bool drv_blocked(const char *where)
 // never-activated cover over the game's monitor. The game keeps the
 // foreground (keyboard, mouse, pad). Bridge thread only.
 static HWND g_sc_cover = nullptr;
+// SC10: when the cover was made, and whether the one hand-back was used.
+static ULONGLONG g_sc_cover_t = 0;
+static bool g_sc10_done = false;
 // RS1: reduced-resolution NR reconstruction and filters; UC1: NR UI correction.
 // Live (read per frame). Seeded from mgpu.ini at arm.
 static std::atomic<int> g_rs_recon{1};   // SRRecon: 0 DLSS SR, 1 residual (default)
@@ -763,8 +774,49 @@ static void sc_cover_sync(bool force_log)
                 lost_name[0] = 0;
                 if (fg != nullptr) GetClassNameA(fg, lost_name, (int)sizeof lost_name);
             }
-            if (now - lost_since < 400) game_fg = true;
-            else if (g_sc_cover_shown.load())
+            // SC10: the foreground goes to the Explorer folder the game was
+            // started from at the moment the scaled picture starts (twice on
+            // 2026-11-06, both times before the cover's first check). A plain
+            // SetForegroundWindow was refused (SC10 build). SC10b: in the first
+            // 3 s after the cover is made, try up to 4 times, 250 ms apart,
+            // borrowing the foreground thread's input state for the call (the
+            // documented AttachThreadInput route), and keep the picture shown
+            // meanwhile. After that, or if every try is refused, the picture
+            // steps aside as before; switching away later is never undone.
+            static unsigned sc10_tries = 0;
+            static ULONGLONG sc10_last = 0;
+            if (!g_sc10_done && g_sc_cover_t != 0 && now - g_sc_cover_t < 3000 && fg != nullptr &&
+                pid != GetCurrentProcessId())
+            {
+                if (sc10_last == 0 || now - sc10_last >= 250)
+                {
+                    sc10_last = now;
+                    ++sc10_tries;
+                    const DWORD fg_tid = GetWindowThreadProcessId(fg, nullptr);
+                    const DWORD me = GetCurrentThreadId();
+                    const bool att = fg_tid != 0 && fg_tid != me && AttachThreadInput(me, fg_tid, TRUE) != FALSE;
+                    BringWindowToTop(g_game_hwnd);
+                    SetForegroundWindow(g_game_hwnd);
+                    if (att) AttachThreadInput(me, fg_tid, FALSE);
+                    const bool back = GetForegroundWindow() == g_game_hwnd;
+                    if (back || sc10_tries >= 4)
+                    {
+                        g_sc10_done = true;
+                        char l[300];
+                        snprintf(l, sizeof l, "[MGPU][SC10] the game lost the foreground to another program's window "
+                                 "(class \"%s\", pid %lu) %llu ms after the scaled picture started - %s (try %u).",
+                                 lost_name, (unsigned long)pid, (unsigned long long)(now - g_sc_cover_t),
+                                 back ? "handed back to the game" : "Windows refused to hand it back; the picture steps aside",
+                                 sc10_tries);
+                        mgpu::diag::info(l);
+                        sc10_tries = 0; sc10_last = 0;
+                    }
+                    if (back) { lost_since = 0; game_fg = true; }
+                }
+                if (!g_sc10_done) game_fg = true;   // keep the picture up while trying
+            }
+            if (!game_fg && now - lost_since < 400) game_fg = true;
+            else if (!game_fg && g_sc_cover_shown.load())
             {
                 char l[200];
                 snprintf(l, sizeof l, "[MGPU][SC8] foreground is another program's window (class \"%s\", pid %lu) "
@@ -847,6 +899,7 @@ static std::atomic<unsigned long long> g_hud_gen_count{0};
 // real, generated and presented frame rates. One line per 10 s, kept even
 // with the detailed log off.
 static std::atomic<bool> g_pf_on{false};   // PerfLog: 0 = no measuring, no line
+std::atomic<unsigned long long> g_fgp_replaced{0};   // FQ1
 static std::mutex g_pf_mx;
 static unsigned g_pf_nr_hist[160] = {};          // 0.25 ms bins, 0-40 ms
 static double   g_pf_nr_sum = 0.0, g_pf_nr_max = 0.0;
@@ -904,15 +957,22 @@ static void perf_present(unsigned long long evals, unsigned long long gens)
         if (var < 0.0) var = 0.0;
         unsigned hitch = 0;   // presents more than twice the average spacing apart
         for (unsigned i = 0; i < 250u; ++i) if ((i + 0.5) * 0.1 > 2.0 * iv_avg) hitch += g_pf_iv_hist[i];
+        // FQ1: pairs (real frame + its generated frames) replaced in the hand-over
+        // before the present thread took them - NR/FG work that was never shown.
+        extern std::atomic<unsigned long long> g_fgp_replaced;   // = PERF1's g_fgp_dropped_jobs
+        const unsigned long long rep_now = g_fgp_replaced.load(std::memory_order_relaxed);
+        static unsigned long long rep_prev = 0;
+        const unsigned long long rep_d = rep_now >= rep_prev ? rep_now - rep_prev : rep_now;   // reset at re-arm
+        rep_prev = rep_now;
         snprintf(line, sizeof line,
                  "[MGPU][PF1] last %.0f s | NR GPU avg %.2f p95 %.2f max %.2f ms, over 11 ms %u of %u | "
                  "present %.1f fps, spacing avg %.2f sd %.2f p99 %.2f max %.2f ms, hitches %u | "
-                 "real %.1f fps, generated %.1f fps",
+                 "real %.1f fps, generated %.1f fps | pairs replaced unshown %llu",
                  dt, nr_avg, (std::min)(pf_pct(g_pf_nr_hist, 160u, 0.25, g_pf_nr_n, 0.95), g_pf_nr_max), g_pf_nr_max,
                  g_pf_nr_over, g_pf_nr_n,
                  g_pf_iv_n / dt, iv_avg, std::sqrt(var), (std::min)(pf_pct(g_pf_iv_hist, 250u, 0.1, g_pf_iv_n, 0.99), g_pf_iv_max),
                  g_pf_iv_max, hitch,
-                 (double)(evals - g_pf_eval0) / dt, (double)(gens - g_pf_gen0) / dt);
+                 (double)(evals - g_pf_eval0) / dt, (double)(gens - g_pf_gen0) / dt, rep_d);
         std::memset(g_pf_nr_hist, 0, sizeof g_pf_nr_hist); std::memset(g_pf_iv_hist, 0, sizeof g_pf_iv_hist);
         g_pf_nr_sum = g_pf_nr_max = 0.0; g_pf_nr_n = g_pf_nr_over = 0;
         g_pf_iv_sum = g_pf_iv_sq = g_pf_iv_max = 0.0; g_pf_iv_n = 0;
@@ -954,11 +1014,12 @@ static bool fg_set_writable(unsigned k)
 
 int fps_hud_toggle()
 {
-    g_fps_hud_mode = (g_fps_hud_mode == 1) ? 2 : (g_fps_hud_mode == 2) ? 0 : 1;
+    // HUD3: BASIC -> DETAIL -> ADVANCED (bus traffic, latency) -> OFF.
+    g_fps_hud_mode = (g_fps_hud_mode == 1) ? 2 : (g_fps_hud_mode == 2) ? 3 : (g_fps_hud_mode == 3) ? 0 : 1;
     const char *name = (g_fps_hud_mode == 1) ? "BASIC" :
-                       (g_fps_hud_mode == 2) ? "DETAIL" : "OFF";
+                       (g_fps_hud_mode == 2) ? "DETAIL" : (g_fps_hud_mode == 3) ? "ADVANCED" : "OFF";
     char msg[128];
-    snprintf(msg, sizeof msg, "[MGPU][HUD] FPS HUD %s (CTRL+ALT+H cycles BASIC/DETAIL/OFF)", name);
+    snprintf(msg, sizeof msg, "[MGPU][HUD] FPS HUD %s (CTRL+ALT+H cycles BASIC/DETAIL/ADVANCED/OFF)", name);
     mgpu::diag::info(msg);
     return g_fps_hud_mode;
 }
@@ -1770,6 +1831,7 @@ void hud_fps_sample(double &game_fps, double &consumed_fps, double &nr_eval_fps,
                     double &nr_skip_fps, double &present_fps, double &nr_gpu_ms);
 double hud_gen_fps();   // FG1, defined beside fg_handoff
 int hud_status_lines(char (*out)[48], int max);   // ST1, defined beside hud_fps_sample
+void hud_adv_sample(double &lat_submit_ms, double &lat_ready_ms, double &queue);   // HUD3
 int ui_frame_gen();     // FG1
 // arm_fault_recover is NOT declared here: it takes a stream_state &, a type
 // that is not declared this early. It is defined in the anonymous namespace
@@ -2308,6 +2370,7 @@ bool present_frame(float r, float g, float b)
         // Diagnostic FPS HUD: producer = game frames entering MGPU; consumer =
         // frames consumed by the neural GPU. Values update at 4 Hz to stay
         // readable and to avoid putting a stream-state lock on every frame.
+        bus_sample();   // BW1: once per output frame, for the panel and the HUD
         const int hud_mode = fps_hud_mode();
         if (hud_mode != 0)
         {
@@ -2318,11 +2381,18 @@ bool present_frame(float r, float g, float b)
                            hud_nr_skip_fps, hud_present_fps, hud_nr_gpu_ms);
             char hud_st[6][48] = {};                        // ST1: StatusHud=1
             const int hud_st_n = hud_status_lines(hud_st, 6);
+            double bus_out = -1.0, bus_in = -1.0;   // HUD3: ADVANCED only
+            double adv_lat = -1.0, adv_rdy = -1.0, adv_q = -1.0;
+            double bus_game = -1.0, bus_tot_out = -1.0, bus_tot_in = -1.0;   // BW5
+            if (hud_mode == 3) { ui_bus_rates(bus_out, bus_in); ui_bus_more(bus_game, bus_tot_out, bus_tot_in);
+                                 hud_adv_sample(adv_lat, adv_rdy, adv_q); }
             mgpu::screen::draw_fps_hud(cl, rtv, bw, bh, hud_mode,
                                        hud_input_fps, hud_consumed_fps, hud_nr_eval_fps,
                                        hud_nr_skip_fps, hud_present_fps, hud_nr_gpu_ms,
                                        (ui_frame_gen() != 0) ? hud_gen_fps() : -1.0,   // FG1
-                                       hud_st, hud_st_n);
+                                       hud_st, hud_st_n, bus_out, bus_in,   // BW1
+                                       adv_lat, adv_rdy, adv_q,               // HUD3
+                                       bus_game, bus_tot_out, bus_tot_in);    // BW5
         }
 
         // CK1: clock / stopwatch, top-right. Independent of the FPS HUD.
@@ -2331,6 +2401,9 @@ bool present_frame(float r, float g, float b)
             const int ckn = clock_lines(ck);
             if (ckn > 0) mgpu::screen::draw_clock_box(cl, rtv, bw, bh, ck, ckn);
         }
+        // SV1: the screen saver covers everything above.
+        if (screensaver_tick())
+            mgpu::screen::draw_saver(cl, rtv, bw, bh, ui_screensaver_style(), GetTickCount64());
 
         // SS1/VR1: captures that include the FPS HUD - exactly what is on screen.
         mgpu::capture::on_present_final(dev, cl, backbuffer[index], bw, bh, bbfmt);
@@ -2508,6 +2581,7 @@ bool present_frame(float r, float g, float b)
     const UINT pi_interval = (g_present_vsync.load(std::memory_order_relaxed) != 0u) ? 1u : 0u;
     (void)mgpu::hdr::sync_colour_space(sc, hdr_applied);   // HD1: HDR10 only for a converted frame
     hr = sc->Present(pi_interval, 0);
+    mgpu::crashlog::note_present(1, (long)hr);   // SO2: the bridge's own present, for judging an overlay step-over
     if (FAILED(hr))
         return fail("Present", static_cast<unsigned>(hr));
 
@@ -2644,8 +2718,10 @@ bool has_present_chain()
 // exactly as T3 did it. The chain goes first because the swapchain holds
 // a reference to the window it was created against: in T4's order
 // (DestroyWindow first) it would outlive the window.
+void bus_meter_stop();   // BW5, defined with the bus counters
 void shutdown()
 {
+    bus_meter_stop();   // BW5
     auto &S = st();
     ini_flush_pending(true);   // SL1: nothing the panel queued is lost
 
@@ -5557,6 +5633,18 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                                       "the DLSSNR.Output rebind between evaluates, or a UAV "
                                       "barrier this path is missing.");
                 }
+                else if (d_in == 0 && d_ab > 0 && d_ac == 0)
+                {
+                    // PR1: intensity 0.00 passing the input through unchanged is
+                    // what NR does at zero; the 1.60 output differing is the proof
+                    // that it processes. This was logged as an error every launch.
+                    snprintf(line, sizeof line,
+                             "[MGPU][P1.2] PROBE PASSED - intensity %.2f passes the input through "
+                             "(expected at zero) and %.2f changes %.2f%% of pixels: NR processes.",
+                             INTENSITY_LO, INTENSITY_HI,
+                             total ? 100.0 * (double)d_ab / (double)total : 0.0);
+                    mgpu::diag::info(line);
+                }
                 else if (d_in == 0)
                 {
                     mgpu::diag::error("[MGPU][P1.2] OUTPUT A == INPUT byte for byte - NR copied "
@@ -6427,6 +6515,15 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                                  "the output never arrived; this is a transit or synchronisation "
                                  "fault, not a model one.", sent);
                         mgpu::diag::error(line);
+                    }
+                    else if (diff_in == 0 && diff_ctrl == 0)
+                    {
+                        // PR1: this probe runs at intensity 0.00, where NR passes the
+                        // input through, so "same as the input" is expected. Same as the
+                        // local control with no sentinel left is the transit proof.
+                        mgpu::diag::info("[MGPU][P1.4] PROBE PASSED - the result crossed the bus and "
+                                         "matches the local NR control byte for byte (at intensity "
+                                         "0.00 NR passes the input through, so it also equals the input).");
                     }
                     else if (diff_in == 0)
                     {
@@ -9751,6 +9848,8 @@ namespace
         ID3D12Resource *fg_outx[FG_SETS][FG_MAX_EXTRA] = {};
         bool fg_extras_failed = false;   // MFG6: the 5x/6x buffers could not be made
         unsigned fg_ready_n = 0;
+        unsigned fg_ready_show = 0;   // DMF5: in-between frames to show (0 = all fg_ready_n)
+        unsigned dg_show = 0;         // DMF5: dg_record's choice for the pair it just made
         unsigned fg_mult = 2;
         ID3D12RootSignature *fg_rs = nullptr;
         ID3D12PipelineState *fg_pso = nullptr;
@@ -10423,6 +10522,12 @@ namespace
         // HL1: the same pair for the HUD-less region.
         std::atomic<unsigned char> hud_slot_valid[RING] = {};
         std::atomic<unsigned long long> hud_slot_frame[RING] = {};
+        // HLD2: which game texture each slot's HUD-less copy came from, carried
+        // to the menu check so a mismatch names its source.
+        std::atomic<unsigned long long> hud_slot_src[RING] = {};
+        unsigned long long hud_src_ii[2] = {};
+        unsigned long long ui_cnt_src = 0;
+        unsigned hld2_lines = 0, hld2_ok_lines = 0;
         std::atomic<bool> hud_live{false};
         std::atomic<unsigned long long> hud_copies{0}, hud_rejects{0}, hud_lock_skips{0},
                                         hud_sealed{0}, hud_missing{0};
@@ -10780,6 +10885,33 @@ namespace
     // FPS HUD sampler. present_frame is above stream_state in this file, so it
     // reaches the counters through this small bridge. Query the counters only
     // four times per second; between samples the cached values are returned.
+    // HUD3: the ADVANCED level's latency figures, over the last quarter second
+    // (deltas of the stream's running sums), under the same lock and cadence.
+    void hud_adv_sample_impl(double &lat_submit_ms, double &lat_ready_ms, double &queue)
+    {
+        static ULONGLONG last = 0;
+        static double ls = 0.0, rs = 0.0; static unsigned long long ln = 0, rn = 0, qs = 0, qn = 0;
+        static double o_lat = 0.0, o_rdy = 0.0, o_q = 0.0;
+        const ULONGLONG now = GetTickCount64();
+        if (last == 0 || now - last >= 250)
+        {
+            stream_state &s = str();
+            double ls2, rs2; unsigned long long ln2, rn2, qs2, qn2;
+            {
+                std::lock_guard<std::mutex> lk(s.cs);
+                ls2 = s.lat_sum; ln2 = s.lat_n; rs2 = s.ready_sum; rn2 = s.ready_n; qs2 = s.q_sum; qn2 = s.q_n;
+            }
+            if (last != 0)
+            {
+                if (ln2 > ln) o_lat = (ls2 - ls) / (double)(ln2 - ln);
+                if (rn2 > rn) o_rdy = (rs2 - rs) / (double)(rn2 - rn);
+                if (qn2 > qn) o_q = (double)(qs2 - qs) / (double)(qn2 - qn);
+            }
+            ls = ls2; ln = ln2; rs = rs2; rn = rn2; qs = qs2; qn = qn2; last = now;
+        }
+        lat_submit_ms = o_lat; lat_ready_ms = o_rdy; queue = o_q;
+    }
+
     void hud_fps_sample_impl(double &game_fps, double &consumed_fps,
                              double &nr_eval_fps, double &nr_skip_fps,
                              double &present_fps, double &nr_gpu_ms)
@@ -11173,8 +11305,10 @@ namespace
 
         char l[420];
         snprintf(l, sizeof l,
-                 "[MGPU][P7.2] mgpu.ini %s: %s (%s). THIS DOES NOT CHANGE THE RUNNING SESSION - "
-                 "the key is read at arm, so it takes effect on the next launch.",
+                 // DMF3: the old note ("does not change the running session") was printed for
+                 // every key, live ones too (FGCap, FGDynTarget...). The panel says which
+                 // settings need a restart; the log line just records the write.
+                 "[MGPU][P7.2] mgpu.ini %s: %s (%s).",
                  ok ? "written" : "WRITE FAILED", line_new,
                  replaced ? "replaced in place" : "appended, the key was absent");
         if (ok) mgpu::diag::info(l); else mgpu::diag::error(l);
@@ -11993,7 +12127,7 @@ static void ffx_message(uint32_t type, const wchar_t *message)
 //                  FSR uses (FrameGen=3): it writes the in-between frame into
 //                  fsr_out and the existing pass/present path does the rest
 //                  (HUD-less frames + HUD added back, pacing, FIX7/FIX8).
-//                  2x. Three failed evaluates fall back to the mod's own.
+//                  2x. Three failed evaluates fall back to BUILT-IN.
 //   DLSSGProbe=1   DGP1: the one-shot feasibility probe (3 BMPs), only when
 //                  FrameGen is 1 or 3 (it shares the feature with FrameGen=4).
 //
@@ -12019,6 +12153,8 @@ struct dg_state
     unsigned mfc_max = 0;
     bool mfc_assumed = false;       // DLSSG3: count not reported - tried, dropped to 2x if refused
     unsigned cur_mfc = 0;           // DLSSG2: in-between frames per pair in use
+    unsigned dyn_gen = 0;           // DMF5: in-between frames generated per pair in dynamic mode (held)
+    unsigned dyn_want_n = 0, dyn_want_run = 0;   // DMF5: a different count asked for, and for how many pairs
     float v2c[16] = {}, c2v[16] = {}, ident[16] = {};
     // FrameGen=4
     bool fg_failed = false;
@@ -12383,7 +12519,7 @@ void dg_fg_fail()
 {
     g_dg.fg_failed = true;
     mgpu::diag::error("[MGPU][DLSSG1] NVIDIA frame generation could not start - FrameGen=4 falls back to "
-                      "the mod's own generator for this run (see the [MGPU][DLSSG1] lines above).");
+                      "BUILT-IN frame generation for this run (see the [MGPU][DLSSG1] lines above).");
 }
 
 // MFG6: makes sure in-between frame buffers 2..want+1 exist in every set and
@@ -12439,6 +12575,79 @@ static void dg_mfc_refused(NVSDK_NGX_Result r)
     mgpu::diag::warn(line);
 }
 
+// ---- DMF1: dynamic multiplier (FGDynamic=1, NVIDIA FG only) ----
+// Instead of one fixed multiplier against a capped game, each real frame gets
+// as many in-between frames as it takes for the shown rate to reach the
+// target (FGDynTarget, fps): real 67 fps at 180 -> 2.69 frames per real one,
+// so about seven pairs in ten get 3x and three get 2x (an error accumulator
+// spreads them). Spacing within a pair stays even; between pairs it changes
+// with the count - the trade against a fixed cap, kept optional for that.
+static std::atomic<int> g_dyn_on{-1}, g_dyn_target{-1};
+static std::atomic<int> g_fg_real_us{0};                       // the real-frame interval the presenter measures
+static std::atomic<unsigned long long> g_dyn_planned{0}, g_dyn_pairs{0};   // for DR's "expected"
+static unsigned long long g_dyn_hist[7] = {};                  // pairs per multiplier (2..6), this summary period
+static unsigned long long g_dyn_log_at = 0;
+static double g_dyn_acc = 0.0;  // Only the FG recording/producer thread modifies this.
+static std::atomic<unsigned> g_dyn_reset_seq{0}; // UI requests a reset without racing the producer.
+static int dyn_on_now()
+{
+    int v = g_dyn_on.load(std::memory_order_relaxed);
+    if (v < 0) { v = ini_read_sr_int("FGDynamic", 0, 0, 1); g_dyn_on.store(v); }
+    return v;
+}
+static int dyn_target_now()
+{
+    int v = g_dyn_target.load(std::memory_order_relaxed);
+    if (v < 0) { v = ini_read_sr_int("FGDynTarget", 180, 60, 480); g_dyn_target.store(v); }
+    return v;
+}
+// Frames to show for this pair (2..cap+1), from the target and the real interval.
+static unsigned dyn_frames_for_pair(unsigned cap_frames)
+{
+    // PERF1: changes in the panel may occur on another thread. Consume reset
+    // requests here rather than writing the non-atomic accumulator from UI.
+    static unsigned seen_reset_seq = 0;
+    const unsigned reset_seq = g_dyn_reset_seq.load(std::memory_order_acquire);
+    if (seen_reset_seq != reset_seq) { g_dyn_acc = 0.0; seen_reset_seq = reset_seq; }
+    const int us = g_fg_real_us.load(std::memory_order_relaxed);
+    if (us <= 0) return 2u;
+    const double want = (double)dyn_target_now() * (double)us / 1e6;   // frames per real frame, fractional
+    double f = want;
+    if (f < 2.0) f = 2.0;
+    if (f > (double)cap_frames) f = (double)cap_frames;
+    if (want < 2.0 || want > (double)cap_frames) g_dyn_acc = 0.0;    // clamped: no wind-up
+    g_dyn_acc += f;
+    unsigned n = (unsigned)g_dyn_acc;
+    if (n < 2u) n = 2u;
+    if (n > cap_frames) n = cap_frames;
+    g_dyn_acc -= (double)n;
+    if (g_dyn_acc < -1.0) g_dyn_acc = -1.0;
+    if (g_dyn_acc > 1.0) g_dyn_acc = 1.0;
+    return n;
+}
+static void dyn_note_pair(unsigned frames)
+{
+    g_dyn_planned.fetch_add(frames, std::memory_order_relaxed);
+    g_dyn_pairs.fetch_add(1ull, std::memory_order_relaxed);
+    if (frames >= 2u && frames <= 6u) ++g_dyn_hist[frames];
+    const unsigned long long now = GetTickCount64();
+    if (g_dyn_log_at == 0ull) { g_dyn_log_at = now + 30000ull; return; }
+    if (now < g_dyn_log_at) return;
+    g_dyn_log_at = now + 30000ull;
+    unsigned long long n = 0, sum = 0;
+    for (unsigned m = 2; m <= 6; ++m) { n += g_dyn_hist[m]; sum += g_dyn_hist[m] * m; }
+    if (n == 0ull) return;
+    const int us = g_fg_real_us.load(std::memory_order_relaxed);
+    char l[320];
+    snprintf(l, sizeof l, "[MGPU][DMF1] last 30 s: average %.2fx (2x %.0f%%, 3x %.0f%%, 4x %.0f%%, 5x %.0f%%, 6x %.0f%%) | "
+             "real %.1f fps, target %d fps.", (double)sum / (double)n,
+             100.0 * g_dyn_hist[2] / n, 100.0 * g_dyn_hist[3] / n, 100.0 * g_dyn_hist[4] / n,
+             100.0 * g_dyn_hist[5] / n, 100.0 * g_dyn_hist[6] / n,
+             us > 0 ? 1e6 / us : 0.0, dyn_target_now());
+    mgpu::diag::info(l);
+    for (unsigned m = 0; m < 7; ++m) g_dyn_hist[m] = 0;
+}
+
 bool dg_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
                ID3D12Resource *real, float mv_el)
 {
@@ -12457,21 +12666,70 @@ bool dg_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
     // DLSSG2: how many in-between frames this pair gets (FGMultiplier - 1),
     // never more than the driver reports or the extra buffers allow.
     unsigned mfc = (s.fg_mult >= 2u) ? s.fg_mult - 1u : 1u;
-    const unsigned cap = (g_dg.mfc_max >= 1u) ? g_dg.mfc_max : 1u;
+    unsigned cap = (g_dg.mfc_max >= 1u) ? g_dg.mfc_max : 1u;
+    const bool dyn = dyn_on_now() != 0;
+    if (dyn)
+    {
+        // DMF1: buffers for the most it may ask, made once, so a high pair
+        // never allocates in the middle of play.
+        if (cap > 1u)
+        {
+            const unsigned have = fg_extras_ensure(s, cap - 1u);
+            if (cap > have + 1u) cap = have + 1u;
+        }
+        // DMF5: NVIDIA's frame generation is always asked for the SAME number
+        // of in-between frames (the most any pair needs, held), so its history
+        // never sees a count change - changing it pair to pair without a reset
+        // flashed (user report, 180-200 fps targets mixing 3x-6x). The fraction
+        // comes from SHOWING fewer of them on some pairs: 4.5x = generate 4
+        // every pair, show 4 on half the pairs and 3 on the others. The
+        // generated count moves only when another count has been needed for 20
+        // pairs in a row (about half a second); that one change resets history
+        // like a manual multiplier change does.
+        const int us_now = g_fg_real_us.load(std::memory_order_relaxed);
+        unsigned need = 1u;
+        if (us_now > 0)
+        {
+            const double want = (double)dyn_target_now() * (double)us_now / 1e6;   // frames per real frame
+            const double gen_d = std::ceil(want - 1e-6) - 1.0;
+            need = gen_d < 1.0 ? 1u : (unsigned)gen_d;
+        }
+        if (need > cap) need = cap;
+        if (g_dg.dyn_gen == 0u) g_dg.dyn_gen = need;
+        else if (need != g_dg.dyn_gen)
+        {
+            if (need == g_dg.dyn_want_n) ++g_dg.dyn_want_run; else { g_dg.dyn_want_n = need; g_dg.dyn_want_run = 1u; }
+            if (g_dg.dyn_want_run >= 20u) { g_dg.dyn_gen = need; g_dg.dyn_want_run = 0u; }
+        }
+        else g_dg.dyn_want_run = 0u;
+        mfc = g_dg.dyn_gen;
+        const unsigned show = dyn_frames_for_pair(mfc + 1u) - 1u;   // 1..mfc
+        s.dg_show = show < mfc ? show : 0u;
+        dyn_note_pair(show + 1u);
+    }
+    else { s.dg_show = 0u; g_dg.dyn_gen = 0u; }
     if (mfc > cap) mfc = cap;
-    if (mfc > 1u)   // MFG6: only as many as there are buffers for
+    if (!dyn && mfc > 1u)   // MFG6: only as many as there are buffers for
     {
         const unsigned have = fg_extras_ensure(s, mfc - 1u);
         if (mfc > have + 1u) mfc = have + 1u;
     }
-    if (mfc != g_dg.cur_mfc)
+    if (mfc != g_dg.cur_mfc && !dyn)
     {
         snprintf(line, sizeof line, "[MGPU][DLSSG2] NVIDIA frame generation at %ux (%u in-between frame%s per real frame)%s.",
                  mfc + 1u, mfc, mfc == 1u ? "" : "s",
                  (s.fg_mult - 1u > mfc) ? " - FGMultiplier asked for more than the driver/buffers allow" : "");
         mgpu::diag::info(line);
     }
+    // DMF5: the generated count is held in dynamic mode, so a change here is
+    // rare (a manual change, or the held count moving) and resets history.
     const bool mfc_changed = (mfc != g_dg.cur_mfc);
+    if (dyn && mfc_changed && g_dg.cur_mfc != 0u)
+    {
+        snprintf(line, sizeof line, "[MGPU][DMF5] dynamic multiplier now generates %u in-between frame%s per real frame "
+                 "(shows %u to %u of them per pair).", mfc, mfc == 1u ? "" : "s", mfc > 1u ? mfc - 1u : 1u, mfc);
+        mgpu::diag::info(line);
+    }
     g_dg.cur_mfc = mfc;
     const NVSDK_NGX_Result r = dg_evaluate(s, cl, ii, real, s.fsr_out, mv_el, reset || mfc_changed, fid, mfc, 1u);
     ++g_dg.evals;
@@ -12485,7 +12743,7 @@ bool dg_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
         ++g_dg.errors;
         snprintf(line, sizeof line, "[MGPU][DLSSG1] frame %llu: EvaluateFeature 0x%08X (%s) (%llu so far). %s",
                  fid, (unsigned)r, ngx_result_name(r), g_dg.errors,
-                 g_dg.errors >= 3 ? "Switching to the mod's own frame generation for this run."
+                 g_dg.errors >= 3 ? "Switching to BUILT-IN frame generation for this run."
                                   : "This frame shows no in-between frame.");
         mgpu::diag::error(line);
         if (g_dg.errors >= 3) g_dg.fg_failed = true;
@@ -12767,7 +13025,7 @@ static bool fsr_create(stream_state &s, ID3D12Device *dev, const D3D12_RESOURCE_
     {
         mgpu::diag::error("[MGPU][FSR] FrameGen=3 needs AMD's amd_fidelityfx_framegeneration_dx12.dll "
                           "in the mgpu folder next to the add-on (or next to the add-on). It was not "
-                          "found or did not export the FidelityFX API. Falling back to the mod's own "
+                          "found or did not export the FidelityFX API. Falling back to BUILT-IN "
                           "frame generation (FrameGen=1) for this run.");
         return false;
     }
@@ -12776,7 +13034,7 @@ static bool fsr_create(stream_state &s, ID3D12Device *dev, const D3D12_RESOURCE_
     {
         snprintf(line, sizeof line,
                  "[MGPU][FSR] depth is %ux%u but the motion vectors are %ux%u. AMD frame "
-                 "generation needs both at one size. Falling back to the mod's own frame "
+                 "generation needs both at one size. Falling back to BUILT-IN frame "
                  "generation (FrameGen=1) for this run.",
                  s.depth_w, s.depth_h, s.mvec_w, s.mvec_h);
         mgpu::diag::error(line);
@@ -12786,7 +13044,7 @@ static bool fsr_create(stream_state &s, ID3D12Device *dev, const D3D12_RESOURCE_
         ffxApiGetSurfaceFormatDX12(out_desc.Format) == FFX_API_SURFACE_FORMAT_UNKNOWN)
     {
         mgpu::diag::error("[MGPU][FSR] the NR output format or the vector extent is not one "
-                          "AMD frame generation accepts. Falling back to the mod's own.");
+                          "AMD frame generation accepts. Falling back to BUILT-IN.");
         return false;
     }
 
@@ -12829,7 +13087,7 @@ static bool fsr_create(stream_state &s, ID3D12Device *dev, const D3D12_RESOURCE_
     {
         snprintf(line, sizeof line,
                  "[MGPU][FSR] ffxCreateContext(frame generation) failed, code %u, from %s. "
-                 "Falling back to the mod's own frame generation (FrameGen=1) for this run.",
+                 "Falling back to BUILT-IN frame generation (FrameGen=1) for this run.",
                  (unsigned)rc, where);
         mgpu::diag::error(line);
         return false;
@@ -12959,7 +13217,7 @@ static bool fsr_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned 
         snprintf(line, sizeof line,
                  "[MGPU][FSR] frame %llu: AMD frame generation call failed, code %u (%llu so far). "
                  "%s", (unsigned long long)fid, (unsigned)rc, s.fsr_errors,
-                 (s.fsr_errors >= 3) ? "Switching to the mod's own frame generation for this run."
+                 (s.fsr_errors >= 3) ? "Switching to BUILT-IN frame generation for this run."
                                      : "This frame shows no in-between frame.");
         mgpu::diag::error(line);
         if (s.fsr_errors >= 3) s.fsr_failed = true;
@@ -13143,6 +13401,7 @@ static void g0_stage_release(stream_state &s)
         }
         s.fg_extras_failed = false;
         s.fg_ready_n = 0;
+        s.fg_ready_show = 0;
         fsr_destroy(s);   // FSR1: the AMD context goes before the resources it saw
         dgp_release();    // DGP1: the probe's feature and textures, same point
         if (s.fsr_out != nullptr) { s.fsr_out->Release(); s.fsr_out = nullptr; }
@@ -14230,6 +14489,7 @@ namespace
             cl->CopyBufferRegion(s.ui_cnt_read, 0, s.ui_cnt, 0, 4);
             barrier(cl, s.ui_cnt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             s.ui_cnt_pending = true;
+            s.ui_cnt_src = s.hud_src_ii[ii < 2u ? ii : 0u];   // HLD2
         }
         return true;
     }
@@ -14788,6 +15048,7 @@ namespace
             s.fg_k = k;
             s.fg_ready = f; s.fg_ready_k = k; s.fg_ready_gen = gen;
             s.fg_ready_n = gen ? (gen_n != 0u ? gen_n : 1u) : 0u;   // DLSSG2
+            s.fg_ready_show = (gen && s.fg_on == 4u) ? s.dg_show : 0u;   // DMF5
             if (gen) ++s.fg_made;
             else if (!mv_ok) ++s.fg_nomv;
             return true;
@@ -14885,6 +15146,7 @@ namespace
         s.fg_k = k;
         s.fg_ready = f; s.fg_ready_k = k; s.fg_ready_gen = gen;
         s.fg_ready_n = gen ? (gen_n != 0u ? gen_n : 1u) : 0u;   // DLSSG2
+        s.fg_ready_show = (gen && s.fg_on == 4u) ? s.dg_show : 0u;   // DMF5
         if (gen) ++s.fg_made;
         else if (!mv_ok) ++s.fg_nomv;
         return ui_done;
@@ -16351,6 +16613,7 @@ static bool sc_make_cover(HWND hwnd, int x, int y, UINT w, UINT h)
     old->Release();
     g_dcomp_target = t2;
     g_sc_cover = hwnd;
+    g_sc_cover_t = GetTickCount64(); g_sc10_done = false;   // SC10
     g_sc_cover_shown.store(false);
     sc_log_refresh(hwnd, "picture on its own window");
     (void)mgpu::cursormap::install(g_game_hwnd);   // MC1: the pointer on the picture
@@ -18252,6 +18515,10 @@ void hud_fps_sample(double &game_fps, double &consumed_fps, double &nr_eval_fps,
     hud_fps_sample_impl(game_fps, consumed_fps, nr_eval_fps, nr_skip_fps,
                         present_fps, nr_gpu_ms);
 }
+void hud_adv_sample(double &lat_submit_ms, double &lat_ready_ms, double &queue)
+{
+    hud_adv_sample_impl(lat_submit_ms, lat_ready_ms, queue);
+}
 
 // ---- ST1: STATUS READOUT ON THE FPS HUD (StatusHud=1) ----
 //
@@ -18301,6 +18568,9 @@ int  ui_scaler_mas()           { return mgpu::scaler::mas(); }
 void ui_set_scaler_mas(int on) { mgpu::scaler::set_mas(on); (void)ui_ini_write("ScalerMAS", mgpu::scaler::mas()); }
 int  ui_scaler_mas_motion()    { return mgpu::scaler::mas_motion(); }
 void ui_set_scaler_mas_motion(int p) { mgpu::scaler::set_mas_motion(p); (void)ui_ini_write("ScalerMASMotion", mgpu::scaler::mas_motion()); }
+int  ui_scaler_half()          { return mgpu::scaler::half(); }                                   // NH1
+void ui_set_scaler_half(int on) { mgpu::scaler::set_half(on); (void)ui_ini_write("ScalerHalf", mgpu::scaler::half()); }
+int  ui_scaler_half_state()    { return mgpu::scaler::half_state(); }
 bool ui_scaler_active()        { return g_sc_active.load(); }
 // PP1 (PanelOverPicture support, as upstream 0.4.0 has them, plus the scaled case)
 bool dcomp_visual_rooted()      { return g_dcomp_rooted; }
@@ -18437,6 +18707,293 @@ void ui_set_stopwatch(bool on)
     g_sw_show.store(on, std::memory_order_relaxed);
     mgpu::diag::info(on ? "[MGPU][CK1] stopwatch started from 0" : "[MGPU][CK1] stopwatch hidden");
 }
+// BW1: bytes moved between the cards, for the panel's live line. Sent = the
+// 3080 Ti's copies into the shared system-memory slots (colour, depth, motion
+// vectors, HUD-less); received = the neural card's reads of the same. The
+// rate shown is the last full second.
+std::atomic<unsigned long long> g_bus_tx{0};
+std::atomic<unsigned long long> g_bus_rx{0};
+// BW5: the game's own frames. The game presents on the render card and the
+// monitor is on the neural card, so Windows copies every game frame across
+// (measured 2026-11-07 with the mod removed: a steady 2.5 GB/s at 4K). An
+// estimate: the game's frame size times its present rate.
+std::atomic<unsigned long long> g_bus_game{0};
+static std::atomic<double> g_bus_game_gbs{0.0};
+
+// BW5: everything on each card's PCIe link, from the driver's own counter
+// (NVML, nvml.dll from the NVIDIA driver - loaded, never shipped). Read on its
+// own thread (each read takes about 20 ms), 4 samples a second, averaged per
+// second: render card out, neural card in. -1 = not available.
+static std::atomic<double> g_nv_out{-1.0}, g_nv_in{-1.0};
+static std::atomic<bool> g_nv_started{false}, g_nv_stop{false}, g_nv_running{false};
+static std::atomic<unsigned long long> g_nv_want{0};   // last time a reader asked (no sampling 5 s after)
+static void nvml_thread()
+{
+    typedef int (*pf_init)();
+    typedef int (*pf_count)(unsigned *);
+    typedef int (*pf_handle)(unsigned, void **);
+    typedef int (*pf_name)(void *, char *, unsigned);
+    typedef int (*pf_pcie)(void *, int, unsigned *);
+    HMODULE m = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (m == nullptr) m = LoadLibraryW(L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
+    pf_init init = m ? (pf_init)GetProcAddress(m, "nvmlInit_v2") : nullptr;
+    pf_count cnt = m ? (pf_count)GetProcAddress(m, "nvmlDeviceGetCount_v2") : nullptr;
+    pf_handle hnd = m ? (pf_handle)GetProcAddress(m, "nvmlDeviceGetHandleByIndex_v2") : nullptr;
+    pf_name nm = m ? (pf_name)GetProcAddress(m, "nvmlDeviceGetName") : nullptr;
+    pf_pcie pc = m ? (pf_pcie)GetProcAddress(m, "nvmlDeviceGetPcieThroughput") : nullptr;
+    void *dev_out = nullptr, *dev_in = nullptr;
+    char n_out[96] = "?", n_in[96] = "?";
+    if (init && cnt && hnd && nm && pc && init() == 0)
+    {
+        mgpu::adapter::selection_result sel;
+        mgpu::adapter::get_selection(sel);   // selected = the neural card
+        unsigned n = 0;
+        if (cnt(&n) == 0)
+            for (unsigned i = 0; i < n && i < 8; ++i)
+            {
+                void *d = nullptr; char name[96] = {};
+                if (hnd(i, &d) != 0 || nm(d, name, sizeof name) != 0) continue;
+                const bool neural = sel.valid && sel.selected_desc[0] && strstr(sel.selected_desc, name + (strncmp(name, "NVIDIA ", 7) == 0 ? 7 : 0)) != nullptr;
+                if (neural && dev_in == nullptr) { dev_in = d; snprintf(n_in, sizeof n_in, "%s", name); }
+                else if (!neural && dev_out == nullptr) { dev_out = d; snprintf(n_out, sizeof n_out, "%s", name); }
+            }
+    }
+    char l[300];
+    snprintf(l, sizeof l, "[MGPU][BW5] driver PCIe counters: %s (render card: out = %s, neural card: in = %s).",
+             (dev_out || dev_in) ? "available" : "NOT available (nvml.dll not found or no NVIDIA card matched)", n_out, n_in);
+    mgpu::diag::info(l);
+    if (dev_out == nullptr && dev_in == nullptr) { g_nv_running.store(false); return; }
+    double so = 0.0, si = 0.0; unsigned k = 0;
+    ULONGLONG t0 = GetTickCount64();
+    while (!g_nv_stop.load(std::memory_order_relaxed))
+    {
+        if (GetTickCount64() - g_nv_want.load(std::memory_order_relaxed) > 5000ull)
+        {   // nobody is looking (panel closed, HUD not ADVANCED, no logging): idle
+            so = si = 0.0; k = 0; t0 = GetTickCount64();
+            Sleep(250);
+            continue;
+        }
+        unsigned v = 0;
+        if (dev_out && pc(dev_out, 0, &v) == 0) so += (double)v * 1024.0;   // TX, KB/s
+        v = 0;
+        if (dev_in && pc(dev_in, 1, &v) == 0) si += (double)v * 1024.0;     // RX, KB/s
+        ++k;
+        const ULONGLONG now = GetTickCount64();
+        if (now - t0 >= 1000 && k > 0)
+        {
+            g_nv_out.store(dev_out ? so / k / 1e9 : -1.0, std::memory_order_relaxed);
+            g_nv_in.store(dev_in ? si / k / 1e9 : -1.0, std::memory_order_relaxed);
+            so = si = 0.0; k = 0; t0 = now;
+        }
+        for (int i = 0; i < 5 && !g_nv_stop.load(std::memory_order_relaxed); ++i) Sleep(40);   // ~4 samples/s
+    }
+    g_nv_running.store(false);
+}
+static void nvml_start()
+{
+    g_nv_want.store(GetTickCount64(), std::memory_order_relaxed);
+    if (g_nv_started.exchange(true)) return;
+    g_nv_running.store(true);
+    try { std::thread(nvml_thread).detach(); } catch (...) { g_nv_running.store(false); }
+}
+void bus_meter_stop()   // shutdown: let the reader finish before the module can go
+{
+    g_nv_stop.store(true);
+    for (int i = 0; i < 50 && g_nv_running.load(); ++i) Sleep(10);
+}
+void ui_bus_more(double &game_gbs, double &total_out, double &total_in)
+{
+    nvml_start();
+    game_gbs = g_bus_game_gbs.load(std::memory_order_relaxed);
+    total_out = g_nv_out.load(std::memory_order_relaxed);
+    total_in = g_nv_in.load(std::memory_order_relaxed);
+}
+// Sampled on the present path only (one thread); the panel and the HUD read
+// the last result.
+static std::atomic<double> g_bus_tx_gbs{0.0}, g_bus_rx_gbs{0.0};
+static void bus_sample()
+{
+    static ULONGLONG t_last = 0;
+    static unsigned long long tx_last = 0, rx_last = 0, gm_last = 0;
+    static double cur_tx = 0.0, cur_rx = 0.0;
+    const ULONGLONG now = GetTickCount64();
+    const unsigned long long tx = g_bus_tx.load(std::memory_order_relaxed);
+    const unsigned long long rx = g_bus_rx.load(std::memory_order_relaxed);
+    const unsigned long long gm = g_bus_game.load(std::memory_order_relaxed);
+    if (t_last == 0) { t_last = now; tx_last = tx; rx_last = rx; gm_last = gm; }
+    else if (now - t_last >= 1000)
+    {
+        const double dt = (double)(now - t_last) / 1000.0;
+        cur_tx = (double)(tx - tx_last) / dt / 1e9;
+        cur_rx = (double)(rx - rx_last) / dt / 1e9;
+        // BW5: only when the picture is on the neural card's monitor (the case this copy exists in)
+        g_bus_game_gbs.store(dcomp_overlay_mode() ? (double)(gm - gm_last) / dt / 1e9 : 0.0, std::memory_order_relaxed);
+        t_last = now; tx_last = tx; rx_last = rx; gm_last = gm;
+        g_bus_tx_gbs.store(cur_tx, std::memory_order_relaxed);
+        g_bus_rx_gbs.store(cur_rx, std::memory_order_relaxed);
+        // BW4: with the HUD option ticked, one log line every 10 s (about 35 KB
+        // an hour) - the value of that moment, like the HUD shows it.
+        static ULONGLONG logged = 0;
+        if (ui_bus_hud() && (logged == 0 || now - logged >= 10000))
+        {
+            logged = now;
+            char l[160];
+            const double to = g_nv_out.load(), ti = g_nv_in.load();
+            char tot[96] = "driver total n/a";
+            if (to >= 0.0 || ti >= 0.0) snprintf(tot, sizeof tot, "driver total: render card out %.2f, neural card in %.2f", to, ti);
+            snprintf(l, sizeof l, "[MGPU][BW4] bus: mod sent %.2f GB/s, received %.2f | game frames ~%.2f GB/s | %s "
+                     "(last second).", cur_tx, cur_rx, g_bus_game_gbs.load(), tot);
+            nvml_start();
+            mgpu::diag::info(l);
+        }
+    }
+}
+// BW3/HUD3: the BUS lines are on the ADVANCED HUD level; this panel option
+// (BusLog, default off) writes them to ReShade.log every 10 s.
+static std::atomic<int> g_bus_hud{-1};
+bool ui_bus_hud()
+{
+    int v = g_bus_hud.load(std::memory_order_relaxed);
+    if (v < 0) { v = ini_read_sr_int("BusLog", 0, 0, 1); g_bus_hud.store(v, std::memory_order_relaxed); }
+    return v != 0;
+}
+void ui_set_bus_hud(bool on)
+{
+    g_bus_hud.store(on ? 1 : 0, std::memory_order_relaxed);
+    (void)ui_ini_write("BusLog", on ? 1 : 0);
+}
+void ui_bus_rates(double &sent_gbs, double &recv_gbs)
+{
+    sent_gbs = g_bus_tx_gbs.load(std::memory_order_relaxed);
+    recv_gbs = g_bus_rx_gbs.load(std::memory_order_relaxed);
+}
+
+// SV1: screen saver - for OLED monitors. After ScreenSaver minutes with no
+// mouse, keyboard or controller input (0 = off; default 10) the picture is
+// covered: black, or the words MGPU BRIDGE drifting slowly in dim grey
+// (ScreenSaverStyle 0 / 1). Any input brings the game back at once. The game
+// keeps running underneath. Never while the panel is open.
+static std::atomic<int> g_sv_min{-1};
+static std::atomic<int> g_sv_style{-1};
+static std::atomic<bool> g_sv_on{false};
+int ui_screensaver_minutes()
+{
+    int v = g_sv_min.load(std::memory_order_relaxed);
+    if (v < 0) { v = ini_read_sr_int("ScreenSaver", 10, 0, 120); g_sv_min.store(v, std::memory_order_relaxed); }
+    return v;
+}
+void ui_set_screensaver_minutes(int m)
+{
+    if (m < 0) m = 0;
+    if (m > 120) m = 120;
+    g_sv_min.store(m, std::memory_order_relaxed);
+    (void)ui_ini_write("ScreenSaver", m);
+}
+int ui_screensaver_style()
+{
+    int v = g_sv_style.load(std::memory_order_relaxed);
+    if (v < 0) { v = ini_read_sr_int("ScreenSaverStyle", 1, 0, 1); g_sv_style.store(v, std::memory_order_relaxed); }
+    return v;
+}
+void ui_set_screensaver_style(int s)
+{
+    s = s ? 1 : 0;
+    g_sv_style.store(s, std::memory_order_relaxed);
+    (void)ui_ini_write("ScreenSaverStyle", s);
+}
+bool ui_screensaver_active() { return g_sv_on.load(std::memory_order_relaxed); }
+
+// Present path (under g_present_mx). Controllers do not count as input for
+// GetLastInputInfo, so XInput is polled too (4 pads, every 250 ms).
+// SV2: a pad counts only when a button changes or a stick / trigger is past
+// its deadzone - the packet number alone changes with every bit of stick
+// drift, and the 2026-11-07 test never went idle. And while the saver is on
+// but not yet showing, the log says every 30 s what is still counting as
+// input (first 10 times), so a never-idle cause is visible.
+static bool screensaver_tick()
+{
+    struct xpad { WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; };
+    struct xstate { DWORD packet; xpad pad; };
+    typedef DWORD (WINAPI *pf_xget)(DWORD, xstate *);
+    static pf_xget xget = nullptr;
+    static bool xtried = false;
+    static ULONGLONG last_pad = 0, polled = 0, said_at = 0;
+    static WORD last_buttons[4] = {};
+    static unsigned said_n = 0;
+    const ULONGLONG now = GetTickCount64();
+    const int mins = ui_screensaver_minutes();
+    bool idle = false;
+    // SV4: the panel holds the countdown. While it is open the saver never
+    // starts, and the wait starts over when it closes - before, the time spent
+    // in the panel counted, so closing it after a minute or more brought the
+    // saver straight up (2026-11-07 17:42:26).
+    static ULONGLONG panel_at = 0;
+    const bool panel = mgpu::live_panel::live() || ui_panel_is_open();   // either window, any mode
+    if (panel) panel_at = now;
+    if (mins > 0 && !panel)
+    {
+        if (!xtried)
+        {
+            xtried = true;
+            HMODULE xm = LoadLibraryW(L"xinput1_4.dll");
+            if (xm == nullptr) xm = LoadLibraryW(L"xinput9_1_0.dll");
+            if (xm != nullptr) xget = (pf_xget)GetProcAddress(xm, "XInputGetState");
+        }
+        if (xget != nullptr && now - polled >= 250)
+        {
+            polled = now;
+            for (DWORD i = 0; i < 4; ++i)
+            {
+                xstate st{};
+                if (xget(i, &st) != 0) continue;   // no pad in that slot
+                auto past = [](SHORT v, int dz) { return v > dz || v < -dz; };
+                const bool moved = st.pad.buttons != last_buttons[i] || st.pad.lt > 30 || st.pad.rt > 30 ||
+                                   past(st.pad.lx, 7849) || past(st.pad.ly, 7849) ||
+                                   past(st.pad.rx, 8689) || past(st.pad.ry, 8689);
+                last_buttons[i] = st.pad.buttons;
+                if (moved) last_pad = now;
+            }
+        }
+        LASTINPUTINFO li{ sizeof li, 0 };
+        const ULONGLONG win_ms = GetLastInputInfo(&li) ? (ULONGLONG)(DWORD)(GetTickCount() - li.dwTime) : 0ull;
+        const ULONGLONG pad_ms = last_pad != 0 ? now - last_pad : ~0ull;
+        // SV3: the mod's own hooks (real keys / real mouse actions only); Windows'
+        // timer only when they are not running.
+        unsigned long long key_ms = 0, mouse_ms = 0;
+        const bool hooks = mgpu::hotkeys::real_input_ages(key_ms, mouse_ms);
+        ULONGLONG idle_ms = hooks ? (key_ms < mouse_ms ? key_ms : mouse_ms) : win_ms;
+        if (pad_ms < idle_ms) idle_ms = pad_ms;
+        if (panel_at != 0 && now - panel_at < idle_ms) idle_ms = now - panel_at;   // SV4
+        idle = idle_ms >= (ULONGLONG)mins * 60000ull;
+        if (!idle && said_n < 10u && (said_at == 0 || now - said_at >= 30000ull))
+        {
+            said_at = now;
+            ++said_n;
+            auto age = [](unsigned long long ms, char *o, size_t n) {
+                if (ms == ~0ull) snprintf(o, n, "never"); else snprintf(o, n, "%llu s ago", ms / 1000ull);
+            };
+            char l[260], kl[24], ml[24], pl[24];
+            age(key_ms, kl, sizeof kl); age(mouse_ms, ml, sizeof ml); age(pad_ms, pl, sizeof pl);
+            if (hooks)
+                snprintf(l, sizeof l, "[MGPU][SV3] screen saver waiting (%d min): key %s, mouse %s, controller %s "
+                         "(Windows' own idle timer: %llu s - not used).", mins, kl, ml, pl, win_ms / 1000ull);
+            else
+                snprintf(l, sizeof l, "[MGPU][SV3] screen saver waiting (%d min): Windows' idle timer %llu s, controller %s "
+                         "(the mod's input hooks are not running).", mins, win_ms / 1000ull, pl);
+            mgpu::diag::info(l);
+        }
+    }
+    if (idle != g_sv_on.load(std::memory_order_relaxed))
+    {
+        g_sv_on.store(idle, std::memory_order_relaxed);
+        char l[160];
+        if (idle) snprintf(l, sizeof l, "[MGPU][SV1] screen saver on (no input for %d min).", mins);
+        else snprintf(l, sizeof l, "[MGPU][SV1] screen saver off.");
+        mgpu::diag::info(l);
+    }
+    return idle;
+}
+
 // Present path: the box's lines (0..2).
 static int clock_lines(char (*out)[24])
 {
@@ -19273,6 +19830,8 @@ struct fg_job
     LARGE_INTEGER t0{};
     double half_ms = 0.0;
     unsigned long long cap_qpc = 0;   // BM1: hand-over time of the real frame
+    float frac[1u + stream_state::FG_MAX_EXTRA] = {};   // DMF5: where each shown in-between frame sits (0 = even)
+    bool clock = false;                // FC1: every generated frame is here; the present thread picks per tick
 };
 static std::mutex g_fgp_mx;
 static std::condition_variable g_fgp_cv;
@@ -19285,6 +19844,10 @@ static std::thread *g_fgp_thread = nullptr;
 static LARGE_INTEGER g_fg_last{};
 static double g_fg_ema_ms = 0.0;
 static HANDLE g_fg_timer = nullptr;
+
+extern std::atomic<unsigned long long> g_fgp_replaced;
+static std::atomic<unsigned long long> &g_fgp_dropped_jobs = g_fgp_replaced;   // one counter (PR1 FQ1 = PERF1)
+static std::atomic<unsigned long long> g_fgp_dropped_frames{0};
 
 // FIX7: references the present thread still holds after submitting, released
 // only once the present fence says the GPU copy that read them is done. An
@@ -19351,8 +19914,53 @@ static void fg_wait_until(const LARGE_INTEGER &t0, double ms)
 
 static unsigned long long s_fw_prev_cap = 0;   // FW1: the previous real frame's hand-over time (present thread)
 
+// ---- FC1: the even frame clock (FGClock=1; dynamic multiplier, NVIDIA FG) ----
+// See fg_clock.hpp. Off by default; live from the panel.
+static std::atomic<int> g_fc_on{-1};
+static int fc_on_now()
+{
+    int v = g_fc_on.load(std::memory_order_relaxed);
+    if (v < 0) { v = ini_read_sr_int("FGClock", 0, 0, 1); g_fc_on.store(v); }
+    return v;
+}
+static mgpu::fg_clock::state g_fc;   // present thread only
+// Frame-time spread of what the present thread shows, in both modes, so the
+// two can be compared from the same [MGPU][FC1] line (present thread only).
+struct fc_spacing { long long last = 0; double n = 0, sum = 0, sq = 0, mx = 0; };
+static fc_spacing g_fcs;
+static void fc_note_present()
+{
+    LARGE_INTEGER q{}, f{};
+    QueryPerformanceCounter(&q);
+    QueryPerformanceFrequency(&f);
+    if (g_fcs.last != 0 && f.QuadPart > 0)
+    {
+        const double ms = (double)(q.QuadPart - g_fcs.last) * 1000.0 / (double)f.QuadPart;
+        if (ms < 100.0) { g_fcs.n += 1; g_fcs.sum += ms; g_fcs.sq += ms * ms; if (ms > g_fcs.mx) g_fcs.mx = ms; }
+    }
+    g_fcs.last = q.QuadPart;
+}
+static void fc_wait_until(double qpc)
+{
+    for (int i = 0; i < 4; ++i)
+    {
+        LARGE_INTEGER n{}, f{};
+        QueryPerformanceCounter(&n);
+        QueryPerformanceFrequency(&f);
+        if (f.QuadPart <= 0) return;
+        const double ms = (qpc - (double)n.QuadPart) * 1000.0 / (double)f.QuadPart;
+        if (ms <= 0.2) return;
+        fg_wait_until(n, ms);   // at most 30 ms per call
+    }
+}
+
 static void fg_present_thread_main()
 {
+    // DMF5: the FGGlobalPace experiment (PERF1, one fixed output clock across
+    // pairs) was retired - measured (518462e3) 208-303 clock rebases per 30 s at
+    // 180-200 fps targets and more flashing than without it - and its code was
+    // removed (GP2). Frames are spaced within each pair.
+    unsigned long long perf1_log_at = GetTickCount64();
     for (;;)
     {
         fg_job job;
@@ -19364,9 +19972,101 @@ static void fg_present_thread_main()
             g_fgp_has = false;
         }
         fg_retire_completed();
+        // PERF1: pending work lost at the hand-off, every 30 s.
+        const unsigned long long perf1_now = GetTickCount64();
+        if (perf1_now - perf1_log_at >= 30000ull)
+        {
+            char line[240];
+            snprintf(line, sizeof line,
+                     "[MGPU][PERF1] handoff: %llu overwritten pending jobs, %llu planned output frames discarded; "
+                     "FGDynamic=%d (Present submissions, not scanouts).",
+                     g_fgp_dropped_jobs.load(std::memory_order_relaxed),
+                     g_fgp_dropped_frames.load(std::memory_order_relaxed),
+                     dyn_on_now());
+            mgpu::diag::info(line);
+            perf1_log_at = perf1_now;
+            // FC1: how even the shown frames were, and what the clock did.
+            if (g_fcs.n > 0 && dyn_on_now() != 0)
+            {
+                const double mean = g_fcs.sum / g_fcs.n;
+                const double var = g_fcs.sq / g_fcs.n - mean * mean;
+                const double sd = var > 0.0 ? std::sqrt(var) : 0.0;
+                LARGE_INTEGER fq{}; QueryPerformanceFrequency(&fq);
+                const double qms = fq.QuadPart > 0 ? 1000.0 / (double)fq.QuadPart : 0.0;
+                char fl[460];
+                if (fc_on_now() != 0)
+                    snprintf(fl, sizeof fl, "[MGPU][FC1] last 30 s, even frame clock ON: frame time %.2f ms average, spread %.2f ms "
+                             "(%.0f%%), longest %.1f ms | ticks late %llu, empty %llu, grid restarts %llu, in-between frames not "
+                             "shown %llu, scene time off by %.2f ms on average, cushion %.2f ms.",
+                             mean, sd, mean > 0 ? 100.0 * sd / mean : 0.0, g_fcs.mx, g_fc.late, g_fc.gaps, g_fc.rebases,
+                             g_fc.skipped, g_fc.shown ? g_fc.err_sum / (double)g_fc.shown * qms : 0.0, g_fc.cushion * qms);
+                else
+                    snprintf(fl, sizeof fl, "[MGPU][FC1] last 30 s, even frame clock off (FGClock=0): frame time %.2f ms "
+                             "average, spread %.2f ms (%.0f%%), longest %.1f ms.",
+                             mean, sd, mean > 0 ? 100.0 * sd / mean : 0.0, g_fcs.mx);
+                mgpu::diag::info(fl);
+            }
+            g_fcs.n = g_fcs.sum = g_fcs.sq = g_fcs.mx = 0;
+            g_fc.clear_counts();
+        }
         bool ok = true;
         unsigned long long fv = 0;   // FIX8: highest value covering this job's copies
-        if (job.gen != nullptr)
+        // FC1: the even frame clock takes the whole pair when it can: it needs
+        // every generated frame (job.clock), the real frame, and the time since
+        // the previous real frame (not after a gap over 200 ms).
+        bool clock_done = false;
+        if (job.clock && job.gen != nullptr && job.real != nullptr && job.cap_qpc != 0ull && s_fw_prev_cap != 0ull &&
+            job.cap_qpc > s_fw_prev_cap)
+        {
+            LARGE_INTEGER fq{}; QueryPerformanceFrequency(&fq);
+            const unsigned long long span = job.cap_qpc - s_fw_prev_cap;
+            const int target = dyn_target_now();
+            if (fq.QuadPart > 0 && span < (unsigned long long)fq.QuadPart / 5ull && target > 0)
+            {
+                ID3D12Resource *fr[2u + stream_state::FG_MAX_EXTRA] = {};
+                double c[2u + stream_state::FG_MAX_EXTRA] = {};
+                unsigned M = 0;
+                ID3D12Resource *seq[1u + stream_state::FG_MAX_EXTRA] = { job.gen };
+                for (unsigned e = 0; e < stream_state::FG_MAX_EXTRA; ++e) seq[1u + e] = job.genx[e];
+                for (unsigned i = 0; i < 1u + stream_state::FG_MAX_EXTRA; ++i)
+                    if (seq[i] != nullptr && job.frac[i] > 0.0f)
+                    {
+                        fr[M] = seq[i];
+                        c[M] = (double)job.cap_qpc - (double)span + (double)span * (double)job.frac[i];
+                        ++M;
+                    }
+                fr[M] = job.real; c[M] = (double)job.cap_qpc; const unsigned real_i = M; ++M;
+                ok = mgpu::fg_clock::run_pair(
+                    g_fc, (double)fq.QuadPart / (double)target, (double)job.t0.QuadPart, (double)span, c, M,
+                    [] { LARGE_INTEGER n{}; QueryPerformanceCounter(&n); return (double)n.QuadPart; },
+                    [](double until) { fc_wait_until(until); },
+                    [&](unsigned j, double) -> bool {
+                        const bool real = (j == real_i);
+                        t_fg_src = fr[j];
+                        t_fg_rest = real ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                        t_fg_is_gen = !real;
+                        t_fg_cap = real ? job.cap_qpc : 0ull;
+                        t_fg_content = real ? job.cap_qpc : (unsigned long long)c[j];   // FW1: the scene time of this frame
+                        const bool pok = present_frame(job.r, job.g, job.b);
+                        t_fg_content = 0; t_fg_cap = 0; t_fg_is_gen = false; t_fg_src = nullptr;
+                        if (t_present_fv > fv) fv = t_present_fv;
+                        if (pok)
+                        {
+                            fc_note_present();
+                            if (!real)
+                            {
+                                g_hud_gen_count.fetch_add(1ull, std::memory_order_relaxed);
+                                g_fg_presented.fetch_add(1ull, std::memory_order_relaxed);
+                            }
+                        }
+                        return pok;
+                    });
+                s_fw_prev_cap = job.cap_qpc;   // FW1
+                clock_done = true;
+            }
+        }
+        if (!clock_done) g_fc.reset();   // the next clocked pair starts a fresh grid
+        if (!clock_done && job.gen != nullptr)
         {
             // DLSSG2: N in-between frames, evenly spaced across the NR interval:
             // frame i at t0 + i*step, the real one at t0 + N*step, where
@@ -19390,8 +20090,9 @@ static void fg_present_thread_main()
                 if (i > 0u) fg_wait_until(job.t0, step * (double)i);
                 t_fg_src = seq[i]; t_fg_rest = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
                 t_fg_is_gen = true;
-                t_fg_content = (span != 0ull) ? cap - span + span * (unsigned long long)(i + 1u) / (unsigned long long)(ng + 1u)
-                                              : cap;
+                t_fg_content = (span == 0ull) ? cap
+                             : (job.frac[i] > 0.0f) ? cap - span + (unsigned long long)((double)span * (double)job.frac[i])   // DMF5
+                             : cap - span + span * (unsigned long long)(i + 1u) / (unsigned long long)(ng + 1u);
                 ok = present_frame(job.r, job.g, job.b);
                 t_fg_content = 0;
                 t_fg_is_gen = false;
@@ -19399,6 +20100,7 @@ static void fg_present_thread_main()
                 if (t_present_fv > fv) fv = t_present_fv;
                 if (ok)
                 {
+                    fc_note_present();   // FC1: spacing, for comparing with the clock
                     g_hud_gen_count.fetch_add(1ull, std::memory_order_relaxed);
                     // FIX7: atomic, so this thread never takes the stream lock here.
                     g_fg_presented.fetch_add(1ull, std::memory_order_relaxed);
@@ -19406,12 +20108,13 @@ static void fg_present_thread_main()
             }
             if (ok) fg_wait_until(job.t0, step * (double)ng);
         }
-        if (ok && job.real != nullptr)
+        if (!clock_done && ok && job.real != nullptr)
         {
             t_fg_src = job.real; t_fg_rest = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             t_fg_cap = job.cap_qpc;
             t_fg_content = job.cap_qpc;   // FW1
             ok = present_frame(job.r, job.g, job.b);
+            if (ok) fc_note_present();
             t_fg_content = 0;
             t_fg_cap = 0;
             if (job.cap_qpc != 0ull) s_fw_prev_cap = job.cap_qpc;   // FW1
@@ -19481,8 +20184,48 @@ bool fg_handoff(float r, float g, float b, bool &failed)
         job.set = k;
         job.real->AddRef();
         if (job.gen != nullptr) job.gen->AddRef();
+        // FC1: with the even frame clock, every generated frame goes to the
+        // present thread with its scene position; it picks one per tick.
+        job.clock = job.gen != nullptr && s.fg_on == 4u && dyn_on_now() != 0 && fc_on_now() != 0;
+        if (job.clock)
+        {
+            const unsigned N = s.fg_ready_n ? s.fg_ready_n : 1u;
+            job.frac[0] = 1.0f / (float)(N + 1u);
+            for (unsigned e = 0; e < stream_state::FG_MAX_EXTRA && e + 2u <= N; ++e)
+                if (s.fg_outx[k][e] != nullptr)
+                {
+                    job.genx[e] = s.fg_outx[k][e]; job.genx[e]->AddRef();
+                    job.frac[e + 1u] = (float)(e + 2u) / (float)(N + 1u);
+                }
+        }
         // DLSSG2: in-between frames 2..N of the same set (FrameGen=4, 3x-6x).
-        if (job.gen != nullptr)
+        else if (job.gen != nullptr && s.fg_ready_show != 0u && s.fg_ready_show < s.fg_ready_n)
+        {
+            // DMF5: show K of the N in-between frames, the ones nearest to even
+            // steps (frame j sits at j/(N+1) of the way; the q-th shown is the j
+            // nearest q/(K+1)). Shown frames are spaced evenly in time; each
+            // keeps its true position for Frame Warp.
+            const unsigned N = s.fg_ready_n, K = s.fg_ready_show;
+            ID3D12Resource *all[1u + stream_state::FG_MAX_EXTRA] = { s.fg_out[k] };
+            for (unsigned e = 0; e < stream_state::FG_MAX_EXTRA; ++e) all[1u + e] = s.fg_outx[k][e];
+            job.gen->Release(); job.gen = nullptr;
+            unsigned prev = 0, slot = 0;
+            for (unsigned q = 1; q <= K; ++q)
+            {
+                unsigned j = (unsigned)std::floor((double)q * (double)(N + 1u) / (double)(K + 1u) + 0.5);
+                if (j <= prev) j = prev + 1u;
+                if (j > N - (K - q)) j = N - (K - q);   // leave room for the rest
+                prev = j;
+                ID3D12Resource *const r = all[j - 1u];
+                if (r == nullptr) continue;
+                r->AddRef();
+                if (slot == 0u) job.gen = r; else job.genx[slot - 1u] = r;
+                job.frac[slot] = (float)j / (float)(N + 1u);
+                ++slot;
+            }
+            if (job.gen == nullptr) { job.gen = s.fg_out[k]; job.gen->AddRef(); job.frac[0] = 0.0f; }
+        }
+        else if (job.gen != nullptr)
             for (unsigned e = 0; e < stream_state::FG_MAX_EXTRA && e + 2u <= s.fg_ready_n; ++e)
                 if (s.fg_outx[k][e] != nullptr) { job.genx[e] = s.fg_outx[k][e]; job.genx[e]->AddRef(); }
         // FIX7: marked busy under the same lock fg_record checks it under.
@@ -19494,7 +20237,10 @@ bool fg_handoff(float r, float g, float b, bool &failed)
     {
         const double dt = (double)(now.QuadPart - g_fg_last.QuadPart) * 1000.0 / (double)fq.QuadPart;
         if (dt > 3.0 && dt < 60.0)
+        {
             g_fg_ema_ms = (g_fg_ema_ms <= 0.0) ? dt : (g_fg_ema_ms * 0.85 + dt * 0.15);
+            g_fg_real_us.store((int)(g_fg_ema_ms * 1000.0), std::memory_order_relaxed);   // DMF1
+        }
     }
     g_fg_last = now;
     job.t0 = now;
@@ -19510,6 +20256,12 @@ bool fg_handoff(float r, float g, float b, bool &failed)
     {
         // The present thread is still busy with the previous pair: drop that
         // pending one (never submitted, so no fence to wait for), keep the newest.
+        g_fgp_dropped_jobs.fetch_add(1ull, std::memory_order_relaxed);
+        unsigned lost = g_fgp_job.real != nullptr ? 1u : 0u;
+        if (g_fgp_job.gen != nullptr) ++lost;
+        for (unsigned e = 0; e < stream_state::FG_MAX_EXTRA; ++e)
+            if (g_fgp_job.genx[e] != nullptr) ++lost;
+        g_fgp_dropped_frames.fetch_add(lost, std::memory_order_relaxed);
         fg_job_drop(g_fgp_job);
     }
     g_fgp_job = job;
@@ -19604,6 +20356,13 @@ void fg_present_stop()
         g_fg_set_fence[k].store(0ull);
     }
     if (ID3D12Fence *pf = g_fg_pfence.exchange(nullptr)) pf->Release();
+    // Shutdown/rearm begins a new drop-count measurement.
+    g_dyn_reset_seq.fetch_add(1u, std::memory_order_release);
+    g_fgp_dropped_jobs.store(0ull, std::memory_order_relaxed);
+    g_fgp_dropped_frames.store(0ull, std::memory_order_relaxed);
+    g_fg_last.QuadPart = 0;
+    g_fg_ema_ms = 0.0;
+    g_fg_real_us.store(0, std::memory_order_relaxed);
 }
 
 // Generated frames per second for the HUD, sampled at most four times a second.
@@ -19695,6 +20454,46 @@ void ui_set_fg_mult(int m)
     (void)ui_ini_write("FGMultiplier", m);
 }
 
+// DMF1: panel side.
+bool ui_fg_dyn_on()            { return dyn_on_now() != 0; }
+void ui_set_fg_dyn_on(bool on)
+{
+    g_dyn_on.store(on ? 1 : 0);
+    g_dyn_reset_seq.fetch_add(1u, std::memory_order_release); // reset occurs on producer
+    (void)ui_ini_write("FGDynamic", on ? 1 : 0);
+}
+int  ui_fg_dyn_target()        { return dyn_target_now(); }
+// FC1: panel side.
+bool ui_fg_clock()             { return fc_on_now() != 0; }
+void ui_set_fg_clock(bool on)
+{
+    g_fc_on.store(on ? 1 : 0);
+    (void)ui_ini_write("FGClock", on ? 1 : 0);
+}
+void ui_set_fg_dyn_target(int v)
+{
+    if (v < 60) v = 60;
+    if (v > 480) v = 480;
+    g_dyn_target.store(v);
+    g_dyn_reset_seq.fetch_add(1u, std::memory_order_release);
+    (void)ui_ini_write("FGDynTarget", v);
+}
+// The average multiplier over the last ~2 s of pairs (0 = none yet).
+float ui_fg_dyn_avg()
+{
+    static unsigned long long p0 = 0, n0 = 0, t0 = 0;
+    static float last = 0.0f;
+    const unsigned long long now = GetTickCount64();
+    const unsigned long long p = g_dyn_planned.load(), n = g_dyn_pairs.load();
+    if (t0 == 0ull) { p0 = p; n0 = n; t0 = now; return last; }
+    if (now - t0 >= 2000ull)
+    {
+        if (n > n0) last = (float)(p - p0) / (float)(n - n0);
+        p0 = p; n0 = n; t0 = now;
+    }
+    return last;
+}
+
 // CS1: Color Strength, 0..1, live.
 float ui_color_strength()
 {
@@ -19737,7 +20536,7 @@ int ui_frame_gen_last()
     return (s.fg_last_mode != 0u) ? (int)s.fg_last_mode : 1;
 }
 
-// FSR1: 0 not tried, 1 running, -1 failed (fell back to the mod's own).
+// FSR1: 0 not tried, 1 running, -1 failed (fell back to BUILT-IN).
 int ui_fsr_state()
 {
     stream_state &s = str();
@@ -19746,7 +20545,7 @@ int ui_fsr_state()
     return s.fsr_up ? 1 : 0;
 }
 
-// DLSSG1: 0 not tried, 1 running, -1 failed (fell back to the mod's own).
+// DLSSG1: 0 not tried, 1 running, -1 failed (fell back to BUILT-IN).
 int ui_dlssg_state()
 {
     stream_state &s = str();
@@ -20157,6 +20956,7 @@ void stream_request()
             mgpu::scaler::set_sharpness(ini_read_sr_int("ScalerSharpness", 50, 0, 100));
             mgpu::scaler::set_mas(ini_read_sr_int("ScalerMAS", 0, 0, 1));              // MAS1
             mgpu::scaler::set_mas_motion(ini_read_sr_int("ScalerMASMotion", 30, 0, 100));
+            mgpu::scaler::set_half(ini_read_sr_int("ScalerHalf", 0, 0, 1));            // NH1
 
             if (s.sr_on != 0u && s.passes != 1u)
             {
@@ -21580,6 +22380,12 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
     // unevenness came from the game and the present path, and each step just
     // cost detail. Below 75% busy, spacing neither lowers NR nor blocks a try up.
     const bool nr_loaded = busy < 0.0 || busy >= 0.75;
+    // DMF4: with the dynamic multiplier mixing counts, uneven spacing is built
+    // in (3x and 4x pairs have different gaps) and no NR scale can remove it.
+    // Measured (4004ed3a): 80% -> 70% in five spacing/short steps at 3.2x with
+    // the card 76-78% busy, spread unchanged at 29-35%. In that mode spacing
+    // never lowers NR; missing frames with the card loaded still do.
+    const bool sp_counts = nr_loaded && dyn_on_now() == 0;
     static LONGLONG sm_said_at = 0;
     char l[320];
 
@@ -21654,15 +22460,19 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
         reduction = true; why = "short";
         hot = 0;
     }
-    else if (uneven && !nr_loaded)
+    else if (uneven && !sp_counts)
     {
         // SM2: not NR - keep the resolution (said at most once a minute).
         if (sm_said_at == 0 || now - sm_said_at > freq * 60)
         {
             sm_said_at = now;
-            snprintf(l, sizeof l, "[MGPU][DR3] uneven spacing (sd %.0f%% of the gap, %d hitch(es)) with the neural "
-                     "card only %.0f%% busy - not NR, resolution kept at %.1f%%.",
-                     sd_rel * 100.0, hits, busy * 100.0, cur / 10.0);
+            if (!nr_loaded)
+                snprintf(l, sizeof l, "[MGPU][DR3] uneven spacing (sd %.0f%% of the gap, %d hitch(es)) with the neural "
+                         "card only %.0f%% busy - not NR, resolution kept at %.1f%%.",
+                         sd_rel * 100.0, hits, busy * 100.0, cur / 10.0);
+            else
+                snprintf(l, sizeof l, "[MGPU][DR3] uneven spacing (sd %.0f%% of the gap) from the dynamic multiplier's "
+                         "mixed counts - not NR, resolution kept at %.1f%%.", sd_rel * 100.0, cur / 10.0);
             mgpu::diag::info(l);
         }
         return false;
@@ -21686,7 +22496,7 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
         {
             next = cur - 20; why = "early warning: neural card nearly full"; hot = 0;
         }
-        else if (ratio >= 0.985 && (steady || !nr_loaded) && now >= up_at && (busy < 0.0 || busy < 0.90))
+        else if (ratio >= 0.985 && (steady || !sp_counts) && now >= up_at && (busy < 0.0 || busy < 0.90))
             next = cur + 20;
     }
     if (last_down != 0 && now - last_down > freq * 120) up_hold_s = 8;   // settled: probe sooner again
@@ -22000,11 +22810,16 @@ static void tf_game_frame()
     static unsigned long long smp_frames[9] = {};   // DR3: game frames counted
     static int smp_cap[9] = {};                      // DR3: Limiter rate in force (0 = off)
     static unsigned long long smp_sn[9] = {}, smp_ssum[9] = {}, smp_ssq[9] = {}, smp_shit[9] = {};   // SM1
+    static unsigned long long smp_plan[9] = {}, smp_pairs[9] = {};   // DMF1
     static unsigned long long prev_gen = 0;
     static unsigned smp_n = 0, smp_i = 0;
     static LONGLONG trip_last = 0;
     static int hold_s = 30;
-    const int mrun = ui_fg_mult_running();
+    const bool dyn_m = dyn_on_now() != 0;   // DMF1
+    const int mrun_real = ui_fg_mult_running();
+    // DMF1: the per-pair count moves by design; a fixed marker keeps the
+    // window "steady", and expected comes from the frames actually planned.
+    const int mrun = (dyn_m && mrun_real >= 2) ? 100 : mrun_real;
     // DR2: NVIDIA FG must be the generator NOW. ui_fg_mult_running() keeps its
     // last value after frame generation is switched off or to AMD, and a
     // window judged against it read "shown 40 of 160" as an overload.
@@ -22050,6 +22865,8 @@ static void tf_game_frame()
             smp_cnt[smp_i] = g_hud_present_count.load(std::memory_order_relaxed);
             smp_t[smp_i] = now; smp_m[smp_i] = mrun; smp_fps[smp_i] = fps;
             smp_frames[smp_i] = game_frames; smp_cap[smp_i] = cap_now;
+            smp_plan[smp_i] = g_dyn_planned.load(std::memory_order_relaxed);
+            smp_pairs[smp_i] = g_dyn_pairs.load(std::memory_order_relaxed);
             smp_sn[smp_i] = sn; smp_ssum[smp_i] = ssum; smp_ssq[smp_i] = ssq; smp_shit[smp_i] = shit;
             smp_i = (smp_i + 1u) % 9u;
             if (smp_n < 9u) ++smp_n;
@@ -22074,7 +22891,13 @@ static void tf_game_frame()
             // DR3: expected = the game frames actually counted in the window
             // x the multiplier in force for all of them (the window is thrown
             // away if the multiplier, the Limiter or generation changed).
-            const double expct = (double)(smp_frames[newest] - smp_frames[oldest]) * (double)smp_m[newest] / dt;
+            double mult_avg = (double)smp_m[newest];
+            if (smp_m[newest] == 100)   // DMF1: the average the window actually asked for
+            {
+                const unsigned long long np = smp_pairs[newest] - smp_pairs[oldest];
+                mult_avg = (np > 0ull) ? (double)(smp_plan[newest] - smp_plan[oldest]) / (double)np : 2.0;
+            }
+            const double expct = (double)(smp_frames[newest] - smp_frames[oldest]) * mult_avg / dt;
             g_tf_out_x10.store((int)(out * 10.0 + 0.5));
             g_tf_exp_x10.store((int)(expct * 10.0 + 0.5));
             const bool shrt = out < expct * 0.92;
@@ -22108,7 +22931,7 @@ static void tf_game_frame()
             // The brake: only with target frame rate on, and only one notch at a time.
             // DR3: also when lowering NR was found not to help (FG/present bound).
             if (shrt && on && !at_active() && (g_dr_on.load() == 0 || dr_at_min() || g_dr_ineff.load() != 0) &&
-                g_tf_brake.load() != 0 && ui_frame_gen() == 4 && smp_m[newest] > 2)
+                g_tf_brake.load() != 0 && ui_frame_gen() == 4 && smp_m[newest] > 2 && smp_m[newest] <= 6)
             {
                 const int ceil_m = smp_m[newest] - 1;
                 hold_s = (trip_last != 0 && now - trip_last < freq * 600) ? (hold_s * 2 > 240 ? 240 : hold_s * 2) : 30;
@@ -23532,6 +24355,14 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
 
     s.produced = fi;
     s.produced_a.store(fi, std::memory_order_release);   // R88: the lock-free mirror
+    {   // BW1: bytes this frame sends to system memory for the neural card
+        unsigned long long b = s.payload_bytes;
+        if (depth_ok) b += s.depth_bytes;
+        if (seal.mvec_valid) b += s.mvec_bytes2;
+        if (s.hud_off != 0 && s.hud_slot_frame[slot].load(std::memory_order_relaxed) == fi) b += s.payload_bytes;
+        g_bus_tx.fetch_add(b, std::memory_order_relaxed);
+        g_bus_game.fetch_add(s.payload_bytes, std::memory_order_relaxed);   // BW5: the game's own frame, once per present
+    }
 
     // ---- R78: ARM THE NEXT SLOT'S MVec FLAG AT ZERO ----
     //
@@ -23586,6 +24417,7 @@ void stream_hud_copy(void *cmd_list_v, unsigned long long handle)
     cd.PlacedFootprint = s.fp;
     cd.PlacedFootprint.Offset = (UINT64)slot * s.slot_bytes + s.hud_off;
     gl->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
+    s.hud_slot_src[slot].store(handle, std::memory_order_relaxed);   // HLD2
     if (s.hud_slot_valid[slot].load(std::memory_order_relaxed) == 0u)
         s.hud_copies.fetch_add(1, std::memory_order_relaxed);
     s.hud_slot_valid[slot].store(1u, std::memory_order_release);
@@ -24290,6 +25122,16 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 s.ui_cnt_last = v;
                 const double area = (double)s.width * (double)s.height;
                 const double frac = (area > 0.0) ? (double)delta / area : 0.0;
+                // HLD2: name the source of any copy that differs by more than 12%
+                // (the first 40), and of the first 10 that match, for contrast.
+                if (frac > 0.12 ? s.hld2_lines < 40u : s.hld2_ok_lines < 10u)
+                {
+                    if (frac > 0.12) ++s.hld2_lines; else ++s.hld2_ok_lines;
+                    snprintf(line, sizeof line, "[MGPU][HLD2] menu check: %.0f%% differs, HUD-less copy from texture 0x%llx.",
+                             frac * 100.0, s.ui_cnt_src);
+                    mgpu::diag::info(line);
+                }
+                mgpu::hudprobe::report_copy(s.ui_cnt_src, frac);   // HL5d
                 // Measured: RoboCop's pause menu 39%. In-game HUD stays far below.
                 if (frac > 0.25) { s.ui_game_ev = 0; ++s.ui_menu_ev; }
                 else if (frac < 0.12) { s.ui_menu_ev = 0; ++s.ui_game_ev; }
@@ -25959,9 +26801,17 @@ void stream_poll()
                                      : (s.mvec_slot_frame[slot].load(std::memory_order_acquire) == f);   // FIX5
         const bool fr_hud   = use_cq ? (s.cq_hud_ok[ii] != 0u)
                                      : hl_frame_ok(s, slot, f, ii);   // HL1
+        if (fr_hud) s.hud_src_ii[ii] = s.hud_slot_src[slot].load(std::memory_order_relaxed);   // HLD2
 
         // REV6: see the bulk path - not while the previous list may still run.
         if (s.nf != nullptr && s.nf->GetCompletedValue() < s.nf_value) return;
+        {   // BW1: bytes this frame reads from system memory onto the neural card
+            unsigned long long b = s.payload_bytes;
+            if (fr_depth) b += s.depth_bytes;
+            if (fr_mvec) b += s.mvec_bytes2;
+            if (fr_hud) b += s.payload_bytes;
+            g_bus_rx.fetch_add(b, std::memory_order_relaxed);
+        }
         const bool hl3 = hl3_frame(s, fr_hud);   // HL3: game's own frame, no NR / generation
         const bool nr_on = s.neural && !hl3;
         HRESULT h = s.na->Reset();

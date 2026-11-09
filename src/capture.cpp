@@ -1175,7 +1175,7 @@ struct bm_job
 
 const char *fg_name(int m)
 {
-    switch (m) { case 0: return "off"; case 1: return "mod's own"; case 2: return "motion view";
+    switch (m) { case 0: return "off"; case 1: return "built-in"; case 2: return "motion view";
                  case 3: return "AMD FSR 3"; case 4: return "NVIDIA DLSS FG"; default: return "?"; }
 }
 

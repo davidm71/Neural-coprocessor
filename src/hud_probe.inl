@@ -24,6 +24,7 @@ struct hcand
     unsigned w, h, fmt;
     std::atomic<unsigned long long> bars;   // barriers seen on it, all time
     std::atomic<unsigned> last_old, last_new;
+    std::atomic<unsigned long long> seen;   // HL5: frame of its last barrier (table replacement)
 };
 
 const unsigned HMAX = 128;
@@ -61,6 +62,125 @@ std::atomic<unsigned long long> g_hl_fires{ 0 };
 std::atomic<unsigned long long> g_hl_fire_frame{ 0 };
 std::atomic<unsigned long long> g_hl_fire_ms{ 0 };   // HL3: GetTickCount64 of the last copy
 std::atomic<unsigned long long> g_hl_unlocks{ 0 };
+// HL4: during action RoboCop moves its finished scene to another texture of
+// the same size and format every few seconds (2026-11-06: 13 LOCKED lines in
+// 3 minutes, 1382 of 6001 frames without the copy). Each move cost 60 frames
+// (~1.7 s at 36 fps) before the new one was locked, and HL3 read the gap as a
+// menu: no NR and no frame generation for that time. Once a lock has been
+// copying recently, a replacement that wins 2 frames running is taken at once.
+std::atomic<bool> g_hl_ever{ false };
+std::atomic<unsigned long long> g_hl_relocks{ 0 };
+// HL5: after the first lock, the copy FOLLOWS the scene's role instead of a
+// handle: whatever display-size texture of the back buffer's format went
+// render target -> shader resource last before the back buffer went into
+// render target is this frame's HUD-less scene, and when it is not the
+// locked one it is copied right there (its state is the one its own last
+// barrier set, not a guess). 2026-11-06 (HL4 build): after a save was loaded
+// nothing was locked for 54 s while the camera followed the mouse - no frame
+// generation in that scene - which a game cycling its scene through several
+// textures, or the 128-entry table running full, both explain; this covers
+// the first, the table replacement below the second. HudFollow=0 turns the
+// following off (the vote alone, as before).
+bool g_hl_follow = true;
+// HLD1: a one-time trace for the save that still flickered on HL5b (the
+// follow still ran every other frame). Armed after 50 follows; then for 40
+// frames every barrier on a display-size texture of the back buffer's format
+// that enters or leaves render target, and every back-buffer transition, is
+// written as one line per frame, in recording order. Logging only.
+std::mutex g_dbg_mx;
+std::atomic<int> g_dbg{ 0 };          // 0 idle, 1 recording, 2 done
+unsigned g_dbg_frames = 0;
+char g_dbg_line[1800];
+int g_dbg_len = 0;
+void dbg_add(const char *piece)
+{
+    std::lock_guard<std::mutex> lk(g_dbg_mx);
+    const int room = (int)sizeof g_dbg_line - g_dbg_len;
+    if (room < 64) return;
+    g_dbg_len += snprintf(g_dbg_line + g_dbg_len, (size_t)room, "%s", piece);
+}
+std::atomic<unsigned long long> g_hl_follows{ 0 };
+// HL5c: the HLD1 trace (2026-11-07) showed the flickering save renders with
+// TWO complete sets of post-process textures (4 each) and switches between
+// them (A A A B ...); each set's last texture is the scene. The HL5 follow
+// copied at the back-buffer barrier - that copy was the one HL2 judged 100%
+// different. Now every texture that has been the last candidate before the
+// back buffer goes into render target joins a small set, and the copy runs
+// at the texture's OWN render target -> shader resource barrier, exactly like
+// the locked texture's copy has always done. A set member that is not the
+// last this frame may be copied first; the real last one is copied after it
+// on the same queue and wins.
+const unsigned kSet = 4u;
+std::atomic<unsigned long long> g_set[kSet];
+std::atomic<unsigned long long> g_set_t[kSet];   // frame it was last seen as the scene
+bool in_set(unsigned long long h)
+{
+    for (unsigned i = 0; i < kSet; ++i)
+        if (g_set[i].load(std::memory_order_relaxed) == h) return true;
+    return false;
+}
+bool banned(unsigned long long h);   // HL5d, below
+void set_note(unsigned long long h, unsigned long long frame)
+{
+    if (banned(h)) return;   // HL5d
+    unsigned lru = 0; unsigned long long lt = ~0ull;
+    for (unsigned i = 0; i < kSet; ++i)
+    {
+        if (g_set[i].load(std::memory_order_relaxed) == h) { g_set_t[i].store(frame); return; }
+        const unsigned long long t = g_set[i].load() == 0 ? 0ull : g_set_t[i].load() + 1ull;
+        if (t < lt) { lt = t; lru = i; }
+    }
+    g_set[lru].store(h); g_set_t[lru].store(frame);
+    const unsigned long long nf = g_hl_follows.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (nf <= 4u)
+    {
+        char l[220];
+        snprintf(l, sizeof l, "[MGPU][HL5] texture 0x%llx holds the game's scene - added to the scene set "
+                 "(%llu added so far; copied at its own barrier from now on).", h, nf);
+        mgpu::diag::info(l);
+    }
+}
+// HL5d: UI2 (one locked texture, set-B frames without a copy) shows that
+// save cleanly, so set B's picture may simply not be the scene. The menu
+// check reports each copy's source: a texture whose copies differ by more
+// than 25% twice, more often than they match, is banned - its frames run
+// with the HUD in, as UI2 did. Bans are kept until the texture is destroyed.
+const unsigned kBan = 8u;
+std::atomic<unsigned long long> g_ban[kBan];
+std::atomic<unsigned> g_ban_n{ 0 };
+struct copy_score { std::atomic<unsigned long long> h; std::atomic<unsigned> bad, good; };
+copy_score g_score[kSet * 2];
+bool banned(unsigned long long h)
+{
+    if (h == 0) return false;
+    for (unsigned i = 0; i < kBan; ++i) if (g_ban[i].load(std::memory_order_relaxed) == h) return true;
+    return false;
+}
+void set_remove(unsigned long long h);
+void ban(unsigned long long h, unsigned bad, unsigned good)
+{
+    if (banned(h)) return;
+    const unsigned i = g_ban_n.fetch_add(1, std::memory_order_relaxed) % kBan;
+    g_ban[i].store(h, std::memory_order_relaxed);
+    set_remove(h);
+    if (g_hl_lock.load() == h) g_hl_lock.store(0);
+    char l[260];
+    snprintf(l, sizeof l, "[MGPU][HL5] texture 0x%llx does not hold the scene (its copies differed from the "
+             "frame %u times, matched %u) - not copied from now on; those frames run with the HUD in.", h, bad, good);
+    mgpu::diag::info(l);
+}
+void set_remove(unsigned long long h)
+{
+    for (unsigned i = 0; i < kSet; ++i)
+        if (g_set[i].load(std::memory_order_relaxed) == h) g_set[i].store(0);
+}
+unsigned set_size()
+{
+    unsigned k = 0;
+    for (unsigned i = 0; i < kSet; ++i) if (g_set[i].load(std::memory_order_relaxed) != 0) ++k;
+    return k;
+}
+std::atomic<unsigned long long> g_t_replaced{ 0 };
 std::atomic<unsigned long long> g_frame_a{ 0 };
 
 // One recorded event of the capture frame.
@@ -212,9 +332,27 @@ void on_init_resource_hp(reshade::api::device *device, const reshade::api::resou
         if (g_t[i].handle == resource.handle) return;
         if (slot < 0 && g_t[i].handle == 0) slot = (int)i;
     }
+    if (slot < 0 && n >= HMAX)
+    {
+        // HL5: full. Reuse the entry whose last barrier is oldest (never the
+        // locked, voted or newest candidate) instead of ignoring every new
+        // texture from here on.
+        const unsigned long long keep1 = g_hl_lock.load(), keep2 = g_hl_vote.load(), keep3 = g_hl_last.load();
+        unsigned long long best = ~0ull;
+        for (unsigned i = 0; i < n; ++i)
+        {
+            const unsigned long long hh = g_t[i].handle;
+            if (hh == keep1 || hh == keep2 || hh == keep3) continue;
+            const unsigned long long sn = g_t[i].seen.load(std::memory_order_relaxed);
+            if (sn < best) { best = sn; slot = (int)i; }
+        }
+        if (slot < 0) return;
+        if (g_t_replaced.fetch_add(1, std::memory_order_relaxed) == 0)
+            mgpu::diag::info("[MGPU][HL5] the texture table is full (128) - the least recently used entries are "
+                             "replaced from now on (counted in the [MGPU][HL1] probe line).");
+    }
     if (slot < 0)
     {
-        if (n >= HMAX) return;
         slot = (int)n;
     }
     hcand &c = g_t[slot];
@@ -222,6 +360,7 @@ void on_init_resource_hp(reshade::api::device *device, const reshade::api::resou
     c.bars.store(0, std::memory_order_relaxed);
     c.last_old.store(0, std::memory_order_relaxed);
     c.last_new.store(0, std::memory_order_relaxed);
+    c.seen.store(g_frame_a.load(std::memory_order_relaxed), std::memory_order_relaxed);   // HL5
     c.handle = resource.handle;
     if ((unsigned)slot == n) g_n.store(n + 1, std::memory_order_release);
 }
@@ -237,6 +376,10 @@ void on_destroy_resource_hp(reshade::api::device *, reshade::api::resource resou
     if (g_hl_lock.load() == resource.handle) { g_hl_lock.store(0); g_hl_unlocks.fetch_add(1); }
     if (g_hl_vote.load() == resource.handle) { g_hl_vote.store(0); g_hl_streak.store(0); }
     if (g_hl_last.load() == resource.handle) g_hl_last.store(0);
+    set_remove(resource.handle);   // HL5c: an address can be reused by a new texture
+    for (unsigned i = 0; i < kBan; ++i)   // HL5d: and a banned address may come back as a new texture
+        if (g_ban[i].load() == resource.handle) g_ban[i].store(0);
+    for (auto &sc : g_score) if (sc.h.load() == resource.handle) sc.h.store(0);
 }
 
 // Copies `res` (currently in reshade state `state`) into a new readback
@@ -306,6 +449,52 @@ bool fresh(unsigned o, unsigned n)
     return written || read;
 }
 
+// HL5: copy c (this frame's HUD-less scene, not the locked texture) on the
+// list that is moving the back buffer into render target, and lock onto it.
+// Its state is the one its own last barrier set; anything that is not a
+// shader-read state is left alone.
+void follow_copy(reshade::api::command_list *cl, unsigned long long c)
+{
+    if (g_hl_hook == nullptr) return;
+    const int ci = find_hc(c);
+    if (ci < 0) return;
+    const unsigned cs = g_t[ci].last_new.load(std::memory_order_relaxed);
+    if ((cs & 0xC0u) == 0u || cs == 0x80000000u || cs == 0x80000804u) return;
+    ID3D12GraphicsCommandList *gl = reinterpret_cast<ID3D12GraphicsCommandList *>(
+        static_cast<uintptr_t>(cl->get_native()));
+    if (gl == nullptr || gl->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+    using ru = reshade::api::resource_usage;
+    const reshade::api::resource r = { c };
+    cl->barrier(r, static_cast<ru>(cs), ru::copy_source);
+    g_hl_hook(reinterpret_cast<void *>(gl), c);
+    cl->barrier(r, ru::copy_source, static_cast<ru>(cs));
+    g_hl_fires.fetch_add(1, std::memory_order_relaxed);
+    g_hl_fire_frame.store(g_frame_a.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    g_hl_fire_ms.store(GetTickCount64(), std::memory_order_relaxed);
+    g_hl_lock.store(c, std::memory_order_relaxed);
+    g_hl_vote.store(c, std::memory_order_relaxed);
+    const unsigned long long nf = g_hl_follows.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (g_dbg.load(std::memory_order_relaxed) == 1)
+    {
+        char pc[48]; snprintf(pc, sizeof pc, " FOLLOW>%llx", c & 0xFFFFFull); dbg_add(pc);
+    }
+    if (nf == 50u)   // HLD1: arm the trace once
+    {
+        { std::lock_guard<std::mutex> lk(g_dbg_mx); g_dbg_len = 0; g_dbg_line[0] = 0; g_dbg_frames = 0; }
+        int expect = 0;
+        if (g_dbg.compare_exchange_strong(expect, 1))
+            mgpu::diag::info("[MGPU][HLD1] scene texture trace: the next 40 frames, one line each "
+                             "(handle:old>new state, * = candidate, /t = thread; BB = back buffer).");
+    }
+    if (nf <= 3u)
+    {
+        char l[240];
+        snprintf(l, sizeof l, "[MGPU][HL5] the game's scene is in texture 0x%llx this frame - copied from there "
+                 "and followed (%llu so far; later ones are counted in the probe line).", c, nf);
+        mgpu::diag::info(l);
+    }
+}
+
 void on_barrier_hp(reshade::api::command_list *cl, uint32_t count,
                    const reshade::api::resource *res,
                    const reshade::api::resource_usage *old_states,
@@ -340,6 +529,7 @@ void on_barrier_hp(reshade::api::command_list *cl, uint32_t count,
             g_t[idx].bars.fetch_add(1, std::memory_order_relaxed);
             g_t[idx].last_old.store(o, std::memory_order_relaxed);
             g_t[idx].last_new.store(n, std::memory_order_relaxed);
+            g_t[idx].seen.store(g_frame_a.load(std::memory_order_relaxed), std::memory_order_relaxed);   // HL5
         }
         if (hl)
         {
@@ -349,10 +539,19 @@ void on_barrier_hp(reshade::api::command_list *cl, uint32_t count,
                               n != 0x80000000u && n != 0x80000804u &&
                               g_t[idx].fmt == g_bb_fmt.load(std::memory_order_relaxed) &&
                               display_res(g_t[idx].w, g_t[idx].h);
+            if (g_dbg.load(std::memory_order_relaxed) == 1 && idx >= 0 && (o == 0x4u || n == 0x4u) &&
+                g_t[idx].fmt == g_bb_fmt.load(std::memory_order_relaxed) && display_res(g_t[idx].w, g_t[idx].h))
+            {
+                char pc[64];
+                snprintf(pc, sizeof pc, " %llx:%x>%x%s/t%lu", h & 0xFFFFFull, o, n, cand ? "*" : "",
+                         (unsigned long)(GetCurrentThreadId() % 100000u));
+                dbg_add(pc);   // HLD1
+            }
             if (cand)
             {
                 g_hl_last.store(h, std::memory_order_relaxed);
-                if (h == g_hl_lock.load(std::memory_order_relaxed) && g_hl_hook != nullptr)
+                if ((h == g_hl_lock.load(std::memory_order_relaxed) ||
+                     (g_hl_follow && in_set(h))) && !banned(h) && g_hl_hook != nullptr)   // HL5c/d
                 {
                     ID3D12GraphicsCommandList *gl = reinterpret_cast<ID3D12GraphicsCommandList *>(
                         static_cast<uintptr_t>(cl->get_native()));
@@ -372,15 +571,44 @@ void on_barrier_hp(reshade::api::command_list *cl, uint32_t count,
             }
             // The back buffer going INTO render target: whatever finished last
             // is the scene the game is about to draw into it.
+            if (bbi >= 0 && g_dbg.load(std::memory_order_relaxed) == 1)   // HLD1
+            {
+                char pc[96];
+                snprintf(pc, sizeof pc, " | BB%d:%x>%x last=%llx lock=%llx fired=%d", bbi, o, n,
+                         g_hl_last.load() & 0xFFFFFull, g_hl_lock.load() & 0xFFFFFull,
+                         g_hl_fire_frame.load() == g_frame_a.load() ? 1 : 0);
+                dbg_add(pc);
+            }
             if (bbi >= 0 && o != 0x4u && n == 0x4u)
             {
                 const unsigned long long c = g_hl_last.load(std::memory_order_relaxed);
-                if (c != 0)
+                if (c != 0 && g_hl_follow && g_hl_ever.load(std::memory_order_relaxed))
+                {
+                    // HL5: follow the role. When c is the locked texture its
+                    // copy already ran at its own barrier this frame.
+                    // HL5b: and only when the locked texture was NOT copied
+                    // this frame. One save (2026-11-06) drew a second
+                    // display-size texture after the scene every other frame;
+                    // following it copied a non-scene image half the time and
+                    // HL2 flipped "menu" on and off every 2 frames (severe
+                    // distortion). A lock that is still being drawn each frame
+                    // is kept; only a lock that has stopped is replaced.
+                    // HL5c: no copy here any more. c joins the scene set and is
+                    // copied at its own barrier from the next time it is drawn.
+                    set_note(c, g_frame_a.load(std::memory_order_relaxed));
+                    if (!banned(c)) g_hl_lock.store(c, std::memory_order_relaxed);   // HL5d
+                    (void)&follow_copy;
+                }
+                else if (c != 0)
                 {
                     if (c == g_hl_vote.load(std::memory_order_relaxed))
                     {
                         const unsigned st = g_hl_streak.fetch_add(1, std::memory_order_relaxed) + 1u;
-                        if (st == 60u && g_hl_lock.load(std::memory_order_relaxed) != c)
+                        // HL4: 2 frames when a lock was copying within the last 3 s.
+                        const bool fast = g_hl_ever.load(std::memory_order_relaxed) &&
+                                          GetTickCount64() - g_hl_fire_ms.load(std::memory_order_relaxed) < 3000ull;
+                        const unsigned need = fast ? 2u : 60u;
+                        if (st >= need && g_hl_lock.load(std::memory_order_relaxed) != c)
                         {
                             // The 300-frame "not seen" timer starts NOW. Without
                             // this it measured from frame 0 and let go of the
@@ -388,12 +616,28 @@ void on_barrier_hp(reshade::api::command_list *cl, uint32_t count,
                             g_hl_fire_frame.store(g_frame_a.load(std::memory_order_relaxed),
                                                   std::memory_order_relaxed);
                             g_hl_lock.store(c, std::memory_order_relaxed);
+                            const bool first = !g_hl_ever.exchange(true, std::memory_order_relaxed);
                             char l[300];
-                            snprintf(l, sizeof l,
-                                     "[MGPU][HL1] LOCKED onto the HUD-less scene texture 0x%llx "
-                                     "(won 60 frames running). It is copied to the neural card "
-                                     "every frame from now on.", c);
-                            mgpu::diag::info(l);
+                            if (fast && !first)
+                            {
+                                // HL4: one line for the first few, then every 25th.
+                                const unsigned long long r = g_hl_relocks.fetch_add(1, std::memory_order_relaxed) + 1u;
+                                if (r <= 3u || r % 25u == 0u)
+                                {
+                                    snprintf(l, sizeof l,
+                                             "[MGPU][HL4] the game moved its scene to texture 0x%llx - followed "
+                                             "after 2 frames (%llu move(s) followed so far).", c, r);
+                                    mgpu::diag::info(l);
+                                }
+                            }
+                            else
+                            {
+                                snprintf(l, sizeof l,
+                                         "[MGPU][HL1] LOCKED onto the HUD-less scene texture 0x%llx "
+                                         "(won %u frames running). It is copied to the neural card "
+                                         "every frame from now on.", c, need);
+                                mgpu::diag::info(l);
+                            }
                         }
                     }
                     else
@@ -711,6 +955,8 @@ void start()
     const char *hv = mgpu::config::find(buf, strlen(buf), "HudLess");
     const bool probe_on = v != nullptr && atoi(v) == 1;
     const bool hl_on = hv != nullptr && atoi(hv) == 1;
+    const char *fv = mgpu::config::find(buf, strlen(buf), "HudFollow");   // HL5
+    g_hl_follow = !(fv != nullptr && atoi(fv) == 0);
     if (!probe_on && !hl_on) return;
     g_hl_on.store(hl_on);
     reshade::register_event<reshade::addon_event::init_resource>(on_init_resource_hp);
@@ -736,6 +982,34 @@ void stop()
 }
 
 bool enabled() { return g_enabled.load(std::memory_order_relaxed); }
+
+void report_copy(unsigned long long h, double frac)   // HL5d: from the menu check
+{
+    if (h == 0 || !g_hl_follow) return;
+    copy_score *sc = nullptr, *free_sc = nullptr;
+    for (auto &x : g_score)
+    {
+        const unsigned long long xh = x.h.load();
+        if (xh == h) { sc = &x; break; }
+        if (xh == 0 && free_sc == nullptr) free_sc = &x;
+    }
+    if (sc == nullptr)
+    {
+        if (free_sc == nullptr) { free_sc = &g_score[0]; }   // full: reuse the first
+        free_sc->h.store(h); free_sc->bad.store(0); free_sc->good.store(0);
+        sc = free_sc;
+    }
+    // A real menu makes EVERY texture's copy differ, so a bad verdict only
+    // counts against h when the verdict before it was for another texture and
+    // matched - h is the odd one out, not the screen.
+    static unsigned long long last_h = 0;
+    static double last_frac = 1.0;
+    if (frac > 0.25) { if (last_h != h && last_frac < 0.12) sc->bad.fetch_add(1); }
+    else if (frac < 0.12) sc->good.fetch_add(1);
+    last_h = h; last_frac = frac;
+    const unsigned b = sc->bad.load(), g = sc->good.load();
+    if (b >= 2u && b > g) ban(h, b, g);
+}
 
 void set_copy_hook(void (*fn)(void *cmd_list_native, unsigned long long resource))
 {
@@ -790,6 +1064,18 @@ void note_frame(void *effect_runtime_ptr, void *command_list_ptr)
     }
     g_bb_fmt.store(bb_fmt, std::memory_order_relaxed);
     g_frame_a.store(g_frame, std::memory_order_relaxed);
+    if (g_dbg.load(std::memory_order_relaxed) == 1)   // HLD1: one line per frame
+    {
+        char l[1900];
+        {
+            std::lock_guard<std::mutex> lk(g_dbg_mx);
+            snprintf(l, sizeof l, "[MGPU][HLD1] f%llu:%s", g_frame, g_dbg_line);
+            g_dbg_len = 0; g_dbg_line[0] = 0;
+            ++g_dbg_frames;
+        }
+        mgpu::diag::info(l);
+        if (g_dbg_frames >= 40u) g_dbg.store(2);
+    }
     if (g_hl_on.load(std::memory_order_relaxed))
     {
         // A locked texture that has not been seen for 5 s (a menu, a level
@@ -805,8 +1091,10 @@ void note_frame(void *effect_runtime_ptr, void *command_list_ptr)
         if ((g_frame % 3600ull) == 1800ull)
         {
             char l[300];
-            snprintf(l, sizeof l, "[MGPU][HL1] probe: locked=0x%llx, copies fired %llu, unlocks %llu.",
-                     g_hl_lock.load(), g_hl_fires.load(), g_hl_unlocks.load());
+            snprintf(l, sizeof l, "[MGPU][HL1] probe: locked=0x%llx, copies fired %llu, unlocks %llu, moves followed "
+                     "%llu (2-frame), scene set %u (%llu added), table %u of %u, entries replaced %llu.",
+                     g_hl_lock.load(), g_hl_fires.load(), g_hl_unlocks.load(), g_hl_relocks.load(),
+                     set_size(), g_hl_follows.load(), g_n.load(), HMAX, g_t_replaced.load());
             mgpu::diag::info(l);
         }
     }

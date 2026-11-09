@@ -52,21 +52,50 @@ Research code, not a product. Run games with anti-cheat and online games at your
 **Frame generation on the second card** (`FrameGen`, panel, `CTRL+ALT+G`)
 - In-between frames are made on the neural card from the game's motion vectors and depth,
   so the render card does no extra work. Three generators, switchable live:
-  `FrameGen=1` the mod's own warp, `3` AMD FSR 3 frame generation (needs
+  `FrameGen=1` BUILT-IN (the mod's own warp), `3` AMD FSR 3 frame generation (needs
   `amd_fidelityfx_framegeneration_dx12.dll` in the `mgpu` folder), `4` NVIDIA DLSS Frame
   Generation (RTX 40/50 neural card; uses the driver's own model, nothing to download).
 - NVIDIA mode does 2x to 6x (`FGMultiplier`, also in the panel), as far as the neural card's
   driver allows (RTX 40: 2x; RTX 50: 4x, 6x on newer drivers - the panel greys out the rest). If a generator cannot
-  start, or fails three times, the mod's own takes over and the panel says so in red.
+  start, or fails three times, BUILT-IN takes over and the panel says so in red.
   Games with an older Streamline (RoboCop: Rogue City) do not report how many in-between
   frames the driver allows; the mod then tries the multiplier you set and drops to 2x if it
   is refused.
+- **Dynamic multiplier** (`FGDynamic=1`, `FGDynTarget` in fps, default 180; "dynamic
+  multiplier" in the panel, NVIDIA mode only): instead of a fixed multiplier against a capped
+  game, each real frame gets as many in-between frames as it takes to reach the target - at
+  67 fps real and 180 shown, about seven frames in ten get 3x and three get 2x (2.69x on
+  average), like DLSS 4.5's Dynamic Multi Frame Generation. The game needs no cap. Spacing
+  is even within each real frame but changes slightly between them, so a fixed cap ×
+  multiplier stays the steadier choice; the log's `[MGPU][DMF1]` line gives the average and
+  the mix every 30 s. Target frame rate and auto-tune are off while it is on.
+  NVIDIA's generator is always asked for the same number of in-between frames (the most a
+  pair needs, changed only after about half a second), and the fraction comes from showing
+  fewer of them on some pairs - so its history never sees a count change, which flashed.
+- **Even frame clock** (`FGClock=1`, off by default; "Frame spacing: Even clock" under the dynamic
+  multiplier - "Per real frame", the default, is the original method; switch either way at any time,
+  live; NVIDIA mode with the dynamic multiplier only): instead of spacing the frames of each real
+  frame evenly inside it (5.0 ms apart in a pair of 3, 7.5 ms in a pair of 2 at 67 → 180 fps), every
+  frame is shown on one steady clock at the shown-fps target (5.56 ms). For each tick the in-between
+  frame nearest in scene time is shown, so motion stays at the right speed; the clock follows the
+  real frames (it does not run on its own, which is why the earlier global pacing failed), and a
+  late tick carries on from where it is, skipping frames that are now stale instead of rushing them.
+  In simulation (`tests/fg_clock_test.cpp`) the frame-time spread drops from 1.1-2.7 ms to
+  0.02-1.8 ms and motion is steadier, for about one tick (4-7 ms) more delay. Every 30 s
+  `[MGPU][FC1]` gives the frame-time spread with the clock on or off, so the two can be compared,
+  and what the clock did (late or empty ticks, grid restarts). Best with G-SYNC and bridge vsync off.
 - **HUD-less mode** (`HudLess=1`, D3D12): frame generation runs on the scene without the
   HUD and the HUD is laid back on top, so text and markers never warp.
   Full-screen menus are recognised (most of the screen differs from the scene) and shown as
   the game draws them, so they are never see-through. When the game stops drawing its scene
   (loading, exit to the main menu) its frames are also shown as drawn until the scene is back,
-  so the menu does not shake.
+  so the menu does not shake. Once the scene texture has been found, the mod follows the
+  game's finished scene from frame to frame even when the game keeps moving it to other textures
+  (RoboCop does this in action and after loading some saves): each frame it copies whichever
+  texture holds the scene (`[MGPU][HL5]`), so neural rendering and frame generation keep running.
+  Games that alternate between whole sets of post-process textures are handled by keeping a
+  small set of known scene textures and copying each at its own barrier.
+  `HudFollow=0` turns that off and keeps only the original 60-frame lock.
 - NVIDIA mode's camera data is estimated: set `FSRFov` to the game's horizontal FOV if
   nearby objects wobble in generated frames.
 - **Cap the game's frame rate for 3x/4x** - see Recommended setup.
@@ -108,7 +137,7 @@ Research code, not a product. Run games with anti-cheat and online games at your
   (a new highest takes effect at the next start); when the scale moves nothing is rebuilt - NR
   works on part of the reduced texture and its history restarts for that one frame.
   It works with NVIDIA frame generation only (the box is greyed out otherwise); with FSR 3,
-  the mod's own generator or frame generation off, the fixed `SRScale` is used.
+  BUILT-IN frame generation or frame generation off, the fixed `SRScale` is used.
   - **What it steers by:** every clean 2 s, the frames shown against the game frames counted ×
     the multiplier (primary), and the neural card's **busy time** - the share of each second it
     spent executing the mod's work, from GPU timestamps on every list, overlapping work counted
@@ -191,7 +220,13 @@ Research code, not a product. Run games with anti-cheat and online games at your
 - **FSR 1 / NIS scaling** (`Scaler`, panel View section): when a game is set below the
   monitor's resolution, the picture is enlarged to the monitor with AMD FSR 1 or NVIDIA Image
   Scaling (with a sharpness slider) instead of Windows' plain stretch. Spatial, so every frame
-  including generated ones is scaled; built in, no DLL.
+  including generated ones is scaled; built in, no DLL. FSR 1 and NIS are compiled from source
+  in the background when scaling starts (about 3 s for NIS); plain bilinear is shown until they
+  are ready, so the game does not freeze (`[MGPU][SC1] compiled in the background` in the log).
+  If another program (for example the Explorer folder the game was started from) takes the
+  foreground in the first 3 s after the scaled picture appears, the mod gives it back to the game
+  (up to 4 tries, `[MGPU][SC10]`) and keeps the picture up meanwhile; after that, switching away
+  makes the picture step aside as before.
   Typical use: a 4K monitor with the game windowed at 2560x1440 (set before launch). Works
   with `DcompOverlay=1`: the picture is shown on a click-through cover over the monitor, so
   the game keeps focus and input. As in Lossless Scaling, the mouse pointer is drawn on the
@@ -207,6 +242,17 @@ Research code, not a product. Run games with anti-cheat and online games at your
   ESC or Home closes it.
   The panel opens in its own window, in front and wide (it can be resized, never narrower than
   its content), instead of as a tab behind ReShade's Home tab.
+- **Panel sections** (UI6): the panel is one column of sections that fold - Scaling to the
+  monitor, Neural rendering (with Intensity), Frame generation, Frame Warp, Latency and display,
+  HDR, View and HUD, Screenshots video and benchmark, DLSS on the second GPU, Hotkeys, and Logs and
+  diagnostics. Each header shows what the section is set to on its right, so the panel reads as a
+  summary when closed. Expand all / Collapse all are at the top. Less-used options sit one fold
+  deeper: "More frame generation options" (FG Lite, `mgpu\nvngx_dlssg.dll`, motion view) and
+  "Copy, queue and late-latch". The live figures, counters, install check, driver and DLL
+  versions and the build line stay at the foot, always shown. Which sections are open is kept in
+  mgpu.ini (`UiOpen`); Scaling, Neural rendering and Frame generation are open the first time.
+  Headers are in Title Case and every option starts with a capital; every control explains itself
+  in a tooltip when the mouse rests on it, greyed-out controls included (UI7).
 - **Startup checks**: if there is no second NVIDIA card (integrated graphics do not count), or the
   NVIDIA driver is older than 610.47 (the first with DLSS 5 neural rendering) or NVIDIA's NGX
   reports that it needs updating, the mod stays off and says why in red at the top of the panel
@@ -219,11 +265,38 @@ Research code, not a product. Run games with anti-cheat and online games at your
   the vendor file is unchanged, the edit is made as the shader is compiled) and FSR 1 (RCAS is
   blended back toward the unsharpened picture). Generated frames use the latest real frame's
   mask. Costs a few reads per pixel. Logged as `[MGPU][MAS1]`.
+- **NIS half precision** (`ScalerHalf=1`, checkbox under Scaling to the monitor; live; default
+  off): a second NIS, built with NVIDIA's own `NIS_USE_HALF_PRECISION=1` (16-bit `min16float` for
+  the filter tables and the pixel tile in shared memory), is compiled the first time the option is
+  on while NIS is scaling. That compile takes about 3 s, so it runs in the background and full
+  precision is shown until it is ready (the panel says "preparing..."); nothing at all happens at
+  start-up while the option stays off. After that the checkbox switches between the two live, so
+  they can be compared on the same scene. The saving is expected to be small (NIS is already a
+  light pass on the neural card) and the 16-bit storage can, rarely, show faint banding in smooth
+  gradients (sky, fog, dark vignettes) on a 10-bit output, which is why full precision stays the
+  default. `min16float` is a hint: a card that does not report 16-bit minimum precision runs it at
+  full precision, and the panel says so. Logged as `[MGPU][NH1]` (with the compile time).
 - **Low-latency present** (`PresentLatency1=1`, "low-latency present" under Latency and display;
   restart): the bridge's swap chain is made waitable with a maximum frame latency of 1, and each
   present first waits until the previous frame has left Windows' queue (at most 100 ms). A
   finished frame then reaches the screen at the next opportunity instead of waiting behind up to
   three others - a few ms less delay. Best with G-SYNC. Logged as `[MGPU][LP1]`.
+- **Bus traffic** (panel, Live section): `bus  sent … GB/s  received … GB/s` - what the render
+  card copied out to system memory and what the neural card read in over the last second
+  (picture, depth, motion vectors and HUD-less copy), counted from the mod's own copies.
+  The FPS HUD (CTRL+ALT+H) has three levels: BASIC (fps), DETAIL (the pipeline's frame rates) and
+  ADVANCED (DETAIL plus BUS OUT / BUS IN, bridge latency, ready time and GPU 0 queue depth).
+  "log bus traffic" (`BusLog=1`) writes the bus figures every 10 s (`[MGPU][BW4]`, ~35 KB an hour).
+  Beside the mod's own (exact) figures: GAME - the game's own frames, which Windows copies from the
+  render card to the monitor's card (an estimate: frame size x frame rate) - and TOTAL OUT / TOTAL IN,
+  everything on the render card's link out and the neural card's link in, from the NVIDIA driver's
+  counter (nvml.dll, read 4 times a second while a reader is showing; includes packet overhead).
+- **Screen saver** (`ScreenSaver=10` minutes, 0 = off; `ScreenSaverStyle=1`; panel, next to the
+  clock): for OLED monitors. After that long with no mouse, keyboard or controller input, the
+  picture is covered - black, or the words MGPU BRIDGE drifting slowly in dim grey. Any input
+  brings the game back at once; the game keeps running underneath, so pause it first. Never
+  while the panel is open, and the wait starts over when the panel closes (SV4). Logged as
+  `[MGPU][SV1]`.
 - **Queue guard** (`QueueGuard=1`, live checkbox in the same section): when the neural card falls
   2 or more frames behind, the game's render thread waits in 0.5 ms steps (at most 25 ms) until
   it catches up, so the game never makes frames that would be skipped - saving the 3080 Ti's
@@ -267,6 +340,39 @@ Research code, not a product. Run games with anti-cheat and online games at your
   the slider switches auto-calibrate off so your value stays.
 - The game's own field of view is used instead when it reaches the mod through Streamline
   (`SLTags=3`). Turn off Windows "Enhance pointer precision" for best results.
+- **`SLTags=3` on RoboCop: Rogue City - Unfinished Business.** Up to SLD1 it hid the game's DLSS
+  start from the mod: SLTags and the mod's NGX catch both need the game exe's one GetProcAddress
+  import slot, SLTags took it first, and the NGX catch never saw the game create DLSS. The mod
+  then treated RoboCop as an unknown game, and its motion-vector test mode crashed the game at
+  the menu. Since SLD2 the NGX catch is chained behind the SLTags hook (`[MGPU][SLD2]` in the
+  log). Even so, this game only sends its camera data to Streamline while its OWN frame
+  generation is on, so with the mod's frame generation `SLTags=3` receives nothing there - leave
+  it at 0. `SLTags=4` installs the same hook but hands back NVIDIA's own functions untouched;
+  both 3 and 4 log every Streamline/NGX function the game looks up (`[MGPU][SLD1] GetProcAddress
+  lookups`) and a summary at frames 900, 3600 and 10800 (`[MGPU][SLD1] SUMMARY`).
+
+**Steam overlay guard** (`SteamOverlayGuard=1`, default on): Steam injects its overlay DLL into
+every game it starts, even with the overlay switched off, and its DXGI hook crashes now and then
+in this setup (`gameoverlayrenderer64.dll+0x9b700`, reading `0xffffffffffffffff`). When that fault
+happens, the crash catcher steps the program back out of the overlay's code, as if the overlay had
+returned, and the game carries on with one frame not shown. Since SO2 it only does so for that
+fault (a read of `0xffffffffffffffff` inside the overlay, at whatever offset a Steam update moves it
+to) and only after checking that the return is safe (unwind data, stack, a CALL site, alignment);
+`SteamOverlayGuard=2` accepts any access violation in the overlay, `3` is SO1's original guard
+exactly (any overlay fault, no return checks, with the new logging), `0` turns it off. At most 5 times
+a minute; past that the fault goes on as before. Every attempt is logged (`[MGPU][SO1]`, also in
+crash.txt), and about 2 s later `[MGPU][SO2]` says whether rendering came back (the faulting thread
+presenting again, frame rate, failed presents, device removed); `[MGPU][SO3]` compares memory a
+minute later. Since SO4 each line also says how sure it is the call was a Present (the CALL's
+vtable slot, and whether the thread was presenting); only contrary evidence refuses a step-over.
+Details, a test checklist and rollback: `docs/steam-overlay-guard.md`.
+
+**How Steam hooks Present** (`[MGPU][SH1]`, once per session, read-only): when the mod's own swap
+chain is created, the log says whether Steam's overlay redirected its function table or patched
+DirectX's Present code itself. With the current Steam client it is the code ("CODE patched in
+memory"), which is why a table-swap bypass (OB1-OB3) could not work and was removed in OB4. If a
+Steam update ever changes this, that line will show it.
+
 
 **Crash catcher**: if the game ever crashes to the desktop, the add-on writes one line naming
 what crashed (the module, the place inside it and the call chain) to `mgpu\crash.txt` and to
@@ -336,6 +442,12 @@ the add-on, never beside the game's `.exe`). Then use **this fork's `mgpu.ini`**
 `assets/`, which has the recommended settings below. Every line it changes from
 upstream is marked `; FORK`.
 
+**Steam games:** start them from Steam as usual. Steam always puts its overlay into the game, and
+that overlay has crashed in the present path; the Steam overlay guard (below) steps over such a
+crash so the game keeps running. `SteamAppIdFile=1` makes the mod write `steam_appid.txt` beside
+the game's exe, which only matters when the exe is started directly (off by default, not in the
+panel: it never helped a game started from Steam).
+
 ## Recommended setup
 
 1. **Turn the game's own DLSS Super Resolution on** in its graphics menu (any quality
@@ -352,7 +464,7 @@ upstream is marked `; FORK`.
    SRMvLowRes=2
    Reflex=1
    ReflexSleep=1
-   FrameGen=3          ; AMD FSR 3 frame generation (4 = NVIDIA DLSS FG, 1 = the mod's own)
+   FrameGen=3          ; AMD FSR 3 frame generation (4 = NVIDIA DLSS FG, 1 = BUILT-IN)
    HudLess=1           ; generated frames keep the HUD sharp (D3D12)
    HookPoint=0         ; auto fallback if the game's ReShade never runs an effect
    ```

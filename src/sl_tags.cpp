@@ -563,6 +563,74 @@ namespace
         }
     }
 
+    // ---- SLD1: WHY DOES SLTags=3 STOP THE GAME'S DLSS? (logging only) ----
+    //
+    // RoboCop Unfinished Business, 2026-11-06: with SLTags=3 the game looked
+    // up slSetConstants once, never called it, never looked up
+    // slSetTagForFrame, and never initialised NGX (DLSS). Without it, NGX
+    // started 19 s in. These records say what the game asked GetProcAddress
+    // for, in order, what came back, and what the pass-throughs returned.
+    // Nothing here changes what the game receives. SLTags=4 installs the same
+    // GetProcAddress swap but hands back the REAL pointer for every name: if
+    // DLSS starts with 4 and not with 3, handing out our pass-through is the
+    // cause; if it fails with 4 too, the swap itself is.
+    //
+    // The hook can run under the loader lock, so it only copies into fixed
+    // slots; module names are resolved and lines written later, by tick().
+    struct sld_rec
+    {
+        char name[44];
+        HMODULE mod;
+        unsigned long long t;   // ms since the swap was installed
+        unsigned char found, swapped;
+        std::atomic<bool> ready;
+    };
+    const unsigned kSldRec = 96u;
+    sld_rec g_sld[kSldRec];
+    std::atomic<unsigned> g_sld_n{0};                    // sl*/NGX names seen
+    std::atomic<unsigned long long> g_sld_other{0};      // every other name
+    unsigned long long g_sld_t0 = 0;
+    int g_early_mode = 0;                                // 3 or 4
+    // [0] slSetConstants, [1] slSetTagForFrame
+    std::atomic<unsigned long long> g_sld_calls[2], g_sld_bad[2], g_sld_nullreal[2];
+    std::atomic<int> g_sld_first_bad[2] = { {-1}, {-1} };
+    unsigned g_sld_dumped = 0;                           // records already written out
+    unsigned g_sld_dumps = 0;
+
+    void sld_note(int which, int result, bool no_real)
+    {
+        g_sld_calls[which].fetch_add(1, std::memory_order_relaxed);
+        if (no_real) g_sld_nullreal[which].fetch_add(1, std::memory_order_relaxed);
+        if (result != 0)   // sl::Result::eOk is 0
+        {
+            g_sld_bad[which].fetch_add(1, std::memory_order_relaxed);
+            int expect = -1;
+            g_sld_first_bad[which].compare_exchange_strong(expect, result, std::memory_order_relaxed);
+        }
+    }
+
+    bool sld_interesting(const char *n)
+    {
+        return (n[0] == 's' && n[1] == 'l') || strncmp(n, "NVSDK_NGX", 9) == 0 ||
+               strncmp(n, "nvngx", 5) == 0 || strncmp(n, "NGX", 3) == 0;
+    }
+
+    void sld_record(const char *name, HMODULE h, bool found, bool swapped)
+    {
+        if (!sld_interesting(name)) { g_sld_other.fetch_add(1, std::memory_order_relaxed); return; }
+        const unsigned i = g_sld_n.fetch_add(1, std::memory_order_relaxed);
+        if (i >= kSldRec) return;
+        sld_rec &r = g_sld[i];
+        size_t k = 0;
+        for (; k + 1 < sizeof r.name && name[k] != '\0'; ++k) r.name[k] = name[k];
+        r.name[k] = '\0';
+        r.mod = h;
+        r.t = GetTickCount64() - g_sld_t0;
+        r.found = found ? 1 : 0;
+        r.swapped = swapped ? 1 : 0;
+        r.ready.store(true, std::memory_order_release);
+    }
+
     // ---- THE THUNKS ----
     //
     // Read, then call the real function with every argument exactly as it
@@ -571,8 +639,10 @@ namespace
                   const void *tags, unsigned n, void *cmd)
     {
         read_array(tags, n);
-        return (g_real_stff != nullptr)
+        const int r = (g_real_stff != nullptr)
                    ? g_real_stff(frame, viewport, tags, n, cmd) : 0;
+        sld_note(1, r, g_real_stff == nullptr);   // SLD1
+        return r;
     }
 
     int hook_st(const void *viewport, const void *tags, unsigned n, void *cmd)
@@ -585,7 +655,9 @@ namespace
     int hook_sc(const void *values, const void *frame, const void *viewport)
     {
         read_constants(values);
-        return (g_real_sc != nullptr) ? g_real_sc(values, frame, viewport) : 0;
+        const int r = (g_real_sc != nullptr) ? g_real_sc(values, frame, viewport) : 0;
+        sld_note(0, r, g_real_sc == nullptr);     // SLD1
+        return r;
     }
 
     // ---- THE IMPORT SWAP ----
@@ -678,15 +750,27 @@ namespace
     // the pointers we return, so this DLL must never unload under them.
     typedef FARPROC (WINAPI *pf_gpa)(HMODULE, LPCSTR);
     pf_gpa g_real_gpa = nullptr;
+    // SLD2: the calibrator's GetProcAddress hook, when it is installed. Both
+    // hooks want the game exe's one GetProcAddress import slot; SLTags takes
+    // it first (at load), so the calibrator's swap missed it and the game's
+    // own NGX lookups (CreateFeature, EvaluateFeature...) went past the NGX
+    // catch - measured 2026-11-06: 52 slots instead of 53, creates=0, no
+    // contract, and the mod treated RoboCop as an unknown title. With this
+    // set, every lookup the exe makes goes on through the calibrator's hook.
+    std::atomic<pf_gpa> g_next_gpa{nullptr};
     unsigned g_gpa_slots = 0;
     bool g_early = false, g_early_late = false, g_early_reported = false;
     std::atomic<unsigned long long> g_gpa_sc{0}, g_gpa_stff{0};
 
     FARPROC WINAPI hook_gpa(HMODULE h, LPCSTR name)
     {
-        FARPROC r = (g_real_gpa != nullptr) ? g_real_gpa(h, name) : nullptr;
-        if (r == nullptr || ((uintptr_t)name >> 16) == 0) return r;   // ordinal
-        if (name[0] != 's' || name[1] != 'l') return r;
+        const pf_gpa nx = g_next_gpa.load(std::memory_order_acquire);   // SLD2
+        FARPROC r = (nx != nullptr) ? nx(h, name) : (g_real_gpa != nullptr) ? g_real_gpa(h, name) : nullptr;
+        if (((uintptr_t)name >> 16) == 0) return r;   // ordinal
+        const bool sub = r != nullptr && g_early_mode == 3 && name[0] == 's' && name[1] == 'l' &&
+                         (strcmp(name, "slSetConstants") == 0 || strcmp(name, "slSetTagForFrame") == 0);
+        sld_record(name, h, r != nullptr, sub);   // SLD1
+        if (!sub) return r;                       // SLTags=4: every name gets the real pointer
         if (strcmp(name, "slSetConstants") == 0)
         {
             g_real_sc = (pf_set_constants)(void *)r;
@@ -800,7 +884,10 @@ namespace
 void early_install(void *self_module)
 {
     HMODULE self = (HMODULE)self_module;
-    if (self == nullptr || early_ini_sltags(self) != 3) return;
+    const int em = (self != nullptr) ? early_ini_sltags(self) : 0;
+    if (em != 3 && em != 4) return;   // SLD1: 4 = the same swap, observe only
+    g_early_mode = em;
+    g_sld_t0 = GetTickCount64();
     g_self = self;
     g_early_late = (GetModuleHandleW(L"sl.interposer.dll") != nullptr);
 
@@ -817,7 +904,7 @@ void early_install(void *self_module)
     if (b != nullptr && b != a) n += patch_module(exe, b, (void *)&hook_gpa);
     g_gpa_slots = n;
     g_early = true;
-    g_mode.store(3, std::memory_order_relaxed);
+    g_mode.store(em, std::memory_order_relaxed);
     if (n != 0u)
     {
         HMODULE pin = nullptr;
@@ -828,12 +915,88 @@ void early_install(void *self_module)
     }
 }
 
+namespace
+{
+    // SLD1: write out the lookups recorded since the last call, then (at set
+    // frame counts) the summary. Called from tick() for SLTags=3/4 only.
+    void sld_report(unsigned long long frames)
+    {
+        const unsigned n = g_sld_n.load(std::memory_order_relaxed);
+        const unsigned have = n < kSldRec ? n : kSldRec;
+        while (g_sld_dumped < have && g_sld_dumps < 12u)
+        {
+            char body[1200];
+            int o = 0;
+            const unsigned first = g_sld_dumped;
+            unsigned k = 0;
+            while (g_sld_dumped < have && k < 12u && o < (int)sizeof body - 200)
+            {
+                const sld_rec &r = g_sld[g_sld_dumped];
+                if (!r.ready.load(std::memory_order_acquire)) break;   // still being written
+                char mod[MAX_PATH] = "?";
+                if (r.mod != nullptr)
+                {
+                    char full[MAX_PATH];
+                    const DWORD m = GetModuleFileNameA(r.mod, full, MAX_PATH);
+                    if (m != 0 && m < MAX_PATH)
+                    {
+                        const char *b = strrchr(full, '\\');
+                        snprintf(mod, sizeof mod, "%s", b ? b + 1 : full);
+                    }
+                    else snprintf(mod, sizeof mod, "unloaded");
+                }
+                o += snprintf(body + o, sizeof body - (size_t)o, "%s +%llums %s(%s) %s%s",
+                              k ? " |" : "", r.t, r.name, mod, r.found ? "found" : "NOT FOUND",
+                              r.swapped ? " PASS-THROUGH HANDED OUT" : "");
+                ++g_sld_dumped; ++k;
+            }
+            if (k == 0) break;
+            char line[1400];
+            snprintf(line, sizeof line, "[MGPU][SLD1] GetProcAddress lookups %u-%u (time since load):%s",
+                     first + 1u, g_sld_dumped, body);
+            mgpu::diag::info(line);
+            ++g_sld_dumps;
+        }
+
+        static int stage = 0;   // summaries at 900, 3600 and 10800 frames
+        const unsigned long long at[3] = { 900ull, 3600ull, 10800ull };
+        if (stage >= 3 || frames < at[stage]) return;
+        while (stage < 3 && frames >= at[stage]) ++stage;
+        const wchar_t *mods[] = { L"sl.interposer.dll", L"sl.common.dll", L"sl.dlss.dll", L"sl.dlss_g.dll",
+                                  L"sl.reflex.dll", L"sl.pcl.dll", L"nvngx_dlss.dll", L"nvngx_dlssg.dll" };
+        char ml[400]; int mo = 0;
+        for (const wchar_t *m : mods)
+            mo += snprintf(ml + mo, sizeof ml - (size_t)mo, "%s%ls %s", mo ? ", " : "", m,
+                           GetModuleHandleW(m) != nullptr ? "loaded" : "not loaded");
+        char line[1600];
+        snprintf(line, sizeof line,
+            "[MGPU][SLD1] SUMMARY at frame %llu, SLTags=%d (%s) | Streamline/NGX names looked up: %u, other names: %llu | "
+            "slSetConstants: calls %llu, non-OK results %llu (first %d), calls with no real pointer %llu | "
+            "slSetTagForFrame: calls %llu, non-OK %llu (first %d), no real pointer %llu | modules: %s. "
+            "HOW TO READ IT. Compare a run with SLTags=4 against one with SLTags=3: the same lookups and "
+            "sl.dlss.dll / nvngx_dlss.dll loaded in both means the pass-through is harmless; lookups that stop "
+            "after slSetConstants, or DLSS modules missing, only with 3, name the pass-through as the cause; "
+            "missing with 4 as well means the GetProcAddress swap itself is. A non-OK result is Streamline "
+            "refusing the call (sl::Result code).",
+            frames, g_early_mode, g_early_mode == 4 ? "observe only" : "pass-through handed out",
+            n, g_sld_other.load(std::memory_order_relaxed),
+            g_sld_calls[0].load(), g_sld_bad[0].load(), g_sld_first_bad[0].load(), g_sld_nullreal[0].load(),
+            g_sld_calls[1].load(), g_sld_bad[1].load(), g_sld_first_bad[1].load(), g_sld_nullreal[1].load(),
+            ml);
+        mgpu::diag::info(line);
+    }
+}
+
+bool early_active() { return g_early && g_gpa_slots != 0u; }
+void chain_gpa(void *next) { g_next_gpa.store((pf_gpa)next, std::memory_order_release); }
+
 void tick(unsigned long long frames, int mode)
 {
     if (mode == 0) return;
-    if (mode == 3)
+    if (mode == 3 || mode == 4)
     {
-        // SLT3 installed at load (or did not); here it only reports, once.
+        // SLT3 installed at load (or did not); here it only reports.
+        if (g_early) sld_report(frames);   // SLD1
         if (g_early_reported) return;
         g_early_reported = true;
         char line[900];
@@ -846,7 +1009,8 @@ void tick(unsigned long long frames, int mode)
             "caught>0 with calls=0: the engine has the pointer but has not called it yet - with "
             "the game's own frame generation unavailable it may never call it. calls>0: an "
             "[MGPU][SLT2] FIRST CONSTANTS line follows with the camera data.",
-            g_early ? "INSTALLED" : "NOT INSTALLED (SLTags is not 3 in mgpu.ini at load)",
+            !g_early ? "NOT INSTALLED (SLTags is not 3 or 4 in mgpu.ini at load)"
+                     : g_early_mode == 4 ? "INSTALLED, OBSERVE ONLY (SLTags=4)" : "INSTALLED",
             g_gpa_slots, g_early_late ? "yes" : "no",
             g_gpa_sc.load(std::memory_order_relaxed),
             g_gpa_stff.load(std::memory_order_relaxed),

@@ -6,6 +6,7 @@
 #include "screen.hpp"
 
 #include <cstring>
+#include <cmath>
 #include <cstdio>
 #include <d3dcompiler.h>
 
@@ -407,7 +408,10 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
                   unsigned width, unsigned height, int mode,
                   double input_fps, double consumed_fps, double nr_eval_fps,
                   double nr_skip_fps, double present_fps, double nr_gpu_ms,
-                  double gen_fps, const char (*status)[48], int n_status)
+                  double gen_fps, const char (*status)[48], int n_status,
+                  double bus_out_gbs, double bus_in_gbs,
+                  double lat_ms, double ready_ms, double queue,
+                  double game_gbs, double tot_out, double tot_in)
 {
     if (cl == nullptr || width == 0 || height == 0 || mode == 0) return;
 
@@ -419,8 +423,8 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
     const int pad = px * 4;
     const int line_h = 7 * px;
 
-    // Up to 7 FPS lines (FG1) and 6 status lines (ST1).
-    static const int MAXL = 13;
+    // Up to 15 FPS lines (FG1, HUD3, BW5) and 6 status lines (ST1).
+    static const int MAXL = 21;
     char text[MAXL][48] = {};
     bool is_status[MAXL] = {};
     int lines = 0;
@@ -441,6 +445,23 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
         snprintf(text[lines++], 48, "NR GPU   %.2f MS", nr_gpu_ms);
         if (gen_fps >= 0.0)
             snprintf(text[lines++], 48, "GENERATED %.1f FPS", gen_fps);
+    }
+    if (mode == 3)   // HUD3: ADVANCED - bus traffic (last second) and latency (last 1/4 s)
+    {
+        if (bus_out_gbs >= 0.0)
+        {
+            snprintf(text[lines++], 48, "BUS OUT  %.2f GB/S", bus_out_gbs);
+            snprintf(text[lines++], 48, "BUS IN   %.2f GB/S", bus_in_gbs);
+        }
+        if (game_gbs > 0.0) snprintf(text[lines++], 48, "GAME     %.2f GB/S", game_gbs);   // BW5
+        if (tot_out >= 0.0) snprintf(text[lines++], 48, "TOTAL OUT %.2f GB/S", tot_out);
+        if (tot_in >= 0.0)  snprintf(text[lines++], 48, "TOTAL IN  %.2f GB/S", tot_in);
+        if (lat_ms >= 0.0)
+        {
+            snprintf(text[lines++], 48, "BRIDGE   %.1f MS", lat_ms);
+            snprintf(text[lines++], 48, "READY    %.1f MS", ready_ms);
+            snprintf(text[lines++], 48, "QUEUE    %.1f FRAMES", queue);
+        }
     }
     for (int i = 0; status != nullptr && i < n_status && lines < MAXL; ++i)
     {
@@ -468,6 +489,34 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
     for (int i = 0; i < lines; ++i)
         draw_text(cl, rtv, text[i], x + pad, y + pad * (i + 1) + line_h * i, px, gap,
                   is_status[i] ? sf : fg, W, H);
+}
+
+// SV1: the screen saver. Black over everything; style 1 adds the words
+// MGPU BRIDGE in dim grey, drifting and bouncing off the edges slowly (a full
+// crossing takes about a minute), so no pixel stays lit for long.
+void draw_saver(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                unsigned width, unsigned height, int style, unsigned long long ms)
+{
+    if (cl == nullptr || width == 0 || height == 0) return;
+    const int W = (int)width, H = (int)height;
+    const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    cl->ClearRenderTargetView(rtv, black, 0, nullptr);
+    if (style != 1) return;
+    const char *t = "MGPU BRIDGE";
+    int px = W / 320; if (px < 2) px = 2;
+    const int gap = px;
+    const int tw = text_width(t, px, gap), th = 7 * px;
+    const int rx = W - tw, ry = H - th;
+    if (rx <= 0 || ry <= 0) return;
+    // Triangle waves: x and y bounce at different speeds so the path wanders.
+    const double sx = (double)W / 60000.0, sy = (double)H / 47000.0;   // px per ms
+    auto tri = [](double p, int range) {
+        const double m = std::fmod(p, 2.0 * range);
+        return (int)(m < range ? m : 2.0 * range - m);
+    };
+    const int x = tri((double)ms * sx, rx), y = tri((double)ms * sy, ry);
+    const float grey[4] = { 0.22f, 0.24f, 0.27f, 1.0f };
+    draw_text(cl, rtv, t, x, y, px, gap, grey, W, H);
 }
 
 void draw_clock_box(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,

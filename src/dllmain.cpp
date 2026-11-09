@@ -66,7 +66,7 @@
 #define MGPU_VERSION_STR "0.2.5-dev"
 // VR2: the fork's build tag, shared by the R141 log line and the panel footer
 // so the two can never disagree. Bump it with every shipped change.
-#define MGPU_SOURCE_TAG "DG3"
+#define MGPU_SOURCE_TAG "HK11"
 
 
 // ---- P6.4: the overlay panel ----
@@ -122,6 +122,7 @@
 #include "framewarp.hpp" // FW1
 #include "hdr.hpp"       // HD1
 #include "crashlog.hpp"  // CR1
+#include "steam_hooks.hpp"      // SH1
 #include "replay.hpp"    // BM2
 #include "cursormap.hpp" // MC2
 #include "live_panel.hpp" // PP1: PanelOverPicture (upstream 0.4.0, NO1950)
@@ -168,8 +169,86 @@ namespace mgpu
 // during a probe cycle at all, not to make the teardown faster.
 // ensure_started() therefore lives only in on_init_swapchain, which fires
 // once, on the real render device.
+// SA1: steam_appid.txt next to the game's exe. Without it, a Steam game started
+// from its exe hands itself back to Steam, and Steam relaunches it with its
+// overlay DLL injected - the overlay that crashed in DXGI present (Oct-Nov
+// 2026 logs, gameoverlayrenderer64.dll+0x9b700). When the game is running under
+// Steam (Steam sets SteamAppId for what it launches) and the file is missing,
+// it is written once, so the NEXT launch from the exe stays out of Steam's
+// relaunch. A game update that deletes it gets it back the same way.
+// SA4: OFF BY DEFAULT, AND NOT IN THE PANEL. It never helped a game started
+// from Steam: Steam injects the overlay before the game looks for the file
+// (2026-11-07 log: started by Steam, file present, overlay loaded). The
+// overlay guard (SO1, crashlog.cpp) is what keeps such a crash from ending
+// the game. SteamAppIdFile=1 still writes it, for starting from the exe.
+// Runs on the first device event, not in DllMain.
+// SA2: state for the log line. 0 = not checked yet, 1 = game not started by
+// Steam (nothing to do), 2 = file present, 3 = written this run, 4 = missing
+// (option off), 5 = could not be written.
+static int g_sa_state = 0;
+static char g_sa_id[32] = {};
+static void steam_appid_check(bool allow_write)
+{
+    char id[32] = {};
+    DWORD n = GetEnvironmentVariableA("SteamAppId", id, sizeof id);
+    if (n == 0 || n >= sizeof id) n = GetEnvironmentVariableA("SteamGameId", id, sizeof id);
+    bool digits = (n > 0 && n < sizeof id);
+    for (DWORD i = 0; digits && i < n; ++i) if (id[i] < '0' || id[i] > '9') digits = false;
+    wchar_t path[MAX_PATH * 2] = {};
+    const DWORD pl = GetModuleFileNameW(nullptr, path, MAX_PATH * 2);
+    wchar_t *slash = (pl != 0 && pl < MAX_PATH * 2) ? wcsrchr(path, L'\\') : nullptr;
+    if (slash == nullptr) { g_sa_state = 1; return; }
+    wcscpy_s(slash + 1, (MAX_PATH * 2) - (size_t)(slash + 1 - path), L"steam_appid.txt");
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) { g_sa_state = 2; return; }
+    if (!digits) { g_sa_state = 1; return; }   // not launched by Steam
+    memcpy(g_sa_id, id, n); g_sa_id[n] = 0;
+    if (!allow_write) { g_sa_state = 4; return; }
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    char l[300];
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        g_sa_state = 5;
+        snprintf(l, sizeof l, "[MGPU][SA1] steam_appid.txt could not be written next to the game's exe (error %lu). "
+                 "Create it by hand with %s in it to keep Steam's overlay out when starting from the exe.",
+                 GetLastError(), id);
+        mgpu::diag::warn(l);
+        return;
+    }
+    DWORD w = 0;
+    const BOOL ok = WriteFile(h, id, n, &w, nullptr);
+    CloseHandle(h);
+    g_sa_state = (ok && w == n) ? 3 : 5;
+    snprintf(l, sizeof l, "[MGPU][SA1] %s steam_appid.txt (%s) next to the game's exe: from the next launch, starting the "
+             "exe directly stays out of Steam's relaunch and its overlay.",
+             (ok && w == n) ? "wrote" : "FAILED to write", id);
+    mgpu::diag::info(l);
+}
+static void steam_appid_file_once()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    steam_appid_check(mgpu::gpu1::ui_ini_read("SteamAppIdFile", 0) != 0);   // SA4: off by default
+    // SA3: say plainly, every run, what decides whether Steam's overlay is in
+    // the process - the crash in gameoverlayrenderer64.dll+0x9b700 has come
+    // back (2026-11-07) and the log could not tell which case it was.
+    char id[32] = {};
+    const DWORD n = GetEnvironmentVariableA("SteamAppId", id, sizeof id);
+    const bool overlay = GetModuleHandleW(L"gameoverlayrenderer64.dll") != nullptr;
+    static const char *const st[] = { "not checked", "absent (game not started by Steam)", "present",
+                                      "written this run", "absent (not written; SteamAppIdFile=1 writes it)", "absent (could not be written)" };
+    char l[400];
+    snprintf(l, sizeof l, "[MGPU][SA3] Steam: started by Steam %s | steam_appid.txt next to the exe: %s | "
+             "Steam overlay (gameoverlayrenderer64.dll) %s.%s",
+             (n > 0 && n < sizeof id) ? "yes" : "no", st[(g_sa_state >= 0 && g_sa_state <= 5) ? g_sa_state : 0],
+             overlay ? "LOADED" : "not loaded",
+             overlay ? " A crash inside it is stepped over by the overlay guard (SteamOverlayGuard, [MGPU][SO1])." : "");
+    mgpu::diag::info(l);
+}
+
 static void on_init_device(reshade::api::device *device)
 {
+    steam_appid_file_once();   // SA1
     // Every device event is logged; the first d3d12 one also captures the
     // provisional game LUID and builds the adapter table. No selection
     // here - brief rule 2 defers it to the swapchain-derived game LUID
@@ -338,6 +417,26 @@ static void mgpu_hud_transport_hook(void *cmd_list_native, unsigned long long re
 
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
+    if (swapchain != nullptr)   // SH1: the bridge's chain is the one on the selected bridge card
+    {
+        reshade::api::device *bd = swapchain->get_device();
+        if (bd != nullptr && bd->get_api() == reshade::api::device_api::d3d12)
+        {
+            mgpu::adapter::selection_result bsel;
+            mgpu::adapter::get_selection(bsel);
+            auto *bd12 = reinterpret_cast<ID3D12Device *>(static_cast<uintptr_t>(bd->get_native()));
+            if (bd12 != nullptr && bsel.valid)
+            {
+                const LUID bl = bd12->GetAdapterLuid();
+                if (bl.LowPart == bsel.selected_luid.LowPart && bl.HighPart == bsel.selected_luid.HighPart &&
+                    !(bsel.game_luid_known && bl.LowPart == bsel.game_luid.LowPart && bl.HighPart == bsel.game_luid.HighPart))
+                {
+                    // SH1: once, read-only - how Steam hooks Present on this chain.
+                    mgpu::steam_hooks::report(reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
+                }
+            }
+        }
+    }
     // DX11 probe: a D3D11 game swap chain only (the bridge's own chain is
     // D3D12). Reads Dx11Probe once; off = one ini read, then one load.
     if (swapchain != nullptr)
@@ -933,6 +1032,14 @@ static int mgpu_game_is_native(int *out_quality = nullptr)
 // preset" section, so choosing Custom scale before a restart offered only the
 // three DLSS steps. Writes SRScale with SRMvLowRes=1 together, as the mode
 // buttons do. Read at the next start.
+// UI7: the tooltip of the control just drawn, shown on hover even when it is
+// greyed out. It wraps the control's call and returns what the control returned.
+static bool ui_tip(bool r, const char *t)
+{
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", t);
+    return r;
+}
+
 static int g_custom_pct = -1;
 static bool draw_custom_scale_slider(const char *id)
 {
@@ -942,7 +1049,7 @@ static bool draw_custom_scale_slider(const char *id)
         if (g_custom_pct < 33 || g_custom_pct > 90) g_custom_pct = 67;
     }
     bool wrote = false;
-    if (ImGui::SliderInt(id, &g_custom_pct, 33, 90, "%d%%"))
+    if (ui_tip(ImGui::SliderInt(id, &g_custom_pct, 33, 90, "%d%%"), "Neural rendering runs at this share of the display resolution and is\nenlarged back. Lower is faster; 85-90% keeps nearly all of NR's detail."))
     {
         mgpu::gpu1::ui_ini_write("SRScale", g_custom_pct);
         mgpu::gpu1::ui_ini_write("SRMvLowRes", 1);
@@ -954,7 +1061,7 @@ static bool draw_custom_scale_slider(const char *id)
         bool dr = mgpu::gpu1::ui_dr_on();
         // DR5: it measures NVIDIA frame generation's delivery, so it only works there.
         const bool dr_usable = mgpu::gpu1::ui_frame_gen() == 4;
-        char idc[48]; snprintf(idc, sizeof idc, "dynamic##dr%s", id);
+        char idc[48]; snprintf(idc, sizeof idc, "Dynamic##dr%s", id);
         ImGui::BeginDisabled(!dr_usable);
         if (ImGui::Checkbox(idc, &dr)) mgpu::gpu1::ui_set_dr_on(dr);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -980,9 +1087,9 @@ static bool draw_custom_scale_slider(const char *id)
                     ImGui::TextDisabled("frame spacing varies +/-%.1f ms (%.0f%% of the gap), %d hitch%s in 2 s",
                                         sdm, sdp, hk, hk == 1 ? "" : "es");
                 int sm = mgpu::gpu1::ui_sm_sens();
-                ImGui::TextUnformatted("smoothness");
+                ImGui::TextUnformatted("Smoothness");
                 char ids[4][40];
-                static const char *const kSm[4] = { "off", "relaxed", "normal", "strict" };
+                static const char *const kSm[4] = { "Off", "Relaxed", "Normal", "Strict" };
                 for (int k = 0; k < 4; ++k)
                 {
                     ImGui::SameLine();
@@ -1002,10 +1109,10 @@ static bool draw_custom_scale_slider(const char *id)
                 else ImGui::TextDisabled("Holding: %s.", dst);
             }
             int lo = mgpu::gpu1::ui_dr_min(), hi = mgpu::gpu1::ui_dr_max();
-            char idl[48]; snprintf(idl, sizeof idl, "lowest##drl%s", id);
-            if (ImGui::SliderInt(idl, &lo, 33, 90, "%d%%")) mgpu::gpu1::ui_set_dr_min(lo > hi ? hi : lo);
-            char idh[48]; snprintf(idh, sizeof idh, "highest##drh%s", id);
-            if (ImGui::SliderInt(idh, &hi, 33, 90, "%d%%")) mgpu::gpu1::ui_set_dr_max(hi < lo ? lo : hi);
+            char idl[48]; snprintf(idl, sizeof idl, "Lowest##drl%s", id);
+            if (ui_tip(ImGui::SliderInt(idl, &lo, 33, 90, "%d%%"), "The lowest scale dynamic resolution may go down to.")) mgpu::gpu1::ui_set_dr_min(lo > hi ? hi : lo);
+            char idh[48]; snprintf(idh, sizeof idh, "Highest##drh%s", id);
+            if (ui_tip(ImGui::SliderInt(idh, &hi, 33, 90, "%d%%"), "The highest scale it may go up to. The reduced textures are made at this\nsize, so raising it takes effect at the next start.")) mgpu::gpu1::ui_set_dr_max(hi < lo ? lo : hi);
             const int al = mgpu::gpu1::ui_dr_alloc();
             if (al > 0 && hi > al)
                 ImGui::TextDisabled("Above %d%% after the next start.", al);
@@ -1017,34 +1124,112 @@ static bool draw_custom_scale_slider(const char *id)
 
 static void draw_scaler_controls()
 {
-    ImGui::SeparatorText("Scaling to the monitor");
     int sc = mgpu::gpu1::ui_scaler();
-    if (ImGui::RadioButton("off##sc", &sc, 0)) mgpu::gpu1::ui_set_scaler(0);
+    if (ui_tip(ImGui::RadioButton("Off##sc", &sc, 0), "No filter: Windows stretches the picture to the monitor as usual.")) mgpu::gpu1::ui_set_scaler(0);
     ImGui::SameLine();
-    if (ImGui::RadioButton("bilinear##sc", &sc, 1)) mgpu::gpu1::ui_set_scaler(1);
+    if (ui_tip(ImGui::RadioButton("Bilinear##sc", &sc, 1), "Plain smooth enlargement, no sharpening. The cheapest.")) mgpu::gpu1::ui_set_scaler(1);
     ImGui::SameLine();
-    if (ImGui::RadioButton("FSR 1##sc", &sc, 2)) mgpu::gpu1::ui_set_scaler(2);
+    if (ui_tip(ImGui::RadioButton("FSR 1##sc", &sc, 2), "AMD FidelityFX Super Resolution 1: edge-aware enlargement with sharpening.")) mgpu::gpu1::ui_set_scaler(2);
     ImGui::SameLine();
-    if (ImGui::RadioButton("NIS##sc", &sc, 3)) mgpu::gpu1::ui_set_scaler(3);
+    if (ui_tip(ImGui::RadioButton("NIS##sc", &sc, 3), "NVIDIA Image Scaling: edge-aware enlargement with sharpening.")) mgpu::gpu1::ui_set_scaler(3);
     int shp = mgpu::gpu1::ui_scaler_sharp();
     ImGui::BeginDisabled(sc < 2);
-    if (ImGui::SliderInt("sharpness##sc", &shp, 0, 100, "%d%%")) mgpu::gpu1::ui_set_scaler_sharp(shp);
+    if (ui_tip(ImGui::SliderInt("Sharpness##sc", &shp, 0, 100, "%d%%"), "How much sharpening FSR 1 or NIS adds while enlarging.")) mgpu::gpu1::ui_set_scaler_sharp(shp);
     // MAS1: motion-adaptive sharpening (live).
     bool mas = mgpu::gpu1::ui_scaler_mas() != 0;
-    if (ImGui::Checkbox("less sharpening in motion##mas", &mas)) mgpu::gpu1::ui_set_scaler_mas(mas ? 1 : 0);
+    if (ImGui::Checkbox("Less sharpening in motion##mas", &mas)) mgpu::gpu1::ui_set_scaler_mas(mas ? 1 : 0);
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Sharpens still areas fully and fast-moving areas less, using the game's\n"
                           "motion vectors - calmer edges in motion, same detail when still.");
     if (mas)
     {
         int mm = mgpu::gpu1::ui_scaler_mas_motion();
-        if (ImGui::SliderInt("sharpening kept in motion##mas", &mm, 0, 100, "%d%%"))
+        if (ui_tip(ImGui::SliderInt("Sharpening kept in motion##mas", &mm, 0, 100, "%d%%"), "The share of the sharpening kept on fast-moving areas.\nStill areas always get all of it."))
             mgpu::gpu1::ui_set_scaler_mas_motion(mm);
+    }
+    ImGui::EndDisabled();
+    // NH1: NIS in half precision (live).
+    ImGui::BeginDisabled(sc != 3);
+    bool hp = mgpu::gpu1::ui_scaler_half() != 0;
+    if (ImGui::Checkbox("NIS half precision##nish", &hp)) mgpu::gpu1::ui_set_scaler_half(hp ? 1 : 0);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Runs NIS with 16-bit math instead of 32-bit, which can save a little time\n"
+                          "on the neural card (the saving is small). Off keeps full precision;\n"
+                          "on can, rarely, show faint banding in smooth gradients such as sky or fog.\n"
+                          "The first time it is turned on it takes a few seconds to prepare in the\n"
+                          "background (full precision meanwhile); after that it switches live.");
+    if (hp && sc == 3)
+    {
+        const int hs = mgpu::gpu1::ui_scaler_half_state();
+        if (hs == 4) { ImGui::SameLine(); ImGui::TextDisabled("(preparing...)"); }
+        else if (hs == 1) { ImGui::SameLine(); ImGui::TextDisabled("(not available - full used)"); }
+        else if (hs == 2) { ImGui::SameLine(); ImGui::TextDisabled("(card runs it at full)"); }
     }
     ImGui::EndDisabled();
     ImGui::TextDisabled(mgpu::gpu1::ui_scaler_active()
                             ? "Enlarging the game to the monitor."
                             : "For a game set below the monitor's resolution. Turning on/off: restart.");
+}
+
+// ---- UI6: COLLAPSIBLE SECTIONS ----
+//
+// The panel had grown into one long page in two columns. Each part is now a
+// header that folds, with what it is set to on the right of the header, so a
+// closed panel still reads as a summary. Which headers are open is kept in
+// mgpu.ini (UiOpen, one bit per section) and comes back on the next launch.
+enum ui_sec_id
+{
+    SEC_SCALE = 0, SEC_NEURAL, SEC_FG, SEC_WARP, SEC_LAT, SEC_HDR,
+    SEC_VIEW, SEC_CAP, SEC_DLSS, SEC_HK, SEC_DIAG, SEC_COUNT
+};
+static const int UI_OPEN_DEFAULT = (1 << SEC_SCALE) | (1 << SEC_NEURAL) | (1 << SEC_FG);
+static int  g_ui_open  = -1;     // bit per section; -1 = not read yet
+static int  g_ui_force = -1;     // Expand all / Collapse all: 1 / 0 for one frame, -1 none
+static bool g_ui_dirty = false;
+static bool g_ui_scoped = false;  // a section's ID scope is open
+
+// Each section's body gets its own ID scope. The panel used to be two child
+// windows, which kept repeated labels ("off", "on", "auto") apart; in one
+// window two "off" buttons would be the same button.
+static void ui_scope_end()
+{
+    if (g_ui_scoped) { ImGui::PopID(); g_ui_scoped = false; }
+}
+
+static bool ui_section(int id, const char *title, const char *summary)
+{
+    ui_scope_end();
+    if (g_ui_open < 0)
+        g_ui_open = mgpu::gpu1::ui_ini_read("UiOpen", UI_OPEN_DEFAULT);
+    const bool was = ((g_ui_open >> id) & 1) != 0;
+    if (g_ui_force >= 0) ImGui::SetNextItemOpen(g_ui_force != 0, ImGuiCond_Always);
+    else                 ImGui::SetNextItemOpen(was, ImGuiCond_Once);
+    char lab[96];
+    snprintf(lab, sizeof lab, "%s###mgpu_sec%d", title, id);
+    const bool open = ImGui::CollapsingHeader(lab);
+    if (summary != nullptr && summary[0] != '\0')
+    {
+        char cap[128];   // UI7: starts with a capital, like every label
+        snprintf(cap, sizeof cap, "%s", summary);
+        if (cap[0] >= 'a' && cap[0] <= 'z') cap[0] = (char)(cap[0] - 'a' + 'A');
+        summary = cap;
+        // Right-aligned on the header bar, in the disabled colour; left out when
+        // the panel is too narrow for it to clear the title.
+        const ImGuiStyle &s = ImGui::GetStyle();
+        const ImVec2 mn = ImGui::GetItemRectMin();
+        const ImVec2 mx = ImGui::GetItemRectMax();
+        const float x = mx.x - ImGui::CalcTextSize(summary).x - s.FramePadding.x * 2.0f;
+        const float title_end = mn.x + ImGui::GetFontSize() + s.FramePadding.x * 3.0f
+                              + ImGui::CalcTextSize(title).x + s.ItemSpacing.x * 2.0f;
+        if (x > title_end)
+            ImGui::GetWindowDrawList()->AddText(ImVec2(x, mn.y + s.FramePadding.y),
+                                                ImGui::GetColorU32(ImGuiCol_TextDisabled, 1.0f),
+                                                summary, nullptr);
+    }
+    if (open != was) { g_ui_open ^= (1 << id); g_ui_dirty = true; }
+    ImGui::PushID(1000 + id);
+    g_ui_scoped = true;
+    return open;
 }
 
 static void draw_mgpu_overlay(reshade::api::effect_runtime *)
@@ -1091,38 +1276,11 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     else if (st.summarised)
         ImGui::TextUnformatted("Finished - ran to its bound. Restart the game to run another.");
 
-    // ========================= BOX 1: THE BRIDGE =========================
-    //
-    // Split into two boxes in V11 because the panel had become one column of
-    // unrelated things. This box is the NEURAL side - what the bridge does with
-    // the frame and how fast it is doing it. The DLSS box below is the
-    // UPSCALER's state, which is a different feature with a different handle
-    // and, unlike everything here, cannot be changed while armed.
-// ---- V12: TWO COLUMNS, NOT ONE TALL STACK ----
-    //
-    // The single column had grown past a screen, so the DLSS box was below the
-    // fold and you had to scroll to find it. Two children side by side, each
-    // scrolling on its own, puts both in view at once.
-    //
-    // IT FALLS BACK TO STACKED BELOW 640 px. A two-column layout in a narrow
-    // overlay is two unreadable columns, which is worse than scrolling. The
-    // overlay's width is the user's to change and we do not control it.
-    const float avail_w = ImGui::GetContentRegionAvail().x;
-    const bool  two_col = (avail_w >= 640.0f);
-    const float col_w   = two_col
-        ? (avail_w - ImGui::GetStyle().ItemSpacing.x) * 0.5f
-        : avail_w;
-    // Tall enough that neither column scrolls in the common case, short enough
-    // to leave the probe section visible underneath.
-    //
-    // Fork: the Late-latch and Latency sections made the bridge column taller
-    // than 560 px, which hid its last rows behind a scrollbar. Grow both
-    // columns into whatever height the overlay window has, keeping 240 px for
-    // the probe section below and 560 px as the floor. Stacked mode keeps the
-    // fixed height, since two columns' worth of height would not fit there.
-    const float avail_h = ImGui::GetContentRegionAvail().y;
-    const float col_h   = (two_col && avail_h - 240.0f > 560.0f) ? (avail_h - 240.0f)
-                                                                 : 560.0f;
+    // UI6: every part of the panel folds; these open or close them all.
+    if (ui_tip(ImGui::SmallButton("Expand All"), "Open every section.")) g_ui_force = 1;
+    ImGui::SameLine();
+    if (ui_tip(ImGui::SmallButton("Collapse All"), "Close every section.")) g_ui_force = 0;
+    char sm[128];   // the summary shown on each header
 
     // DRV1 / GPU1: why the mod is not running, when it is the hardware or the
     // driver - above everything else, full width, so it cannot be missed.
@@ -1138,108 +1296,171 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::Separator();
         }
     }
-    ImGui::BeginChild("mgpu_box_bridge", ImVec2(col_w, col_h), true);
-    ImGui::SeparatorText("MGPU BRIDGE  -  neural rendering");
-    {
-    // ---- Model tuning, first and always visible ----
-    //
-    // Moved to the top in P7.10. These are the controls the reference
-    // implementation sets and this one leaves at the feature's defaults, so
-    // they are the first thing to reach for when the image looks wrong - and
-    // "the image looks wrong" is why most people will open this panel at all.
-    // Burying them under four other groups meant nobody found them.
-    ImGui::SeparatorText("Model");
 
-    // NM1: which network the NR DLL runs (310.9.16+ carries two).
     {
-        static int nm = -1;
-        if (nm < 0) nm = mgpu::gpu1::ui_nr_model();
-        ImGui::TextUnformatted("network");
-        ImGui::SameLine();
-        if (ImGui::RadioButton("default##nm", &nm, 0)) mgpu::gpu1::ui_set_nr_model(0);
-        ImGui::SameLine();
-        if (ImGui::RadioButton("original (A)##nm", &nm, 1)) mgpu::gpu1::ui_set_nr_model(1);
-        ImGui::SameLine();
-        if (ImGui::RadioButton("fast (B)##nm", &nm, 2)) mgpu::gpu1::ui_set_nr_model(2);
-        ImGui::TextDisabled("Applies on the next launch.");
+        static const char *const sn[] = { "off", "bilinear", "FSR 1", "NIS" };
+        const int s = mgpu::gpu1::ui_scaler();
+        const int si = (s >= 0 && s <= 3) ? s : 0;
+        if (si >= 2) snprintf(sm, sizeof sm, "%s, sharpness %d%%", sn[si], mgpu::gpu1::ui_scaler_sharp());
+        else         snprintf(sm, sizeof sm, "%s", sn[si]);
     }
-    // UC1: NR's own HUD/text protection. Live.
+    if (ui_section(SEC_SCALE, "Scaling To The Monitor", sm))
+        draw_scaler_controls();
+
     {
-        int uc = mgpu::gpu1::ui_nr_uic();
-        ImGui::TextUnformatted("UI correction");
+        static const char *const mn[] = { "default", "original (A)", "fast (B)" };
+        const int m = mgpu::gpu1::ui_nr_model();
+        const int si = (int)(st.style + 0.5f);
+        if (!st.neural) snprintf(sm, sizeof sm, "off");
+        else snprintf(sm, sizeof sm, "%s, Style %c, x%u", mn[(m >= 0 && m <= 2) ? m : 0],
+                      (char)('A' + ((si >= 0 && si <= 2) ? si : 0)), st.passes);
+    }
+    if (ui_section(SEC_NEURAL, "Neural Rendering", sm))
+    {
+        bool neural = st.neural;
+        if (ui_tip(ImGui::Checkbox("Neural stage", &neural), "Runs DLSS 5 neural rendering on the second GPU.\nOff shows the game's own frames instead."))
+            mgpu::gpu1::ui_set_neural(neural);
         ImGui::SameLine();
-        if (ImGui::RadioButton("auto##uc", &uc, 0)) mgpu::gpu1::ui_set_nr_uic(0);
+        ImGui::TextDisabled(!neural ? "(off - the game's own frames are shown)" : st.nr_ok ? "(running)" : "(transport only)");
+
+        // ---- Model tuning, first and always visible ----
+        //
+        // Moved to the top in P7.10. These are the controls the reference
+        // implementation sets and this one leaves at the feature's defaults, so
+        // they are the first thing to reach for when the image looks wrong - and
+        // "the image looks wrong" is why most people will open this panel at all.
+        // Burying them under four other groups meant nobody found them.
+        ImGui::SeparatorText("Model");
+
+        // NM1: which network the NR DLL runs (310.9.16+ carries two).
+        {
+            static int nm = -1;
+            if (nm < 0) nm = mgpu::gpu1::ui_nr_model();
+            ImGui::TextUnformatted("Network");
+            ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton("Default##nm", &nm, 0), "Leave the choice of network to the NR DLL. Applies on the next launch.")) mgpu::gpu1::ui_set_nr_model(0);
+            ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton("Original (A)##nm", &nm, 1), "NR's original network. Applies on the next launch.")) mgpu::gpu1::ui_set_nr_model(1);
+            ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton("Fast (B)##nm", &nm, 2), "The smaller network, about 2x faster than A. Applies on the next launch.")) mgpu::gpu1::ui_set_nr_model(2);
+            ImGui::TextDisabled("Applies on the next launch.");
+        }
+        // UC1: NR's own HUD/text protection. Live.
+        {
+            int uc = mgpu::gpu1::ui_nr_uic();
+            ImGui::TextUnformatted("UI correction");
+            ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton("Auto##uc", &uc, 0), "NR's own protection of on-screen text and HUD, left to the DLL.")) mgpu::gpu1::ui_set_nr_uic(0);
+            ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton("Off##uc", &uc, 1), "NR's protection of on-screen text and HUD turned off.")) mgpu::gpu1::ui_set_nr_uic(1);
+            ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton("On##uc", &uc, 2), "NR's protection of on-screen text and HUD always on.")) mgpu::gpu1::ui_set_nr_uic(2);
+        }
+
+        int style_i = (int)(st.style + 0.5f);
+        ImGui::TextUnformatted("Style");
         ImGui::SameLine();
-        if (ImGui::RadioButton("off##uc", &uc, 1)) mgpu::gpu1::ui_set_nr_uic(1);
+        if (ui_tip(ImGui::RadioButton("A", &style_i, 0), "Style A: the neural rendering style the feature uses by default.\nMoving any control in this group applies the whole group.")) mgpu::gpu1::ui_set_tuning_value(3, 0.0f);
         ImGui::SameLine();
-        if (ImGui::RadioButton("on##uc", &uc, 2)) mgpu::gpu1::ui_set_nr_uic(2);
+        if (ui_tip(ImGui::RadioButton("B", &style_i, 1), "Style B: an alternative neural rendering style.")) mgpu::gpu1::ui_set_tuning_value(3, 1.0f);
+        ImGui::SameLine();
+        if (ui_tip(ImGui::RadioButton("C", &style_i, 2), "Style C: a second alternative neural rendering style.")) mgpu::gpu1::ui_set_tuning_value(3, 2.0f);
+
+        float tone = st.tone_strength;
+        if (ui_tip(ImGui::SliderFloat("Tone", &tone, 0.0f, 2.0f, "%.2f"), "Local tone strength: local contrast, which reads as ambient-occlusion-like\nshading. Lower it if colours look washed or flat. 1.00 = default."))
+            mgpu::gpu1::ui_set_tuning_value(0, tone);
+        float structure = st.structure_strength;
+        if (ui_tip(ImGui::SliderFloat("Structure", &structure, 0.0f, 2.0f, "%.2f"), "Local structure strength: how strongly fine detail is rebuilt.\n1.00 = default."))
+            mgpu::gpu1::ui_set_tuning_value(1, structure);
+        float skin = st.skin_strength;
+        if (ui_tip(ImGui::SliderFloat("Skin", &skin, 0.0f, 2.0f, "%.2f"), "Structure strength on skin. Lower keeps faces closer to the game's own.\n1.00 = default."))
+            mgpu::gpu1::ui_set_tuning_value(2, skin);
+        bool mask = st.auto_mask;
+        if (ui_tip(ImGui::Checkbox("Auto mask", &mask), "NR's automatic mask (UseAutoMask in NVIDIA's DLSS-NR guide)."))
+            mgpu::gpu1::ui_set_tuning_value(4, mask ? 1.0f : 0.0f);
+
+        if (!st.tuning_on)
+            ImGui::TextDisabled("Not applied yet - move any control above to enable the group.");
+        else
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Applied - this is a tuning run.");
+            ImGui::SameLine();
+            if (ui_tip(ImGui::SmallButton("Reset"), "Stops applying the tuning group, so NR runs with its defaults.")) mgpu::gpu1::ui_set_tuning(false);
+        }
+        ImGui::TextDisabled("Washed or flat colour? Take tone down - 0.00 fixed it on the dev rig.");
+
+        // ---- Passes ----
+        ImGui::SeparatorText("Passes");
+        int passes = (int)st.passes;
+        for (unsigned i = 1; i <= st.max_passes; ++i)
+        {
+            char lab[8];
+            snprintf(lab, sizeof lab, "x%u", i);
+            if (i > 1) ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton(lab, &passes, (int)i), "How many neural rendering passes run on each frame. More passes give a\nstronger effect and cost more on the second GPU."))
+                mgpu::gpu1::ui_set_passes(i);
+        }
+        // ONE line, and it goes red when the setting it warns about is active. The
+        // panel used to carry six lines of explanation here; a warning nobody
+        // finishes reading is not a warning. The reasoning is in mgpu.ini.
+        if (passes >= 2)
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                               "x2 is free to the game but holds the second GPU near its power "
+                               "limit. x1 recommended.");
+        else
+            ImGui::TextDisabled("x1 leaves the second GPU about half idle.");
+
+        // ---- Intensity ----
+        ImGui::SeparatorText("Intensity");
+        int pr = st.preset;
+        if (ui_tip(ImGui::RadioButton("Manual", &pr, 0), "Set the strength of each pass yourself."))       mgpu::gpu1::ui_set_preset(0);
+        ImGui::SameLine();
+        if (ui_tip(ImGui::RadioButton("Front-loaded", &pr, 1), "Stronger early passes, lighter later ones.")) mgpu::gpu1::ui_set_preset(1);
+        ImGui::SameLine();
+        if (ui_tip(ImGui::RadioButton("Back-loaded", &pr, 2), "Lighter early passes, stronger later ones."))  mgpu::gpu1::ui_set_preset(2);
+
+        float all = st.intensity[0];
+        if (ui_tip(ImGui::SliderFloat("All passes", &all, 0.0f, 2.0f, "%.2f"), "The strength of every pass at once. 1.00 = NR's normal strength."))
+            mgpu::gpu1::ui_set_intensity(0, all);
+        // FV4: with foveation "centre 2x" the centre's second pass uses pass 2's
+        // intensity, so its slider shows at x1 too.
+        const bool fv4 = (mgpu::gpu1::ui_fov_mode() == 3);
+        for (unsigned i = 0; i < st.max_passes && (i < st.passes || (fv4 && i == 1)); ++i)
+        {
+            char lab[32];
+            snprintf(lab, sizeof lab, (i >= st.passes) ? "Pass 2 (centre 2x)" : "Pass %u", i + 1);
+            float v = st.intensity[i];
+            if (ui_tip(ImGui::SliderFloat(lab, &v, 0.0f, 2.0f, "%.2f"), "The strength of this pass alone."))
+                mgpu::gpu1::ui_set_intensity(i + 1, v);
+        }
+        if (st.passes == 1)
+            ImGui::TextDisabled("At x1 the three shapes are identical - there is one pass to shape.");
+
+        // CS1: Color Strength. Live; written to mgpu.ini as ColorStrength.
+        {
+            float cs = mgpu::gpu1::ui_color_strength();
+            if (ui_tip(ImGui::SliderFloat("Color strength", &cs, 0.0f, 1.0f, "%.2f"), "1.00 = the neural colours. Lower keeps NR's lighting but brings back the\ngame's own hue and saturation (skin, cloth, foliage)."))
+                mgpu::gpu1::ui_set_color_strength(cs);
+            ImGui::TextDisabled("1.00 = the neural colours. Lower keeps its lighting but restores");
+            ImGui::TextDisabled("the game's own hue and saturation (skin, cloth, foliage).");
+        }
     }
 
-    int style_i = (int)(st.style + 0.5f);
-    ImGui::TextUnformatted("Style");
-    ImGui::SameLine();
-    if (ImGui::RadioButton("A", &style_i, 0)) mgpu::gpu1::ui_set_tuning_value(3, 0.0f);
-    ImGui::SameLine();
-    if (ImGui::RadioButton("B", &style_i, 1)) mgpu::gpu1::ui_set_tuning_value(3, 1.0f);
-    ImGui::SameLine();
-    if (ImGui::RadioButton("C", &style_i, 2)) mgpu::gpu1::ui_set_tuning_value(3, 2.0f);
-
-    float tone = st.tone_strength;
-    if (ImGui::SliderFloat("tone", &tone, 0.0f, 2.0f, "%.2f"))
-        mgpu::gpu1::ui_set_tuning_value(0, tone);
-    float structure = st.structure_strength;
-    if (ImGui::SliderFloat("structure", &structure, 0.0f, 2.0f, "%.2f"))
-        mgpu::gpu1::ui_set_tuning_value(1, structure);
-    float skin = st.skin_strength;
-    if (ImGui::SliderFloat("skin", &skin, 0.0f, 2.0f, "%.2f"))
-        mgpu::gpu1::ui_set_tuning_value(2, skin);
-    bool mask = st.auto_mask;
-    if (ImGui::Checkbox("auto mask", &mask))
-        mgpu::gpu1::ui_set_tuning_value(4, mask ? 1.0f : 0.0f);
-
-    if (!st.tuning_on)
-        ImGui::TextDisabled("Not applied yet - move any control above to enable the group.");
-    else
     {
-        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Applied - this is a tuning run.");
-        ImGui::SameLine();
-        if (ImGui::SmallButton("reset")) mgpu::gpu1::ui_set_tuning(false);
+        const int fgm = mgpu::gpu1::ui_frame_gen();
+        const char *e = (fgm == 0) ? "off" : (fgm == 2) ? "motion view" : (fgm == 3) ? "AMD FSR 3"
+                      : (fgm == 4) ? "NVIDIA DLSS FG" : "BUILT-IN";
+        char mul[16] = "", cap[24] = "";
+        if (fgm == 4) snprintf(mul, sizeof mul, ", %dx", mgpu::gpu1::ui_fg_mult());
+        if (mgpu::gpu1::ui_tf_cap_on()) snprintf(cap, sizeof cap, ", cap %d", mgpu::gpu1::ui_tf_cap());
+        snprintf(sm, sizeof sm, "%s%s%s", e, mul, cap);
     }
-    ImGui::TextDisabled("Washed or flat colour? Take tone down - 0.00 fixed it on the dev rig.");
-
-    // ---- Passes ----
-    ImGui::SeparatorText("Passes");
-    int passes = (int)st.passes;
-    for (unsigned i = 1; i <= st.max_passes; ++i)
-    {
-        char lab[8];
-        snprintf(lab, sizeof lab, "x%u", i);
-        if (i > 1) ImGui::SameLine();
-        if (ImGui::RadioButton(lab, &passes, (int)i))
-            mgpu::gpu1::ui_set_passes(i);
-    }
-    // ONE line, and it goes red when the setting it warns about is active. The
-    // panel used to carry six lines of explanation here; a warning nobody
-    // finishes reading is not a warning. The reasoning is in mgpu.ini.
-    if (passes >= 2)
-        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
-                           "x2 is free to the game but holds the second GPU near its power "
-                           "limit. x1 recommended.");
-    else
-        ImGui::TextDisabled("x1 leaves the second GPU about half idle.");
-
-    bool neural = st.neural;
-    if (ImGui::Checkbox("neural stage", &neural))
-        mgpu::gpu1::ui_set_neural(neural);
-    ImGui::SameLine();
-    ImGui::TextDisabled(!neural ? "(off - the game's own frames are shown)" : st.nr_ok ? "(running)" : "(transport only)");
-
+    if (ui_section(SEC_FG, "Frame Generation", sm))
     // ---- FG1: frame generation, its own section so it is easy to find ----
     {
-        ImGui::SeparatorText("Frame generation (prototype)");
         const int fgm = mgpu::gpu1::ui_frame_gen();
         bool fg_on = (fgm != 0);
-        if (ImGui::Checkbox("Frame generation", &fg_on))
+        if (ui_tip(ImGui::Checkbox("Frame generation", &fg_on), "Makes in-between frames on the second GPU from the game's motion vectors\nand depth, so the render card does no extra work. Also CTRL+ALT+G."))
             mgpu::gpu1::ui_set_frame_gen(fg_on ? mgpu::gpu1::ui_frame_gen_last() : 0);
         ImGui::SameLine();
         ImGui::TextDisabled("(live - also CTRL+ALT+G in game)");
@@ -1247,12 +1468,12 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         // any multiplier - or with frame generation off.
         {
             bool cap_on = mgpu::gpu1::ui_tf_cap_on();
-            if (ImGui::Checkbox("Limiter##tf", &cap_on)) mgpu::gpu1::ui_set_tf_cap_on(cap_on);
+            if (ui_tip(ImGui::Checkbox("Limiter##tf", &cap_on), "Caps the game's frame rate, with any generator and multiplier, or with\nframe generation off. Turn the game's own cap off.")) mgpu::gpu1::ui_set_tf_cap_on(cap_on);
             ImGui::SameLine();
             ImGui::BeginDisabled(!cap_on);
             int cap = mgpu::gpu1::ui_tf_cap();
             ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
-            if (ImGui::SliderInt("##tfcap", &cap, 20, 240, "%d fps")) mgpu::gpu1::ui_set_tf_cap(cap);
+            if (ui_tip(ImGui::SliderInt("##tfcap", &cap, 20, 240, "%d fps"), "The game's frame-rate cap.")) mgpu::gpu1::ui_set_tf_cap(cap);
             ImGui::EndDisabled();
             if (cap_on)
             {
@@ -1263,19 +1484,19 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         ImGui::BeginDisabled(!fg_on);
         // FSR1: which generator.
         int eng = (fgm == 3) ? 1 : (fgm == 4) ? 2 : 0;
-        ImGui::TextUnformatted("generator");
+        ImGui::TextUnformatted("Generator");
         ImGui::SameLine();
-        if (ImGui::RadioButton("mod's own##fge", &eng, 0) && (fgm == 3 || fgm == 4)) mgpu::gpu1::ui_set_frame_gen(1);
+        if (ui_tip(ImGui::RadioButton("BUILT-IN##fge", &eng, 0), "The mod's own generator: one in-between frame per real frame, made from\nthe game's motion vectors.") && (fgm == 3 || fgm == 4)) mgpu::gpu1::ui_set_frame_gen(1);
         ImGui::SameLine();
-        if (ImGui::RadioButton("AMD FSR 3##fge", &eng, 1) && fgm != 3) mgpu::gpu1::ui_set_frame_gen(3);
+        if (ui_tip(ImGui::RadioButton("AMD FSR 3##fge", &eng, 1), "AMD FSR 3 frame generation. Needs\namd_fidelityfx_framegeneration_dx12.dll in the mgpu folder.") && fgm != 3) mgpu::gpu1::ui_set_frame_gen(3);
         ImGui::SameLine();
-        if (ImGui::RadioButton("NVIDIA DLSS FG##fge", &eng, 2) && fgm != 4) mgpu::gpu1::ui_set_frame_gen(4);   // DLSSG1
+        if (ui_tip(ImGui::RadioButton("NVIDIA DLSS FG##fge", &eng, 2), "NVIDIA DLSS Frame Generation on the second GPU (RTX 40/50), 2x to 6x as\nits driver allows. Uses the driver's own model.") && fgm != 4) mgpu::gpu1::ui_set_frame_gen(4);   // DLSSG1
         if (fgm == 4)
         {
             const int ds = mgpu::gpu1::ui_dlssg_state();
             if (ds < 0)
                 ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
-                                   "NVIDIA frame generation failed to start - using the mod's own (see ReShade.log [MGPU][DLSSG1]).");
+                                   "NVIDIA frame generation failed to start - using BUILT-IN (see ReShade.log [MGPU][DLSSG1]).");
             else if (ds > 0)
                 ImGui::TextDisabled("NVIDIA DLSS frame generation running.");
             else
@@ -1287,8 +1508,13 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // above the card's limit then runs at the limit (shown below).
             // TF1: target frame rate - the game cap plus an automatic multiplier.
             bool tf = mgpu::gpu1::ui_tf_on();
-            if (ImGui::Checkbox("target frame rate (multiplier picked automatically)##tf", &tf))
+            const bool dyn_m = mgpu::gpu1::ui_fg_dyn_on();   // DMF1
+            ImGui::BeginDisabled(dyn_m);
+            if (ImGui::Checkbox("Target frame rate (multiplier picked automatically)##tf", &tf))
                 mgpu::gpu1::ui_set_tf_on(tf);
+            ImGui::EndDisabled();
+            if (dyn_m && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Off while the dynamic multiplier is on.");
             if (tf)
             {
                 // The monitor's refresh, for the "paces evenly" hint.
@@ -1307,7 +1533,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 const float w = ImGui::GetFontSize() * 12.0f;
                 int tgt = mgpu::gpu1::ui_tf_target();
                 ImGui::SetNextItemWidth(w);
-                if (ImGui::SliderInt("target##tf", &tgt, 30, s_hz > 30 ? (s_hz > 480 ? 480 : s_hz) : 480, "%d fps"))
+                if (ui_tip(ImGui::SliderInt("Target##tf", &tgt, 30, s_hz > 30 ? (s_hz > 480 ? 480 : s_hz) : 480, "%d fps"), "The frame rate to show. The multiplier is picked from the game's measured\nframe rate and re-picked when it changes."))
                     mgpu::gpu1::ui_set_tf_target(tgt);
                 if (!mgpu::gpu1::ui_tf_cap_on())
                     ImGui::TextDisabled("Limiter off: the multiplier follows the game's own frame rate.");
@@ -1316,7 +1542,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 const int pk = mgpu::gpu1::ui_tf_pick();
                 // TF4: the overload brake.
                 bool brk = mgpu::gpu1::ui_tf_brake_on();
-                if (ImGui::Checkbox("overload brake (step down when the neural card can't keep up)##tf", &brk))
+                if (ui_tip(ImGui::Checkbox("Overload brake (step down when the neural card can't keep up)##tf", &brk), "If the frames shown fall more than 8% short for 2 s, the multiplier steps\ndown one notch, holds 30 s, then tries again."))
                     mgpu::gpu1::ui_set_tf_brake_on(brk);
                 if (rf > 0.0f && pk != 0)
                 {
@@ -1353,7 +1579,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 const int ast = mgpu::gpu1::ui_at_state();
                 if (ast == 1 || ast == 2)
                 {
-                    if (ImGui::Button("Cancel auto-tune##at")) mgpu::gpu1::ui_at_cancel();
+                    if (ui_tip(ImGui::Button("Cancel auto-tune##at"), "Stops auto-tune and changes nothing.")) mgpu::gpu1::ui_at_cancel();
                     ImGui::SameLine();
                     int c = 0, m = 0, n = 0, t = 0;
                     mgpu::gpu1::ui_at_progress(&c, &m, &n, &t);
@@ -1362,7 +1588,10 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 }
                 else
                 {
-                    if (ImGui::Button("Auto-tune##at"))
+                    ImGui::BeginDisabled(dyn_m);   // DMF1: nothing fixed to tune
+                    const bool at_click = ui_tip(ImGui::Button("Auto-tune##at"), "Click, close the panel and play for a minute or two. It tries Limiter x\nmultiplier pairs and keeps the highest smooth output with the fewest\ngenerated frames.");
+                    ImGui::EndDisabled();
+                    if (at_click)
                     {
                         int hz = 0;
                         HWND gw = (HWND)mgpu::gpu1::dcomp_game_hwnd();
@@ -1389,8 +1618,44 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             int mult = mgpu::gpu1::ui_fg_mult();
             const int maxm = mgpu::gpu1::ui_dlssg_max_mult();
             const int run  = mgpu::gpu1::ui_fg_mult_running();
-            ImGui::BeginDisabled(tf);   // TF1 picks it
-            ImGui::TextUnformatted("multiplier");
+            // DMF1: dynamic multiplier - a count per real frame toward a target.
+            {
+                bool dyn = dyn_m;
+                ImGui::BeginDisabled(tf);
+                if (ImGui::Checkbox("Dynamic multiplier##dmf", &dyn)) mgpu::gpu1::ui_set_fg_dyn_on(dyn);
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("%s", tf ? "Off while target frame rate is on."
+                        : "Each real frame gets as many in-between frames as it takes to reach\n"
+                          "the target, so the game needs no cap (like DLSS 4.5 Dynamic MFG).\n"
+                          "Spacing changes slightly between frames; a fixed cap x multiplier\n"
+                          "is the steadier choice.");
+                if (dyn)
+                {
+                    int tg = mgpu::gpu1::ui_fg_dyn_target();
+                    if (ui_tip(ImGui::SliderInt("Shown fps##dmf", &tg, 60, 360, "%d fps"), "The frame rate the dynamic multiplier aims to show.")) mgpu::gpu1::ui_set_fg_dyn_target(tg);
+                    // FC1: frame spacing - the original per-pair spacing (default) or the
+                    // even frame clock (FGClock=1). Live; either can be picked at any time.
+                    int fc = mgpu::gpu1::ui_fg_clock() ? 1 : 0;
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted("Frame spacing");
+                    ImGui::SameLine();
+                    if (ui_tip(ImGui::RadioButton("Per real frame##fc", &fc, 0),
+                               "The original method: the frames made from each real frame are spaced\n"
+                               "evenly inside it. Spacing changes a little from one real frame to the\n"
+                               "next. The lowest delay."))
+                        mgpu::gpu1::ui_set_fg_clock(false);
+                    ImGui::SameLine();
+                    if (ui_tip(ImGui::RadioButton("Even clock##fc", &fc, 1),
+                               "Every frame on one steady clock at the shown fps. For each tick the\n"
+                               "in-between frame nearest in time is shown; a late frame is skipped,\n"
+                               "never rushed. Steadier frame times, about one tick (4-7 ms) more delay.\n"
+                               "Compare the [MGPU][FC1] lines in ReShade.log with each setting."))
+                        mgpu::gpu1::ui_set_fg_clock(true);
+                }
+            }
+            ImGui::BeginDisabled(tf || dyn_m);   // TF1 / DMF1 pick it
+            ImGui::TextUnformatted("Multiplier");
             static const char *const kMultLabel[5] = { "2x##fgm", "3x##fgm", "4x##fgm", "5x##fgm", "6x##fgm" };
             for (int m = 2; m <= 6; ++m)
             {
@@ -1405,7 +1670,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::EndDisabled();   // TF1
             // TF4: with the multiplier picked by hand, the brake does not touch
             // it - but say when the card can't deliver it.
-            if (!tf && run != 0 && mgpu::gpu1::ui_tf_short())
+            if (!tf && !dyn_m && run != 0 && mgpu::gpu1::ui_tf_short())
                 ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
                                    "%dx gives ~%.0f of %.0f fps - the neural card can't keep up.", run,
                                    mgpu::gpu1::ui_tf_out_fps(), mgpu::gpu1::ui_tf_expected_fps());
@@ -1417,7 +1682,14 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             const unsigned long long now_ms = GetTickCount64();
             if (mult != s_mult_seen) { s_mult_seen = mult; s_mult_t = now_ms; }
             const bool settling = now_ms - s_mult_t < 2000ull;
-            if (maxm == 0)
+            if (dyn_m)   // DMF1: the running average in place of the fixed multiplier's status
+            {
+                const float avg = mgpu::gpu1::ui_fg_dyn_avg();
+                if (avg <= 0.0f) ImGui::TextDisabled("Dynamic multiplier starts with the next frames.");
+                else if (maxm > 0) ImGui::TextDisabled("Running at %.2fx on average (this card allows up to %dx).", avg, maxm);
+                else ImGui::TextDisabled("Running at %.2fx on average.", avg);
+            }
+            else if (maxm == 0)
                 ImGui::TextDisabled("The card's limit is read when NVIDIA frame generation starts.");
             else if (run != 0 && run < mult && mult > maxm)
                 ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
@@ -1430,41 +1702,27 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             else if (run != 0)
                 ImGui::TextDisabled("Running at %dx (this card allows up to %dx).", run, maxm);
             ImGui::TextDisabled("Keep NR fps x multiplier at or under the monitor's refresh rate.");
-            // FL1
-            static int fgl = -1, fgs = -1;
-            if (fgl < 0) { fgl = mgpu::gpu1::ui_fg_lite(); fgs = mgpu::gpu1::ui_fg_source(); }
-            bool lite = fgl != 0;
-            if (ImGui::Checkbox("FG Lite (faster, slightly softer)", &lite)) { fgl = lite ? 1 : 0; mgpu::gpu1::ui_set_fg_lite(fgl); }
-            bool own = fgs != 0;
-            ImGui::SameLine();
-            if (ImGui::Checkbox("use mgpu\\nvngx_dlssg.dll", &own)) { fgs = own ? 1 : 0; mgpu::gpu1::ui_set_fg_source(fgs); }
-            ImGui::TextDisabled("Both apply on the next launch.");
         }
         if (fgm == 3)
         {
             const int fs = mgpu::gpu1::ui_fsr_state();
             if (fs < 0)
                 ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
-                                   "AMD FSR failed to start - using the mod's own (see ReShade.log [MGPU][FSR]).");
+                                   "AMD FSR failed to start - using BUILT-IN (see ReShade.log [MGPU][FSR]).");
             else if (fs > 0)
                 ImGui::TextDisabled("AMD FSR 3 running.");
             else
                 ImGui::TextDisabled("AMD FSR 3 starts on the next frame (needs the AMD DLL in the mgpu folder).");
         }
-        bool mv = (fgm == 2);
-        ImGui::BeginDisabled(fgm == 3 || fgm == 4);
-        if (ImGui::Checkbox("motion view (debug: shows the motion vectors instead)", &mv))
-            mgpu::gpu1::ui_set_frame_gen(mv ? 2 : 1);
-        ImGui::EndDisabled();
         bool hf = mgpu::gpu1::ui_fg_hudfix();
-        if (ImGui::Checkbox("HUD fix (keep on-screen text and menus still)", &hf))
+        if (ui_tip(ImGui::Checkbox("HUD fix (keep on-screen text and menus still)", &hf), "Keeps on-screen text, markers and menus still in generated frames."))
             mgpu::gpu1::ui_set_fg_hudfix(hf);
         // HUD1: the HUD-less frame search (HudProbe=1 in mgpu.ini).
         if (mgpu::hudprobe::enabled())
         {
             const int hs = mgpu::hudprobe::state();
             ImGui::BeginDisabled(hs != 0);
-            if (ImGui::Button("Capture HUD-less candidates (CTRL+ALT+J)"))
+            if (ui_tip(ImGui::Button("Capture HUD-less candidates (CTRL+ALT+J)"), "Saves candidate scene images without the HUD to mgpu\\hudprobe, for\nfinding the HUD-less picture in a new game."))
                 mgpu::hudprobe::request_capture();
             ImGui::EndDisabled();
             ImGui::SameLine();
@@ -1475,25 +1733,49 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                                     mgpu::hudprobe::last_capture_id(),
                                     mgpu::hudprobe::last_capture_images());
         }
+        // UI6: the less-used choices, folded.
+        if (ui_tip(ImGui::TreeNode("More Frame Generation Options##fgmore"), "FG Lite, the frame generation DLL and motion view."))
+        {
+            // FL1
+            static int fgl = -1, fgs = -1;
+            if (fgl < 0) { fgl = mgpu::gpu1::ui_fg_lite(); fgs = mgpu::gpu1::ui_fg_source(); }
+            ImGui::BeginDisabled(fgm != 4);
+            bool lite = fgl != 0;
+            if (ui_tip(ImGui::Checkbox("FG Lite (faster, slightly softer)", &lite), "Asks NVIDIA frame generation for its lighter blending mode: faster,\nslightly softer. Needs a 310.9.16+ DLL. Applies on the next launch.")) { fgl = lite ? 1 : 0; mgpu::gpu1::ui_set_fg_lite(fgl); }
+            bool own = fgs != 0;
+            if (ui_tip(ImGui::Checkbox("Use mgpu\\nvngx_dlssg.dll", &own), "Loads mgpu\\nvngx_dlssg.dll ahead of the driver's copy, so a newer DLL can\nbe used. Applies on the next launch.")) { fgs = own ? 1 : 0; mgpu::gpu1::ui_set_fg_source(fgs); }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled(fgm == 4 ? "Both apply on the next launch." : "These two are for NVIDIA DLSS FG.");
+            bool mv = (fgm == 2);
+            ImGui::BeginDisabled(fgm == 3 || fgm == 4);
+            if (ui_tip(ImGui::Checkbox("Motion view (debug: shows the motion vectors instead)", &mv), "Debug: shows the motion vectors instead of the picture (BUILT-IN only)."))
+                mgpu::gpu1::ui_set_frame_gen(mv ? 2 : 1);
+            ImGui::EndDisabled();
+            ImGui::TreePop();
+        }
         ImGui::EndDisabled();
         if (fg_on)
             ImGui::Text("generated: %.1f fps", mgpu::gpu1::hud_gen_fps());
-        ImGui::TextDisabled("One in-between frame per NR frame from the game's motion vectors. "
-                            "Adds about half a frame of latency.");
+        // UI2: this line described the mod's own generator only; with NVIDIA
+        // frame generation (3x-6x, dynamic) it was wrong. The NVIDIA status is
+        // shown under the multiplier row.
+        if (fgm != 4)
+            ImGui::TextDisabled("One in-between frame per NR frame from the game's motion vectors. "
+                                "Adds about half a frame of latency.");
     }
 
     // ---- FW1: Frame Warp. Live; every control writes mgpu.ini.
+    if (ui_section(SEC_WARP, "Frame Warp", mgpu::framewarp::enabled() ? "on" : "off"))
     {
-        ImGui::SeparatorText("Frame Warp");
         bool fw = mgpu::framewarp::enabled();
-        if (ImGui::Checkbox("Frame Warp - camera turns show up at once##fw", &fw))
+        if (ui_tip(ImGui::Checkbox("Frame Warp - camera turns show up at once##fw", &fw), "Shifts each shown frame by the newest mouse movement, so camera turns\nshow up at once instead of a frame later. Pauses in menus."))
             mgpu::framewarp::set_enabled(fw);
         ImGui::BeginDisabled(!fw);
         static int fws = -1;
         if (fws < 0 || !ImGui::IsAnyItemActive()) fws = mgpu::framewarp::scale();
         float fwsf = (float)fws / 1000.0f;
-        if (ImGui::SliderFloat("degrees per mouse count##fw", &fwsf, 0.001f, 0.500f, "%.3f",
-                               ImGuiSliderFlags_Logarithmic))
+        if (ui_tip(ImGui::SliderFloat("Degrees per mouse count##fw", &fwsf, 0.001f, 0.500f, "%.3f",
+                               ImGuiSliderFlags_Logarithmic), "How far the camera turns per mouse count, in degrees.\nAuto-calibrate learns it."))
         {
             fws = (int)(fwsf * 1000.0f + 0.5f);
             if (fws < 1) fws = 1;
@@ -1501,16 +1783,16 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         }
         static int fwp = -1;
         if (fwp < 0 || !ImGui::IsAnyItemActive()) fwp = mgpu::framewarp::strength();
-        if (ImGui::SliderInt("strength (%)##fw", &fwp, 0, 100))
+        if (ImGui::SliderInt("Strength (%)##fw", &fwp, 0, 100))
             mgpu::framewarp::set_strength(fwp);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("How much of the delay to make up. Higher = snappier turns, more edge stretch.");
         bool fwi = mgpu::framewarp::invert_y();
-        if (ImGui::Checkbox("game uses inverted vertical look##fw", &fwi))
+        if (ui_tip(ImGui::Checkbox("Game uses inverted vertical look##fw", &fwi), "Tick if the game is set to inverted vertical look."))
             mgpu::framewarp::set_invert_y(fwi);
         static int fwl = -1;
         if (fwl < 0 || !ImGui::IsAnyItemActive()) fwl = mgpu::framewarp::lead_ms();
-        if (ImGui::SliderInt("extra lead (ms)##fw", &fwl, 0, 60))
+        if (ui_tip(ImGui::SliderInt("Extra lead (ms)##fw", &fwl, 0, 60), "Shifts a little further ahead than the measured delay."))
             mgpu::framewarp::set_lead_ms(fwl);
         char fwst[200];
         mgpu::framewarp::status(fwst, sizeof fwst);
@@ -1523,18 +1805,18 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         const float fov = mgpu::framewarp::fov_in_use((float)mgpu::gpu1::ui_ini_read("FSRFov", 90), &fsrc);
         ImGui::TextDisabled("field of view %.1f deg (%s)", fov, fsrc);
         bool fwa = mgpu::framewarp::auto_calibrate();
-        if (ImGui::Checkbox("auto-calibrate##fw", &fwa))
+        if (ImGui::Checkbox("Auto-calibrate##fw", &fwa))
             mgpu::framewarp::set_auto_calibrate(fwa);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Learns the settings from your camera turns while Frame Warp is on.");
         const bool cal = mgpu::framewarp::calibrating();
         if (!cal)
         {
-            if (ImGui::Button("Calibrate##fw")) mgpu::framewarp::calib_start();
+            if (ui_tip(ImGui::Button("Calibrate##fw"), "Close the panel and turn left and right for 5 s. The settings are learned\nfrom the turns.")) mgpu::framewarp::calib_start();
             ImGui::SameLine();
             ImGui::TextDisabled("close overlay, turn left/right for 5 s");
         }
-        else if (ImGui::Button("Stop calibrating##fw")) mgpu::framewarp::calib_cancel();
+        else if (ui_tip(ImGui::Button("Stop calibrating##fw"), "Stops calibrating and keeps the current settings.")) mgpu::framewarp::calib_cancel();
         char fwc[320];
         mgpu::framewarp::calib_status(fwc, sizeof fwc);
         if (fwc[0])
@@ -1546,54 +1828,6 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         ImGui::TextDisabled("Speeds up camera turns only. Pauses in menus.");
     }
 
-    // ---- OPT2: late-latch, live. Applied immediately AND written to mgpu.ini
-    // so the next launch starts the same way. Before arm, the arm reads the
-    // file the panel just wrote, so the two cannot disagree.
-    {
-        ImGui::SeparatorText("Late-latch");
-        const bool cq_ini = mgpu::gpu1::ui_ini_read("CopyQueue", 0) != 0;
-        const bool usable = st.armed ? st.ll_ready : cq_ini;
-        ImGui::BeginDisabled(!usable);
-        // Before arm the stream has not read the file yet: show the file.
-        const bool ll_now = st.armed ? st.ll_on
-                                     : (mgpu::gpu1::ui_ini_read("LateLatch", 0) != 0);
-        bool ll = ll_now;
-        if (ImGui::Checkbox("late-latch prefetch", &ll))
-        {
-            mgpu::gpu1::ui_set_late_latch(ll);
-            (void)mgpu::gpu1::ui_ini_write("LateLatch", ll ? 1 : 0);
-        }
-        ImGui::BeginDisabled(!ll_now);
-        static int age = -1;
-        if (age < 0 || (st.armed && !ImGui::IsAnyItemActive()))
-            age = st.armed ? (int)st.ll_age : mgpu::gpu1::ui_ini_read("LateLatchAge", 2);
-        ImGui::SliderInt("max age (frames)", &age, 0, 4, "%d", ImGuiSliderFlags_AlwaysClamp);
-        if (ImGui::IsItemDeactivatedAfterEdit())
-        {
-            mgpu::gpu1::ui_set_late_latch_age((unsigned)age);
-            (void)mgpu::gpu1::ui_ini_write("LateLatchAge", age);
-        }
-        ImGui::EndDisabled();
-        ImGui::EndDisabled();
-        if (!usable)
-            ImGui::TextDisabled("Needs CopyQueue=1 or 2 in mgpu.ini (restart to apply).");
-        else if (st.ll_on && st.ll_issued > 0)
-        {
-            char llt[200];
-            if (st.ll_recent_pct >= 0.0f)
-                snprintf(llt, sizeof llt, "used %.1f%% recently  |  %.1f%% of %llu since arm",
-                         (double)st.ll_recent_pct,
-                         100.0 * (double)st.ll_hits / (double)st.ll_issued, st.ll_issued);
-            else
-                snprintf(llt, sizeof llt, "used %.1f%% of %llu latched  |  too old %llu",
-                         100.0 * (double)st.ll_hits / (double)st.ll_issued,
-                         st.ll_issued, st.ll_stale);
-            ImGui::TextDisabled("%s", llt);
-        }
-        else
-            ImGui::TextDisabled("More neural fps; up to 'max age' frames of extra lag. 2 recommended.");
-    }
-
     // ---- Fork: latency and display. Everything here is written to mgpu.ini.
     // Vsync is also live; the rest are read at launch or arm, so the panel
     // compares against what this session started with and says RESTART.
@@ -1602,6 +1836,13 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     // outlives a crash and unticking could not undo it) was answered by V43:
     // reflex::clear_residue runs at every launch whenever ReflexApplied=1 is
     // left behind, whatever Reflex is set to.
+    {
+        static const char *const rn[] = { "Reflex off", "Reflex on", "Reflex on + boost" };
+        const int r = mgpu::gpu1::ui_ini_read("Reflex", 0);
+        snprintf(sm, sizeof sm, "%s%s", rn[(r >= 0 && r <= 2) ? r : 0],
+                 mgpu::gpu1::ui_present_vsync() ? ", vsync" : "");
+    }
+    if (ui_section(SEC_LAT, "Latency And Display", sm))
     {
         static bool loaded = false;
         static int rfx = 0, rfx_sleep = 0, cq = 0, rw = 0, dco = -2, stg = 0;
@@ -1618,20 +1859,19 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             rfx0 = rfx; rfx_sleep0 = rfx_sleep; cq0 = cq; rw0 = rw; dco0 = dco; stg0 = stg;
         }
 
-        ImGui::SeparatorText("Latency and display");
 
         // Reflex on the render GPU (GPU 0).
         ImGui::TextUnformatted("Reflex");
         ImGui::SameLine();
         int r = rfx;
-        if (ImGui::RadioButton("off##rfx", &r, 0) && mgpu::gpu1::ui_ini_write("Reflex", 0)) rfx = 0;
+        if (ui_tip(ImGui::RadioButton("Off##rfx", &r, 0), "No NVIDIA Reflex on the render card. Restart to apply.") && mgpu::gpu1::ui_ini_write("Reflex", 0)) rfx = 0;
         ImGui::SameLine();
-        if (ImGui::RadioButton("on##rfx", &r, 1) && mgpu::gpu1::ui_ini_write("Reflex", 1)) rfx = 1;
+        if (ui_tip(ImGui::RadioButton("On##rfx", &r, 1), "NVIDIA Reflex low-latency mode on the render card. If the game has its\nown Reflex option, use one or the other. Restart to apply.") && mgpu::gpu1::ui_ini_write("Reflex", 1)) rfx = 1;
         ImGui::SameLine();
-        if (ImGui::RadioButton("on + boost##rfx", &r, 2) && mgpu::gpu1::ui_ini_write("Reflex", 2)) rfx = 2;
+        if (ui_tip(ImGui::RadioButton("On + boost##rfx", &r, 2), "Reflex, plus boost: keeps the render card's clocks up.\nRestart to apply.") && mgpu::gpu1::ui_ini_write("Reflex", 2)) rfx = 2;
         ImGui::BeginDisabled(rfx == 0);
         bool sl = (rfx_sleep != 0);
-        if (ImGui::Checkbox("Reflex sleep (shortens the render queue)", &sl) &&
+        if (ui_tip(ImGui::Checkbox("Reflex sleep (shortens the render queue)", &sl), "Shortens the render queue so frames wait less. Restart to apply.") &&
             mgpu::gpu1::ui_ini_write("ReflexSleep", sl ? 1 : 0))
             rfx_sleep = sl ? 1 : 0;
         ImGui::EndDisabled();
@@ -1639,7 +1879,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 
         // Bridge present vsync: live.
         bool vs = mgpu::gpu1::ui_present_vsync();
-        if (ImGui::Checkbox("bridge vsync", &vs))
+        if (ui_tip(ImGui::Checkbox("Bridge vsync", &vs), "Vsync on the bridge's picture. Off is lower latency but can tear. Live."))
         {
             mgpu::gpu1::ui_set_present_vsync(vs);
             (void)mgpu::gpu1::ui_ini_write("PresentVsync", vs ? 1 : 0);
@@ -1652,7 +1892,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             static int lp1 = -1;
             if (lp1 < 0) lp1 = mgpu::gpu1::ui_ini_read("PresentLatency1", 0) == 1 ? 1 : 0;
             bool on = lp1 != 0;
-            if (ImGui::Checkbox("low-latency present##lp1", &on) &&
+            if (ui_tip(ImGui::Checkbox("Low-latency present##lp1", &on), "At most one finished frame waits in Windows' queue before the screen,\ninstead of up to three: a few ms less delay. Best with G-SYNC.\nRestart to apply.") &&
                 mgpu::gpu1::ui_ini_write("PresentLatency1", on ? 1 : 0))
                 lp1 = on ? 1 : 0;
             ImGui::SameLine();
@@ -1661,51 +1901,105 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 ImGui::SetTooltip("At most one finished frame waits in Windows' queue before the screen,\n"
                                   "instead of up to three: a few ms less delay. Best with G-SYNC.");
         }
-        // QD1: queue guard (live).
-        {
-            bool qd = mgpu::gpu1::ui_qd_on();
-            if (ImGui::Checkbox("queue guard (game never runs ahead of the neural card)##qd", &qd))
-                mgpu::gpu1::ui_set_qd_on(qd);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("When the neural card falls 2+ frames behind, the game waits briefly\n"
-                                  "(at most 25 ms) instead of making frames that would be skipped.\n"
-                                  "Rarely acts with a Limiter that fits; logged as [MGPU][QD1].");
-        }
-
-        // Copy queue.
-        ImGui::TextUnformatted("copy queue");
-        ImGui::SameLine();
-        int c = cq;
-        if (ImGui::RadioButton("off##cq", &c, 0) && mgpu::gpu1::ui_ini_write("CopyQueue", 0)) cq = 0;
-        ImGui::SameLine();
-        if (ImGui::RadioButton("split##cq", &c, 1) && mgpu::gpu1::ui_ini_write("CopyQueue", 1)) cq = 1;
-        ImGui::SameLine();
-        if (ImGui::RadioButton("gated##cq", &c, 2) && mgpu::gpu1::ui_ini_write("CopyQueue", 2)) cq = 2;
-        ImGui::SameLine();
-        ImGui::TextDisabled("(gated recommended; late-latch needs split or gated)");
-
-        // OPT5: GPU 0 async staging.
-        bool stb = (stg != 0);
-        if (ImGui::Checkbox("GPU 0 async staging (moves the PCIe copy off the game's queue)", &stb) &&
-            mgpu::gpu1::ui_ini_write("StageCopy", stb ? 1 : 0))
-            stg = stb ? 1 : 0;
-
-        // Ring window.
-        bool rwb = (rw != 0);
-        if (ImGui::Checkbox("ring window (drop stale backlog)", &rwb) &&
-            mgpu::gpu1::ui_ini_write("RingWindow", rwb ? 1 : 0))
-            rw = rwb ? 1 : 0;
 
         // Composition overlay. This fork accepts On with any number of displays.
-        ImGui::TextUnformatted("overlay mode");
+        ImGui::TextUnformatted("Overlay mode");
         ImGui::SameLine();
         int d = (dco == 1) ? 1 : ((dco == -1) ? 2 : 0);
-        if (ImGui::RadioButton("window##dco", &d, 0) && mgpu::gpu1::ui_ini_write("DcompOverlay", 0)) dco = 0;
+        if (ui_tip(ImGui::RadioButton("Window##dco", &d, 0), "The bridge shows its picture in a window of its own. Restart to apply.") && mgpu::gpu1::ui_ini_write("DcompOverlay", 0)) dco = 0;
         ImGui::SameLine();
-        if (ImGui::RadioButton("overlay##dco", &d, 1) && mgpu::gpu1::ui_ini_write("DcompOverlay", 1)) dco = 1;
+        if (ui_tip(ImGui::RadioButton("Overlay##dco", &d, 1), "Draws on the game's own window, so the game keeps input (CTRL+ALT+F6\nhides it). Restart to apply.") && mgpu::gpu1::ui_ini_write("DcompOverlay", 1)) dco = 1;
         ImGui::SameLine();
-        if (ImGui::RadioButton("auto##dco", &d, 2) && mgpu::gpu1::ui_ini_write_text("DcompOverlay", "auto")) dco = -1;
+        if (ui_tip(ImGui::RadioButton("Auto##dco", &d, 2), "Overlay with one monitor, window otherwise. Restart to apply.") && mgpu::gpu1::ui_ini_write_text("DcompOverlay", "auto")) dco = -1;
         ImGui::TextDisabled("overlay: draws on the game's own window and keeps input (CTRL+ALT+F6 hides it).");
+
+        // UI6: the copy path, the queue and late-latch, folded.
+        if (ui_tip(ImGui::TreeNode("Copy, Queue And Late-Latch##latmore"), "Queue guard, copy queue, GPU 0 staging, ring window and late-latch."))
+        {
+            // QD1: queue guard (live).
+            {
+                bool qd = mgpu::gpu1::ui_qd_on();
+                if (ImGui::Checkbox("Queue guard (game never runs ahead of the neural card)##qd", &qd))
+                    mgpu::gpu1::ui_set_qd_on(qd);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("When the neural card falls 2+ frames behind, the game waits briefly\n"
+                                      "(at most 25 ms) instead of making frames that would be skipped.\n"
+                                      "Rarely acts with a Limiter that fits; logged as [MGPU][QD1].");
+            }
+
+            // Copy queue.
+            ImGui::TextUnformatted("Copy queue");
+            ImGui::SameLine();
+            int c = cq;
+            if (ui_tip(ImGui::RadioButton("Off##cq", &c, 0), "The copy into the second GPU runs on its main queue. Restart to apply.") && mgpu::gpu1::ui_ini_write("CopyQueue", 0)) cq = 0;
+            ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton("Split##cq", &c, 1), "The copy runs on a queue of its own, so it can overlap neural work when\nframes back up. Restart to apply.") && mgpu::gpu1::ui_ini_write("CopyQueue", 1)) cq = 1;
+            ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton("Gated##cq", &c, 2), "A copy queue that waits on the GPU for the frame to land, so the copy\nstarts the moment it arrives. Recommended. Restart to apply.") && mgpu::gpu1::ui_ini_write("CopyQueue", 2)) cq = 2;
+            ImGui::SameLine();
+            ImGui::TextDisabled("(gated recommended; late-latch needs split or gated)");
+
+            // OPT5: GPU 0 async staging.
+            bool stb = (stg != 0);
+            if (ui_tip(ImGui::Checkbox("GPU 0 async staging (moves the PCIe copy off the game's queue)", &stb), "Copies each frame to a buffer on the render card first and sends it\nacross PCIe on a separate copy engine (measured 3.4 ms to 0.7 ms per\nframe). Restart to apply.") &&
+                mgpu::gpu1::ui_ini_write("StageCopy", stb ? 1 : 0))
+                stg = stb ? 1 : 0;
+
+            // Ring window.
+            bool rwb = (rw != 0);
+            if (ui_tip(ImGui::Checkbox("Ring window (drop stale backlog)", &rwb), "When the second GPU falls behind, older waiting frames are dropped so it\nalways works on the newest. Restart to apply.") &&
+                mgpu::gpu1::ui_ini_write("RingWindow", rwb ? 1 : 0))
+                rw = rwb ? 1 : 0;
+
+            // ---- OPT2: late-latch, live. Applied immediately AND written to mgpu.ini
+            // so the next launch starts the same way. Before arm, the arm reads the
+            // file the panel just wrote, so the two cannot disagree.
+            {
+            ImGui::SeparatorText("Late-Latch");
+                const bool cq_ini = mgpu::gpu1::ui_ini_read("CopyQueue", 0) != 0;
+                const bool usable = st.armed ? st.ll_ready : cq_ini;
+                ImGui::BeginDisabled(!usable);
+                // Before arm the stream has not read the file yet: show the file.
+                const bool ll_now = st.armed ? st.ll_on
+                                             : (mgpu::gpu1::ui_ini_read("LateLatch", 0) != 0);
+                bool ll = ll_now;
+                if (ui_tip(ImGui::Checkbox("Late-latch prefetch", &ll), "While the second GPU works on one frame, the newest arrived frame is\nalready copied to it. More neural fps; up to 'max age' frames of lag."))
+                {
+                    mgpu::gpu1::ui_set_late_latch(ll);
+                    (void)mgpu::gpu1::ui_ini_write("LateLatch", ll ? 1 : 0);
+                }
+                ImGui::BeginDisabled(!ll_now);
+                static int age = -1;
+                if (age < 0 || (st.armed && !ImGui::IsAnyItemActive()))
+                    age = st.armed ? (int)st.ll_age : mgpu::gpu1::ui_ini_read("LateLatchAge", 2);
+                ui_tip(ImGui::SliderInt("Max age (frames)", &age, 0, 4, "%d", ImGuiSliderFlags_AlwaysClamp), "The oldest a prefetched frame may be when it is used. 2 recommended.");
+                if (ImGui::IsItemDeactivatedAfterEdit())
+                {
+                    mgpu::gpu1::ui_set_late_latch_age((unsigned)age);
+                    (void)mgpu::gpu1::ui_ini_write("LateLatchAge", age);
+                }
+                ImGui::EndDisabled();
+                ImGui::EndDisabled();
+                if (!usable)
+                    ImGui::TextDisabled("Needs CopyQueue=1 or 2 in mgpu.ini (restart to apply).");
+                else if (st.ll_on && st.ll_issued > 0)
+                {
+                    char llt[200];
+                    if (st.ll_recent_pct >= 0.0f)
+                        snprintf(llt, sizeof llt, "used %.1f%% recently  |  %.1f%% of %llu since arm",
+                                 (double)st.ll_recent_pct,
+                                 100.0 * (double)st.ll_hits / (double)st.ll_issued, st.ll_issued);
+                    else
+                        snprintf(llt, sizeof llt, "used %.1f%% of %llu latched  |  too old %llu",
+                                 100.0 * (double)st.ll_hits / (double)st.ll_issued,
+                                 st.ll_issued, st.ll_stale);
+                    ImGui::TextDisabled("%s", llt);
+                }
+                else
+                    ImGui::TextDisabled("More neural fps; up to 'max age' frames of extra lag. 2 recommended.");
+            }
+            ImGui::TreePop();
+        }
 
         const bool dco_changed = ((dco0 == 1) != (dco == 1)) || ((dco0 == -1) != (dco == -1));
         if (rfx != rfx0 || rfx_sleep != rfx_sleep0 || cq != cq0 || rw != rw0 || stg != stg0 ||
@@ -1714,73 +2008,9 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                                "Restart the game once to apply.");
     }
 
-    // ---- Intensity ----
-    ImGui::SeparatorText("Intensity");
-    int pr = st.preset;
-    if (ImGui::RadioButton("manual", &pr, 0))       mgpu::gpu1::ui_set_preset(0);
-    ImGui::SameLine();
-    if (ImGui::RadioButton("front-loaded", &pr, 1)) mgpu::gpu1::ui_set_preset(1);
-    ImGui::SameLine();
-    if (ImGui::RadioButton("back-loaded", &pr, 2))  mgpu::gpu1::ui_set_preset(2);
-
-    float all = st.intensity[0];
-    if (ImGui::SliderFloat("all passes", &all, 0.0f, 2.0f, "%.2f"))
-        mgpu::gpu1::ui_set_intensity(0, all);
-    // FV4: with foveation "centre 2x" the centre's second pass uses pass 2's
-    // intensity, so its slider shows at x1 too.
-    const bool fv4 = (mgpu::gpu1::ui_fov_mode() == 3);
-    for (unsigned i = 0; i < st.max_passes && (i < st.passes || (fv4 && i == 1)); ++i)
-    {
-        char lab[32];
-        snprintf(lab, sizeof lab, (i >= st.passes) ? "pass 2 (centre 2x)" : "pass %u", i + 1);
-        float v = st.intensity[i];
-        if (ImGui::SliderFloat(lab, &v, 0.0f, 2.0f, "%.2f"))
-            mgpu::gpu1::ui_set_intensity(i + 1, v);
-    }
-    if (st.passes == 1)
-        ImGui::TextDisabled("At x1 the three shapes are identical - there is one pass to shape.");
-
-    // CS1: Color Strength. Live; written to mgpu.ini as ColorStrength.
-    {
-        float cs = mgpu::gpu1::ui_color_strength();
-        if (ImGui::SliderFloat("color strength", &cs, 0.0f, 1.0f, "%.2f"))
-            mgpu::gpu1::ui_set_color_strength(cs);
-        ImGui::TextDisabled("1.00 = the neural colours. Lower keeps its lighting but restores");
-        ImGui::TextDisabled("the game's own hue and saturation (skin, cloth, foliage).");
-    }
-
-    // ---- View ----
-    ImGui::SeparatorText("View");
-    int pm = st.present_mode;
-    if (ImGui::RadioButton("output", &pm, 0)) mgpu::gpu1::ui_set_present_mode(0);
-    ImGui::SameLine();
-    if (ImGui::RadioButton("input", &pm, 1))  mgpu::gpu1::ui_set_present_mode(1);
-    ImGui::SameLine();
-    if (ImGui::RadioButton("split", &pm, 2))  mgpu::gpu1::ui_set_present_mode(2);
-    float sp = st.split_pos;
-    if (ImGui::SliderFloat("seam", &sp, 0.0f, 1.0f, "%.2f"))
-        mgpu::gpu1::ui_set_split_pos(sp);
-    ImGui::TextDisabled("Split: input left of the seam, output right, same frame.");
-    ImGui::TextDisabled("CTRL+ALT+, and . move it with no overlay open (SHIFT = coarse); see Hotkeys.");
-    // ST1: the status lines on the FPS HUD (StatusHud in mgpu.ini). Live.
-    {
-        bool sh = mgpu::gpu1::ui_status_hud();
-        if (ImGui::Checkbox("status on the FPS HUD", &sh)) mgpu::gpu1::ui_set_status_hud(sh);
-        ImGui::TextDisabled("Neural state, neural frames, last NGX result, frame generator, hook.");
-        ImGui::TextDisabled("Shown under the FPS lines; CTRL+ALT+H hides the whole HUD.");
-    }
-    // CK1: clock and stopwatch, top-right.
-    {
-        bool ck = mgpu::gpu1::ui_clock();
-        if (ImGui::Checkbox("clock", &ck)) mgpu::gpu1::ui_set_clock(ck);
-        ImGui::SameLine();
-        bool sw = mgpu::gpu1::ui_stopwatch();
-        if (ImGui::Checkbox("stopwatch", &sw)) mgpu::gpu1::ui_set_stopwatch(sw);
-        ImGui::TextDisabled("Top-right. CTRL+ALT+C / CTRL+ALT+S (see Hotkeys). Stopwatch starts at 0.");
-    }
     // HD1: HDR output. Live; every control writes mgpu.ini.
+    if (ui_section(SEC_HDR, "HDR", mgpu::hdr::enabled() ? "on" : "off"))
     {
-        ImGui::SeparatorText("HDR");
         bool hd = mgpu::hdr::enabled();
         if (ImGui::Checkbox("HDR output##hd", &hd)) mgpu::hdr::set_enabled(hd);
         if (ImGui::IsItemHovered())
@@ -1791,33 +2021,105 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         char pkf[48];
         if (pk == 0) snprintf(pkf, sizeof pkf, "monitor's (%d nits)", mgpu::hdr::peak_in_use());
         else snprintf(pkf, sizeof pkf, "%%d nits");
-        if (ImGui::SliderInt("peak##hd", &pk, 0, 2000, pkf)) mgpu::hdr::set_peak(pk < 100 ? 0 : pk);
+        if (ImGui::SliderInt("Peak##hd", &pk, 0, 2000, pkf)) mgpu::hdr::set_peak(pk < 100 ? 0 : pk);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brightest highlight. Far left = what the monitor reports.");
         int pw = mgpu::hdr::paper_white();
-        if (ImGui::SliderInt("paper white##hd", &pw, 80, 500, "%d nits")) mgpu::hdr::set_paper_white(pw);
+        if (ImGui::SliderInt("Paper white##hd", &pw, 80, 500, "%d nits")) mgpu::hdr::set_paper_white(pw);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brightness of white walls, paper and menus.");
         int hl = mgpu::hdr::highlights();
-        if (ImGui::SliderInt("highlights##hd", &hl, 0, 100, "%d%%")) mgpu::hdr::set_highlights(hl);
+        if (ImGui::SliderInt("Highlights##hd", &hl, 0, 100, "%d%%")) mgpu::hdr::set_highlights(hl);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("How far bright areas (sky, lights, fire) reach toward the peak.");
         int sa = mgpu::hdr::saturation();
-        if (ImGui::SliderInt("saturation##hd", &sa, 50, 150, "%d%%")) mgpu::hdr::set_saturation(sa);
+        if (ui_tip(ImGui::SliderInt("Saturation##hd", &sa, 50, 150, "%d%%"), "Colour saturation of the HDR picture. 100% = unchanged.")) mgpu::hdr::set_saturation(sa);
         ImGui::EndDisabled();
         const char *why = mgpu::hdr::status();
         if (why[0] != '\0') ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s", why);
     }
 
-    // ---- SS1 / VR1 / BM1 / BM2: screenshots, video, benchmark ----
-    ImGui::SeparatorText("Screenshots, video and benchmark");
     {
-        if (ImGui::Button("Screenshot")) mgpu::capture::request_screenshot();
+        static const char *const pn[] = { "output", "input", "split" };
+        const int p = (int)st.present_mode;
+        const int sv = mgpu::gpu1::ui_screensaver_minutes();
+        if (sv > 0) snprintf(sm, sizeof sm, "%s, screen saver %d min", pn[(p >= 0 && p <= 2) ? p : 0], sv);
+        else        snprintf(sm, sizeof sm, "%s", pn[(p >= 0 && p <= 2) ? p : 0]);
+    }
+    if (ui_section(SEC_VIEW, "View And HUD", sm))
+    {
+        int pm = st.present_mode;
+        if (ui_tip(ImGui::RadioButton("Output", &pm, 0), "Shows the neural output.")) mgpu::gpu1::ui_set_present_mode(0);
+        ImGui::SameLine();
+        if (ui_tip(ImGui::RadioButton("Input", &pm, 1), "Shows the game's frame as it arrives, before neural rendering."))  mgpu::gpu1::ui_set_present_mode(1);
+        ImGui::SameLine();
+        if (ui_tip(ImGui::RadioButton("Split", &pm, 2), "Input left of the seam, output right, same frame."))  mgpu::gpu1::ui_set_present_mode(2);
+        float sp = st.split_pos;
+        if (ui_tip(ImGui::SliderFloat("Seam", &sp, 0.0f, 1.0f, "%.2f"), "Where the split view divides. CTRL+ALT+, and . move it (SHIFT = coarse)."))
+            mgpu::gpu1::ui_set_split_pos(sp);
+        ImGui::TextDisabled("Split: input left of the seam, output right, same frame.");
+        ImGui::TextDisabled("CTRL+ALT+, and . move it with no overlay open (SHIFT = coarse); see Hotkeys.");
+        // ST1: the status lines on the FPS HUD (StatusHud in mgpu.ini). Live.
+        {
+            bool sh = mgpu::gpu1::ui_status_hud();
+            if (ui_tip(ImGui::Checkbox("Status on the FPS HUD", &sh), "Adds lines under the FPS HUD: neural state, neural frames, last NGX\nresult, frame generator and hook.")) mgpu::gpu1::ui_set_status_hud(sh);
+            ImGui::SameLine();
+            bool bh = mgpu::gpu1::ui_bus_hud();   // BW3
+            if (ImGui::Checkbox("Log bus traffic", &bh)) mgpu::gpu1::ui_set_bus_hud(bh);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Writes the bus traffic (GB/s sent and received) to ReShade.log every 10 s.\n"
+                                  "It is shown live on the ADVANCED FPS HUD (third press of CTRL+ALT+H).");
+            ImGui::TextDisabled("Neural state, neural frames, last NGX result, frame generator, hook.");
+            ImGui::TextDisabled("Shown under the FPS lines; CTRL+ALT+H hides the whole HUD.");
+        }
+        // CK1: clock and stopwatch, top-right.
+        {
+            bool ck = mgpu::gpu1::ui_clock();
+            if (ui_tip(ImGui::Checkbox("Clock", &ck), "A clock at the top right. CTRL+ALT+C.")) mgpu::gpu1::ui_set_clock(ck);
+            ImGui::SameLine();
+            bool sw = mgpu::gpu1::ui_stopwatch();
+            if (ui_tip(ImGui::Checkbox("Stopwatch", &sw), "A stopwatch at the top right, starting at 0. CTRL+ALT+S.")) mgpu::gpu1::ui_set_stopwatch(sw);
+            ImGui::TextDisabled("Top-right. CTRL+ALT+C / CTRL+ALT+S (see Hotkeys). Stopwatch starts at 0.");
+        }
+        // SV1: screen saver.
+        {
+            static const int mins[] = { 0, 1, 2, 5, 10, 15, 30, 60 };
+            static const char *const names[] = { "Off", "1 min", "2 min", "5 min", "10 min", "15 min", "30 min", "60 min" };
+            const int cur = mgpu::gpu1::ui_screensaver_minutes();
+            int sel = 0;
+            for (int i = 0; i < 8; ++i) if (mins[i] == cur) sel = i;
+            // UI5: label first, each list as wide as its longest entry.
+            const float arrow = ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 2.0f;
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Screen saver");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::CalcTextSize("60 min").x + arrow);
+            if (ImGui::Combo("##sv", &sel, names, 8)) mgpu::gpu1::ui_set_screensaver_minutes(mins[sel]);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("For OLED monitors: after this long with no mouse, keyboard or controller\n"
+                                  "input, the picture is covered. Any input brings it back. The game keeps\n"
+                                  "running underneath, so pause it first. Never while this panel is open.");
+            ImGui::SameLine();
+            int sty = mgpu::gpu1::ui_screensaver_style();
+            ImGui::BeginDisabled(cur == 0);
+            ImGui::SetNextItemWidth(ImGui::CalcTextSize("Drifting logo").x + arrow);
+            static const char *const styles[] = { "Black", "Drifting logo" };
+            if (ui_tip(ImGui::Combo("##svs", &sty, styles, 2), "Black, or a dim MGPU BRIDGE logo drifting across the screen.")) mgpu::gpu1::ui_set_screensaver_style(sty);
+            ImGui::EndDisabled();
+        }
+    }
+
+    // ---- SS1 / VR1 / BM1 / BM2: screenshots, video, benchmark ----
+    if (ui_section(SEC_CAP, "Screenshots, Video And Benchmark",
+                   mgpu::capture::recording_state() != 0 ? "recording"
+                   : mgpu::capture::bench_state() != 0 ? "benchmark running" : ""))
+    {
+        if (ui_tip(ImGui::Button("Screenshot"), "Saves a PNG of what the bridge shows to mgpu\\captures. CTRL+ALT+P.")) mgpu::capture::request_screenshot();
         ImGui::SameLine();
         const int rs = mgpu::capture::recording_state();
-        if (ImGui::Button(rs != 0 ? "Stop recording" : "Record video")) mgpu::capture::toggle_recording();
+        if (ui_tip(ImGui::Button(rs != 0 ? "Stop recording" : "Record video"), "Records an MP4 (H.264 on the second GPU's encoder) with the game's\naudio. CTRL+ALT+R.")) mgpu::capture::toggle_recording();
         ImGui::SameLine();
         const int bs = mgpu::capture::bench_state();
-        if (ImGui::Button(bs != 0 ? "Stop benchmark" : "Run benchmark")) mgpu::capture::toggle_benchmark();
+        if (ui_tip(ImGui::Button(bs != 0 ? "Stop benchmark" : "Run benchmark"), "A timed run: average fps, 1% and 0.1% lows, pacing and the latency the\nmod adds, saved to mgpu\\benchmarks\\results.csv. CTRL+ALT+B.")) mgpu::capture::toggle_benchmark();
         ImGui::SameLine();
-        if (ImGui::Button("Open folder"))
+        if (ui_tip(ImGui::Button("Open folder"), "Opens the folder where screenshots, videos and benchmarks are saved."))
         {
             wchar_t d[MAX_PATH * 2] = {};
             if (mgpu::capture::base_folder(d, MAX_PATH * 2))
@@ -1826,38 +2128,38 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         ImGui::TextDisabled("Takes what the bridge shows: neural output and generated frames (FPS HUD optional).");
 
         int rsec = mgpu::capture::record_seconds();
-        if (ImGui::SliderInt("video length limit (s, 0 = until stopped)", &rsec, 0, 600))
+        if (ui_tip(ImGui::SliderInt("Video length limit (s, 0 = until stopped)", &rsec, 0, 600), "Recording stops after this many seconds. 0 = until stopped."))
             mgpu::capture::set_record_seconds(rsec);
         int rf = mgpu::capture::record_fps();
         ImGui::TextUnformatted("video frame rate:");
         ImGui::SameLine();
-        if (ImGui::RadioButton("every frame shown##rf", rf == 0))  mgpu::capture::set_record_fps(0);
+        if (ui_tip(ImGui::RadioButton("Every frame shown##rf", rf == 0), "Records every frame shown, generated frames included."))  mgpu::capture::set_record_fps(0);
         ImGui::SameLine();
-        if (ImGui::RadioButton("30##rf", rf == 30))   mgpu::capture::set_record_fps(30);
+        if (ui_tip(ImGui::RadioButton("30##rf", rf == 30), "Records at 30 fps."))   mgpu::capture::set_record_fps(30);
         ImGui::SameLine();
-        if (ImGui::RadioButton("60##rf", rf == 60))   mgpu::capture::set_record_fps(60);
+        if (ui_tip(ImGui::RadioButton("60##rf", rf == 60), "Records at 60 fps."))   mgpu::capture::set_record_fps(60);
         ImGui::SameLine();
-        if (ImGui::RadioButton("120##rf", rf == 120)) mgpu::capture::set_record_fps(120);
+        if (ui_tip(ImGui::RadioButton("120##rf", rf == 120), "Records at 120 fps.")) mgpu::capture::set_record_fps(120);
         bool ra = mgpu::capture::record_audio();
-        if (ImGui::Checkbox("record game audio", &ra)) mgpu::capture::set_record_audio(ra);
+        if (ui_tip(ImGui::Checkbox("Record game audio", &ra), "Records the game's own sound with the video.")) mgpu::capture::set_record_audio(ra);
         bool sh = mgpu::capture::screenshot_hud();
-        if (ImGui::Checkbox("screenshots include the FPS HUD", &sh)) mgpu::capture::set_screenshot_hud(sh);
+        if (ui_tip(ImGui::Checkbox("Screenshots include the FPS HUD", &sh), "Draws the FPS HUD into screenshots.")) mgpu::capture::set_screenshot_hud(sh);
         ImGui::SameLine();
         bool rh = mgpu::capture::record_hud();
-        if (ImGui::Checkbox("video includes the FPS HUD", &rh)) mgpu::capture::set_record_hud(rh);
+        if (ui_tip(ImGui::Checkbox("Video includes the FPS HUD", &rh), "Draws the FPS HUD into videos.")) mgpu::capture::set_record_hud(rh);
 
         int bsec = mgpu::capture::bench_seconds();
-        if (ImGui::SliderInt("benchmark length (s)", &bsec, 5, 300)) mgpu::capture::set_bench_seconds(bsec);
+        if (ui_tip(ImGui::SliderInt("Benchmark length (s)", &bsec, 5, 300), "How long the measured part of a benchmark runs.")) mgpu::capture::set_bench_seconds(bsec);
         int bd = mgpu::capture::bench_delay();
-        if (ImGui::SliderInt("benchmark countdown (s)", &bd, 0, 10)) mgpu::capture::set_bench_delay(bd);
+        if (ui_tip(ImGui::SliderInt("Benchmark countdown (s)", &bd, 0, 10), "Seconds before measuring starts, to close the panel and get ready.")) mgpu::capture::set_bench_delay(bd);
         bool br = mgpu::capture::bench_replay();
-        if (ImGui::Checkbox("use input replay (repeatable runs)", &br)) mgpu::capture::set_bench_replay(br);
+        if (ui_tip(ImGui::Checkbox("Use input replay (repeatable runs)", &br), "Every benchmark replays the recorded keyboard and mouse path, so runs\ncan be compared. Single-player games only.")) mgpu::capture::set_bench_replay(br);
         double ps = 0.0; unsigned pe = 0;
         if (mgpu::replay::has_path(&ps, &pe))
             ImGui::TextDisabled("Input path for this game: %.1f s, %u events. With replay on, the run lasts as long as the path.", ps, pe);
         else
             ImGui::TextDisabled("No input path recorded for this game yet.");
-        if (ImGui::Button(mgpu::replay::recording() ? "Stop recording input path" : "Record input path"))
+        if (ui_tip(ImGui::Button(mgpu::replay::recording() ? "Stop recording input path" : "Record input path"), "Records a keyboard and mouse path for benchmark replay. CTRL+ALT+I."))
             mgpu::replay::toggle_record();
         ImGui::TextDisabled("Best with the hotkey: start, close this overlay, walk or pan, press it again.");
         ImGui::TextDisabled("Turn off Windows \"Enhance pointer precision\" so mouse turns repeat exactly.");
@@ -1869,115 +2171,6 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (m2[0]) ImGui::TextWrapped("%s", m2);
     }
 
-    // ---- HK1: hotkeys ----
-    if (ImGui::CollapsingHeader("Hotkeys"))
-    {
-        ImGui::TextDisabled("Click a key, then press the new combination (ESC cancels).");
-        ImGui::TextDisabled("They work only while the game or the bridge window is in front.");
-        const int cap = mgpu::hotkeys::capturing();
-        for (unsigned i = 0; i < mgpu::hotkeys::count(); ++i)
-        {
-            char nm[48], lab[96];
-            mgpu::hotkeys::name(i, nm, sizeof nm);
-            snprintf(lab, sizeof lab, "%s##hk%u", (cap == (int)i) ? "Press keys..." : nm, i);
-            ImGui::TextUnformatted(mgpu::hotkeys::label(i));
-            ImGui::SameLine(260.0f);
-            if (ImGui::Button(lab, ImVec2(180.0f, 0.0f)))
-            {
-                if (cap == (int)i) mgpu::hotkeys::cancel_capture();
-                else mgpu::hotkeys::begin_capture(i);
-            }
-            const int c = mgpu::hotkeys::conflict(i);
-            if (c != 0)
-            {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
-                                   c == 1 ? "same keys as another action"
-                                   : c == 2 ? "another program also uses these keys"
-                                            : "no CTRL/ALT: the game sees this key too");
-            }
-        }
-        if (ImGui::Button("Reset hotkeys to defaults")) mgpu::hotkeys::reset_defaults();
-    }
-
-    // ---- Counters ----
-    if (st.armed)
-    {
-        ImGui::SeparatorText("Counters");
-        char c1[200];
-        snprintf(c1, sizeof c1,
-                 "produced %llu  consumed %llu  dropped %llu  overrun %llu  skipped %llu",
-                 st.produced, st.consumed, st.dropped, st.overrun, st.skipped);
-        ImGui::TextUnformatted(c1);
-        if (st.overrun != 0)
-            ImGui::TextDisabled("Overrun climbing = GPU 1 is past its budget at this pass count.");
-    }
-
-    // ---- Live ----
-    //
-    // EVERY NUMBER HERE IS THE ONE ITS END-OF-RUN LOG LINE PRINTS, over the
-    // same divisor. If the panel and the log ever disagree, the panel is wrong
-    // and it is a bug, not a second opinion.
-    if (st.armed)
-    {
-        ImGui::SeparatorText("Live");
-        char lv[260];
-
-        snprintf(lv, sizeof lv, "fps   game %.1f   GPU 1 %.1f",
-                 st.fps_produced, st.fps_consumed);
-        ImGui::TextUnformatted(lv);
-        if (st.fps_consumed + 1.0 < st.fps_produced)
-            ImGui::TextDisabled("GPU 1 behind the game - frames are being skipped, not dropped.");
-
-        if (st.gpu1_ts_ok)
-        {
-            snprintf(lv, sizeof lv,
-                     "GPU 1 ms  copy %.3f   unpack %.3f   EVALUATE %.3f   out %.3f",
-                     st.gpu1_copy_ms, st.gpu1_unpack_ms, st.gpu1_eval_ms, st.gpu1_out_ms);
-            ImGui::TextUnformatted(lv);
-            ImGui::TextDisabled(st.sr_on
-                ? "Evaluate spans every pass AND the reduce and upscale - not the neural cost alone."
-                : "Evaluate spans every pass - divide by the pass count to compare against one.");
-        }
-
-        snprintf(lv, sizeof lv, "latency  ready-to-consume %.2f ms   submit-to-consume %.2f ms",
-                 st.lat_ready_ms, st.lat_submit_ms);
-        ImGui::TextUnformatted(lv);
-        ImGui::TextDisabled("Bridge share only - the game's render before and the present after are not in it.");
-
-        snprintf(lv, sizeof lv, "GPU 0 queue  mean %.2f   max %llu frames behind",
-                 st.backlog_mean, st.backlog_max);
-        if (st.backlog_mean >= 2.5)
-        {
-            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "%s", lv);
-            ImGui::TextDisabled("Queueing deep. Reflex=1 in mgpu.ini, or turn it on in the game.");
-        }
-        else
-        {
-            ImGui::TextUnformatted(lv);
-            if (st.backlog_mean > 0.0 && st.backlog_mean <= 1.6)
-                ImGui::TextDisabled("1.0 is the structural floor, not an error. This is what low latency looks like.");
-        }
-
-        snprintf(lv, sizeof lv, "ring  %u slots%s   skipped by window %llu",
-                 st.ring_depth,
-                 (st.ring_window != 0) ? "  (window ON)" : "  (window off)",
-                 st.ring_skipped);
-        ImGui::TextUnformatted(lv);
-
-        if (st.reordered != 0 || st.bad_magic != 0 || st.contract != 0)
-        {
-            snprintf(lv, sizeof lv, "SEAL FAULTS  reordered %llu  bad magic %llu  contract %llu",
-                     st.reordered, st.bad_magic, st.contract);
-            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "%s", lv);
-        }
-    }
-
-    }
-    ImGui::EndChild();   // ---- end BOX 1 ----
-
-    if (two_col) ImGui::SameLine();
-
     // ====================== BOX 2: DLSS AND REFLEX ======================
     //
     // READ-ONLY, AND THAT IS A DECISION RATHER THAN AN OMISSION. Quality,
@@ -1985,8 +2178,9 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     // one means releasing and rebuilding that handle mid-stream: a 200-450 ms
     // stall on the bridge thread, down a teardown path that has crashed
     // before. These are set in mgpu.ini and take effect on the next arm.
-    ImGui::BeginChild("mgpu_box_dlss", ImVec2(col_w, col_h), true);
-    ImGui::SeparatorText("DLSS  -  super resolution and Reflex");
+    if (st.armed || st.summarised) snprintf(sm, sizeof sm, "%s", st.sr_on ? "running" : "off");
+    else snprintf(sm, sizeof sm, "%s", mgpu::gpu1::ui_ini_read("SRUpscale", 0) != 0 ? "on" : "off");
+    if (ui_section(SEC_DLSS, "DLSS On The Second GPU", sm))
     {
         char dl[300];
 
@@ -2093,7 +2287,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // for the person who already clicked one. Everything here writes
             // mgpu.ini on the click, and mgpu.ini is read when the stream
             // ARMS - so nothing in this section changes a running session.
-            if (ImGui::Checkbox("Enable DLSS on GPU 1", &m_sr))
+            if (ui_tip(ImGui::Checkbox("Enable DLSS on GPU 1", &m_sr), "Neural rendering runs at a reduced resolution and DLSS on the second GPU\nenlarges it back. Read when the bridge starts."))
             {
                 mgpu::gpu1::ui_ini_write("SRUpscale", m_sr ? 1 : 0);
                 // Turning it on must leave a usable R behind even when the
@@ -2150,18 +2344,18 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 
             ImGui::BeginDisabled(!m_sr);
 
-            ImGui::TextUnformatted("preset");
+            ImGui::TextUnformatted("Preset");
             ImGui::SameLine();
-            if (ImGui::RadioButton("title default##p", m_preset == 0))
+            if (ui_tip(ImGui::RadioButton("Title default##p", m_preset == 0), "The preset the DLSS DLL picks for this game."))
             { m_preset = 0;  mgpu::gpu1::ui_ini_write("SRPreset", 0); }
             ImGui::SameLine();
-            if (ImGui::RadioButton("K##p", m_preset == 11))
+            if (ui_tip(ImGui::RadioButton("K##p", m_preset == 11), "DLSS preset K. A DLL without it uses its own."))
             { m_preset = 11; mgpu::gpu1::ui_ini_write("SRPreset", 11); }
             ImGui::SameLine();
-            if (ImGui::RadioButton("L##p", m_preset == 12))
+            if (ui_tip(ImGui::RadioButton("L##p", m_preset == 12), "DLSS preset L. A DLL without it uses its own."))
             { m_preset = 12; mgpu::gpu1::ui_ini_write("SRPreset", 12); }
             ImGui::SameLine();
-            if (ImGui::RadioButton("M##p", m_preset == 13))
+            if (ui_tip(ImGui::RadioButton("M##p", m_preset == 13), "DLSS preset M. A DLL without it uses its own."))
             { m_preset = 13; mgpu::gpu1::ui_ini_write("SRPreset", 13); }
             ImGui::TextDisabled("A DLL that lacks the preset asked for uses its own instead.");
 
@@ -2177,12 +2371,12 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // write SRScale and SRMvLowRes through write_mode, so the pair can
             // never be set independently - the combination that crashed at arm
             // on 2026-09-12 is unreachable from this panel.
-            ImGui::TextUnformatted("upscaling");
-            if (ImGui::RadioButton("Native Upscaling", m_match))
+            ImGui::TextUnformatted("Upscaling");
+            if (ui_tip(ImGui::RadioButton("Native Upscaling", m_match), "Upscales from the game's own render resolution. Higher quality; needs the\ngame's own DLSS upscaling on (not DLAA)."))
             { m_match = true;  write_mode(m_mode); }
             ImGui::TextDisabled("Upscales from the game's own render resolution. Higher quality.");
 
-            if (ImGui::RadioButton("Custom scale", !m_match))
+            if (ui_tip(ImGui::RadioButton("Custom scale", !m_match), "Neural rendering runs at a percentage you choose. Works at DLAA."))
             { m_match = false; write_mode(m_mode); }
             ImGui::TextDisabled("NR runs at a percentage you choose. Works at DLAA.");
 
@@ -2190,15 +2384,15 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // above: all three write SRScale, Native Upscaling overrides it,
             // and a row that disappears teaches nobody it was ever an option.
             ImGui::BeginDisabled(m_match);
-            ImGui::TextUnformatted("mode  ");
+            ImGui::TextUnformatted("Mode  ");
             ImGui::SameLine();
-            if (ImGui::RadioButton("quality##m", m_mode == 2))
+            if (ui_tip(ImGui::RadioButton("Quality##m", m_mode == 2), "Neural rendering at 67% of the display."))
             { m_mode = 2; write_mode(2); g_custom_pct = 67; }
             ImGui::SameLine();
-            if (ImGui::RadioButton("balanced##m", m_mode == 1))
+            if (ui_tip(ImGui::RadioButton("Balanced##m", m_mode == 1), "Neural rendering at 58% of the display."))
             { m_mode = 1; write_mode(1); g_custom_pct = 58; }
             ImGui::SameLine();
-            if (ImGui::RadioButton("performance##m", m_mode == 0))
+            if (ui_tip(ImGui::RadioButton("Performance##m", m_mode == 0), "Neural rendering at 50% of the display."))
             { m_mode = 0; write_mode(0); g_custom_pct = 50; }
             ImGui::TextDisabled("Sets the resolution neural rendering runs at, the way DLSS does:");
             ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
@@ -2217,7 +2411,6 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::EndDisabled();
 
 
-            draw_scaler_controls();
 
             // ---- V26: THERE IS NO "DLAA MODE" ANY MORE, AND THAT IS THE FIX ----
             //
@@ -2272,7 +2465,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::TextDisabled("The file is mgpu.ini, next to the game's exe.");
 
             ImGui::Spacing();
-            if (ImGui::Button("  START NOW  ")) mgpu::gpu1::ui_request_arm();
+            if (ui_tip(ImGui::Button("  START NOW  "), "Starts the bridge now with the settings above.")) mgpu::gpu1::ui_request_arm();
             ImGui::SameLine();
             ImGui::TextDisabled("starts the bridge with the settings already saved");
         }
@@ -2297,7 +2490,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         // said so, which is why it read as the add-on losing track of DLSS.
         // The restart is now stated where the state is, not left to be
         // inferred from two launches.
-        ImGui::SeparatorText("Super resolution");
+        ImGui::SeparatorText("Super Resolution");
         // NO2: with the neural stage off these settings do nothing, so they
         // are greyed out (the monitor scaling below still applies).
         if (!st.neural)
@@ -2321,18 +2514,38 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             {
                 static int ps = -1;
                 if (ps < 0) ps = (st.sr_scale_pct > 0) ? (int)st.sr_scale_pct : 67;
-                if (ImGui::SliderInt("resolution scale##pre", &ps, 33, 90, "%d%%"))
+                if (ui_tip(ImGui::SliderInt("Resolution scale##pre", &ps, 33, 90, "%d%%"), "The share of the display resolution neural rendering runs at. Needed at\nDLAA. Restart to apply."))
                     (void)mgpu::gpu1::ui_ini_write("SRScale", ps);
                 ImGui::TextDisabled("Saved as SRScale; restart to apply. Needed at DLAA.");
             }
         }
         else
         {
+            // UI3: show the size NR runs at NOW. st.sr_w/h are the textures'
+            // size (made at SRDynMax when dynamic is on), so the line read
+            // 2048x1152 (80%) even while NR ran at 67% or a lower dynamic step.
+            unsigned rw = st.sr_w, rh = st.sr_h;
+            {
+                const float dn = mgpu::gpu1::ui_dr_now();
+                const bool dr_live = mgpu::gpu1::ui_dr_on() && mgpu::gpu1::ui_frame_gen() == 4 && dn > 0.0f;
+                double pct = 0.0;
+                if (dr_live) pct = dn;
+                else if (st.sr_scale_pct != 0u) pct = (double)st.sr_scale_pct;
+                if (pct > 0.0 && st.out_w > 0u && st.out_h > 0u)
+                {
+                    const unsigned cw = (unsigned)((double)st.out_w * pct / 100.0 + 0.5) & ~1u;
+                    const unsigned ch = (unsigned)((double)st.out_h * pct / 100.0 + 0.5) & ~1u;
+                    if (cw > 0u && ch > 0u && cw <= st.sr_w && ch <= st.sr_h) { rw = cw; rh = ch; }
+                }
+            }
             snprintf(dl, sizeof dl, "%ux%u  ->  %ux%u   (%.2f Mpx -> %.2f Mpx)",
-                     st.sr_w, st.sr_h, st.out_w, st.out_h,
-                     (double)st.sr_w * (double)st.sr_h / 1000000.0,
+                     rw, rh, st.out_w, st.out_h,
+                     (double)rw * (double)rh / 1000000.0,
                      (double)st.out_w * (double)st.out_h / 1000000.0);
             ImGui::TextUnformatted(dl);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Neural rendering size now -> DLSS Super Resolution output.\n"
+                                  "NIS / FSR 1 then enlarge it to the monitor.");
 
             static const char *qn[] = { "Max Perf", "Balanced", "Max Quality",
                                         "Ultra Perf", "Ultra Quality", "DLAA" };
@@ -2357,8 +2570,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                      st.sr_mv_fix_x, st.sr_mv_fix_y);
             ImGui::TextUnformatted(dl);
             if (st.sr_mv_mode == 1)
-                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
-                                   "EXPERIMENTAL. May reduce ghosting - or cause it. Not confirmed on any other rig or game.");
+                ImGui::TextDisabled("Mode 1: vectors at the reduced size (Custom scale).");   // UI2
             // PW1: mode 2 has been the measured-correct default since R180 (0.2.4);
             // the red "ghosted" warning predated that and was stale.
             else if (st.sr_mv_mode == 2)
@@ -2469,7 +2681,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 return true;
             };
 
-            if (ImGui::Checkbox("DLSS Super Resolution on GPU 1", &want_sr))
+            if (ui_tip(ImGui::Checkbox("DLSS Super Resolution on GPU 1", &want_sr), "Turns DLSS Super Resolution on the second GPU on or off for the next\nlaunch."))
                 wrote_any |= mgpu::gpu1::ui_ini_write("SRUpscale", want_sr ? 1 : 0);
             ImGui::TextDisabled("Native Parameters ON");
 
@@ -2497,7 +2709,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 (want_match ? (st.sr_scale_pct == 0u) : (st.sr_scale_pct == want_pct));
 
             ImGui::BeginDisabled(!want_sr);
-            if (ImGui::RadioButton("Native Upscaling", want_match))
+            if (ui_tip(ImGui::RadioButton("Native Upscaling", want_match), "Upscales from the game's own render resolution. Higher quality; needs the\ngame's own DLSS upscaling on (not DLAA). Restart to apply."))
             { want_match = true;  wrote_any |= write_sr_mode(want_m, true); }
             ImGui::TextDisabled("Upscales from the game's own render resolution. Higher quality.");
 
@@ -2577,7 +2789,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 else
                     ImGui::TextColored(y, "DLAA - Native Upscaling needs DLSS in the game.");
             }
-            if (ImGui::RadioButton("Custom scale", !want_match))
+            if (ui_tip(ImGui::RadioButton("Custom scale", !want_match), "Neural rendering runs at a percentage you choose. Works at DLAA.\nRestart to apply."))
             { want_match = false; wrote_any |= write_sr_mode(want_m, false); }
             ImGui::TextDisabled("NR runs at a percentage you choose. Works at DLAA.");
 
@@ -2622,15 +2834,15 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 }
 
                 ImGui::Spacing();
-                ImGui::TextUnformatted("mode  ");
+                ImGui::TextUnformatted("Mode  ");
                 ImGui::SameLine();
-                if (ImGui::RadioButton("quality##xm", want_m == 2))
+                if (ui_tip(ImGui::RadioButton("Quality##xm", want_m == 2), "Neural rendering at 67% of the display. Restart to apply."))
                 { want_m = 2; wrote_any |= write_sr_mode(2, false); g_custom_pct = 67; }
                 ImGui::SameLine();
-                if (ImGui::RadioButton("balanced##xm", want_m == 1))
+                if (ui_tip(ImGui::RadioButton("Balanced##xm", want_m == 1), "Neural rendering at 58% of the display. Restart to apply."))
                 { want_m = 1; wrote_any |= write_sr_mode(1, false); g_custom_pct = 58; }
                 ImGui::SameLine();
-                if (ImGui::RadioButton("performance##xm", want_m == 0))
+                if (ui_tip(ImGui::RadioButton("Performance##xm", want_m == 0), "Neural rendering at 50% of the display. Restart to apply."))
                 { want_m = 0; wrote_any |= write_sr_mode(0, false); g_custom_pct = 50; }
                 ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
                 wrote_any |= draw_custom_scale_slider("scale##cs_run");
@@ -2652,9 +2864,8 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 
 
         ImGui::EndDisabled();   // NO2
-        draw_scaler_controls();
 
-        ImGui::SeparatorText("Change quality or preset");
+        ImGui::SeparatorText("Change Quality Or Preset");
         ImGui::BeginDisabled(!st.neural);   // NO2
         if (!st.sr_on)
         {
@@ -2826,27 +3037,27 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 if (dirty && !st.sr_rebuild_pending)
                 {
                     ImGui::SameLine();
-                    if (ImGui::Button("  APPLY  "))
+                    if (ui_tip(ImGui::Button("  APPLY  "), "Rebuilds DLSS with the new quality, scale or preset (a short pause)."))
                     {
                         const int scale = (want_s > 0) ? want_s : ((want_q == 2) ? 67 : ((want_q == 1) ? 58 : 50));
                         mgpu::gpu1::ui_set_sr_request(want_q, want_p, scale);
                     }
                     ImGui::SameLine();
-                    if (ImGui::SmallButton("cancel"))
+                    if (ui_tip(ImGui::SmallButton("Cancel"), "Discards the change."))
                     { want_q = st.sr_quality; want_p = st.sr_preset; want_s = (int)st.sr_scale_pct; }
                 }
             }
 
             ImGui::TextUnformatted("Quality");
             ImGui::SameLine();
-            if (ImGui::RadioButton("quality", want_q == 2))     { want_q = 2; want_s = 67; }
+            if (ui_tip(ImGui::RadioButton("Quality", want_q == 2), "67% of the display."))     { want_q = 2; want_s = 67; }
             ImGui::SameLine();
-            if (ImGui::RadioButton("balanced", want_q == 1))    { want_q = 1; want_s = 58; }
+            if (ui_tip(ImGui::RadioButton("Balanced", want_q == 1), "58% of the display."))    { want_q = 1; want_s = 58; }
             ImGui::SameLine();
-            if (ImGui::RadioButton("performance", want_q == 0)) { want_q = 0; want_s = 50; }
+            if (ui_tip(ImGui::RadioButton("Performance", want_q == 0), "50% of the display.")) { want_q = 0; want_s = 50; }
             {   // RS1: any scale, not only the three DLSS steps
                 int sc = (want_s > 0) ? want_s : 67;
-                if (ImGui::SliderInt("resolution scale", &sc, 33, 90, "%d%%")) want_s = sc;
+                if (ui_tip(ImGui::SliderInt("Resolution scale", &sc, 33, 90, "%d%%"), "Any scale from 33% to 90% of the display.")) want_s = sc;
             }
             // V18. THE MODE NOW SETS R, WHICH IS WHAT MAKES IT MEAN ANYTHING.
             // Without this the buttons changed only the model's internal mode
@@ -2857,25 +3068,25 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 
             ImGui::TextUnformatted("Preset");
             ImGui::SameLine();
-            if (ImGui::RadioButton("title default", want_p == 0)) want_p = 0;
+            if (ui_tip(ImGui::RadioButton("Title default", want_p == 0), "The preset the DLSS DLL picks for this game.")) want_p = 0;
             ImGui::SameLine();
-            if (ImGui::RadioButton("K", want_p == 11)) want_p = 11;
+            if (ui_tip(ImGui::RadioButton("K", want_p == 11), "DLSS preset K.")) want_p = 11;
             ImGui::SameLine();
-            if (ImGui::RadioButton("L", want_p == 12)) want_p = 12;
+            if (ui_tip(ImGui::RadioButton("L", want_p == 12), "DLSS preset L.")) want_p = 12;
             ImGui::SameLine();
-            if (ImGui::RadioButton("M", want_p == 13)) want_p = 13;
+            if (ui_tip(ImGui::RadioButton("M", want_p == 13), "DLSS preset M.")) want_p = 13;
             ImGui::TextDisabled("A DLL that lacks the preset asked for silently uses its own.");
             ImGui::TextDisabled("Its nvngx_dlss_*.log says which one it HONOURED. That is the answer.");
 
             // RS1: how the full picture is rebuilt from NR's reduced output. Live.
             // Defaults work; the choices are tucked away for tinkerers.
-            if (ImGui::TreeNode("Advanced##rs"))
+            if (ui_tip(ImGui::TreeNode("Advanced##rs"), "How the reduced picture is rebuilt, the filters, and foveated rendering."))
             {
                 // UI2: label column and option columns at fixed positions, so
                 // the three rows line up whatever the label or option length.
                 const float x0    = ImGui::GetCursorPosX();
                 const float sp    = ImGui::GetStyle().ItemSpacing.x;
-                const float lab_w = ImGui::CalcTextSize("downsample").x + sp * 3.0f;
+                const float lab_w = ImGui::CalcTextSize("Downsample").x + sp * 3.0f;
                 const float opt_w = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x +
                                     ImGui::CalcTextSize("DLSS SR").x + sp * 3.0f;
                 auto row = [&](const char *label, const char *const *names, int n, int &cur, const char *id,
@@ -2888,23 +3099,23 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                         ImGui::SameLine(x0 + lab_w + opt_w * (float)i);
                         char b[48];
                         snprintf(b, sizeof b, "%s##%s%d", names[i], id, i);
-                        if (ImGui::RadioButton(b, &cur, i)) set(i);
+                        if (ui_tip(ImGui::RadioButton(b, &cur, i), "Rebuild: residual enlarges only NR's change onto the full-res frame;\nDLSS SR enlarges the whole reduced picture. Down/upsample: the filters\nused. Defaults: residual, area, bilinear.")) set(i);
                     }
                 };
-                static const char *const rn[] = { "DLSS SR", "residual" };
-                static const char *const dn_[] = { "area", "bilinear", "nearest" };
-                static const char *const un[] = { "bilinear", "bicubic", "nearest" };
+                static const char *const rn[] = { "DLSS SR", "Residual" };
+                static const char *const dn_[] = { "Area", "Bilinear", "Nearest" };
+                static const char *const un[] = { "Bilinear", "Bicubic", "Nearest" };
                 int rr = mgpu::gpu1::ui_rs_recon();
-                row("rebuild", rn, 2, rr, "rs", [](int v) { mgpu::gpu1::ui_set_rs_recon(v); });
+                row("Rebuild", rn, 2, rr, "rs", [](int v) { mgpu::gpu1::ui_set_rs_recon(v); });
                 int dn = mgpu::gpu1::ui_rs_down();
-                row("downsample", dn_, 3, dn, "dn", [](int v) { mgpu::gpu1::ui_set_rs_down(v); });
+                row("Downsample", dn_, 3, dn, "dn", [](int v) { mgpu::gpu1::ui_set_rs_down(v); });
                 ImGui::BeginDisabled(rr != 1);
                 int up = mgpu::gpu1::ui_rs_up();
-                row("upsample", un, 3, up, "up", [](int v) { mgpu::gpu1::ui_set_rs_up(v); });
+                row("Upsample", un, 3, up, "up", [](int v) { mgpu::gpu1::ui_set_rs_up(v); });
                 ImGui::EndDisabled();
                 ImGui::Spacing();
                 ImGui::SetCursorPosX(x0 + lab_w);
-                if (ImGui::SmallButton("defaults##rs"))
+                if (ui_tip(ImGui::SmallButton("Defaults##rs"), "Back to residual, area and bilinear."))
                 { mgpu::gpu1::ui_set_rs_recon(1); mgpu::gpu1::ui_set_rs_down(0); mgpu::gpu1::ui_set_rs_up(0); }
                 ImGui::SameLine();
                 ImGui::TextDisabled("residual, area, bilinear");
@@ -2913,7 +3124,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 // picture. Needs Custom scale, rebuild = residual, one pass.
                 ImGui::Spacing();
                 ImGui::AlignTextToFramePadding();
-                ImGui::TextUnformatted("foveated");
+                ImGui::TextUnformatted("Foveated");
                 ImGui::SameLine(x0 + lab_w);
                 ImGui::BeginDisabled(rr != 1);
                 // FV2: off / centre box / lower band, in the same option columns.
@@ -2921,14 +3132,14 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 {
                     // FV4: "centre 2x" = the centre gets a second pass over the
                     // one-pass picture. Second row, under "centre".
-                    static const char *const fn[] = { "off", "centre", "band", "centre 2x" };
+                    static const char *const fn[] = { "Off", "Centre", "Band", "Centre 2x" };
                     for (int i = 0; i < 4; ++i)
                     {
                         if (i == 3) ImGui::SetCursorPosX(x0 + lab_w + opt_w);
                         else if (i > 0) ImGui::SameLine(x0 + lab_w + opt_w * (float)i);
                         char b[40];
                         snprintf(b, sizeof b, "%s##fv%d", fn[i], i);
-                        if (ImGui::RadioButton(b, &fm, i)) mgpu::gpu1::ui_set_fov_mode(i);
+                        if (ui_tip(ImGui::RadioButton(b, &fm, i), "Full-resolution NR in the centre (or a band) over the reduced picture.\nCentre 2x adds a second pass on the centre. Needs Custom scale, the\nresidual rebuild and one pass.")) mgpu::gpu1::ui_set_fov_mode(i);
                     }
                 }
                 if (fm != 0)
@@ -2938,26 +3149,26 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                     if (fm == 2)
                     {
                         int fb = mgpu::gpu1::ui_fov_band();
-                        if (ImGui::SliderInt("height##fv", &fb, 30, 90, "%d%%")) mgpu::gpu1::ui_set_fov_band(fb);
+                        if (ui_tip(ImGui::SliderInt("Height##fv", &fb, 30, 90, "%d%%"), "Band height, as a share of the picture's height.")) mgpu::gpu1::ui_set_fov_band(fb);
                         // FV3: where the band sits. 0 top, 50 middle, 100 bottom.
                         ImGui::SetCursorPosX(x0 + lab_w);
                         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
                         int bpv = mgpu::gpu1::ui_fov_bpos();
                         const char *bpf = bpv == 0 ? "top" : bpv == 50 ? "middle" : bpv == 100 ? "bottom" : "%d";
-                        if (ImGui::SliderInt("position##fv", &bpv, 0, 100, bpf)) mgpu::gpu1::ui_set_fov_bpos(bpv);
+                        if (ui_tip(ImGui::SliderInt("Position##fv", &bpv, 0, 100, bpf), "Band position: 0 top, 50 middle, 100 bottom.")) mgpu::gpu1::ui_set_fov_bpos(bpv);
                         ImGui::SetCursorPosX(x0 + lab_w);
                         bool fw = mgpu::gpu1::ui_fov_fullw();
-                        if (ImGui::Checkbox("full width on ultrawide##fv", &fw)) mgpu::gpu1::ui_set_fov_fullw(fw);
+                        if (ui_tip(ImGui::Checkbox("Full width on ultrawide##fv", &fw), "Lets the band run the full width on 21:9 and wider monitors (racing\ngames). Otherwise it stops at 16:9.")) mgpu::gpu1::ui_set_fov_fullw(fw);
                     }
                     else
                     {
                         int fp = mgpu::gpu1::ui_fov_pct();
-                        if (ImGui::SliderInt("size##fv", &fp, 30, 90, "%d%%")) mgpu::gpu1::ui_set_fov_pct(fp);
+                        if (ui_tip(ImGui::SliderInt("Size##fv", &fp, 30, 90, "%d%%"), "Centre box size, as a share of each side.")) mgpu::gpu1::ui_set_fov_pct(fp);
                     }
                     ImGui::SetCursorPosX(x0 + lab_w);
                     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
                     int ff = mgpu::gpu1::ui_fov_feather();
-                    if (ImGui::SliderInt("soft edge##fv", &ff, 0, 50, "%d%%")) mgpu::gpu1::ui_set_fov_feather(ff);
+                    if (ui_tip(ImGui::SliderInt("Soft edge##fv", &ff, 0, 50, "%d%%"), "Width of the blend at the box's edge.")) mgpu::gpu1::ui_set_fov_feather(ff);
                     if (fm == 3)
                     {
                         ImGui::SetCursorPosX(x0 + lab_w);
@@ -3028,62 +3239,311 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::EndDisabled();   // NO2
         }   // ---- end of the armed view ----
     }
-    ImGui::EndChild();   // ---- end BOX 2 ----
 
-    // ---- P9.1: the lateral acquisition probe ----
-    //
-    // Drawn on the GAME runtime as well as the bridge one, which is what makes
-    // the toggle safe: register_event and unregister_event are called from the
-    // render thread of the runtime being drawn, never from the bridge thread.
-    ImGui::SeparatorText("Probe (P9.1) - acquisition lateral");
+    // ---- HK1: hotkeys ----
+    snprintf(sm, sizeof sm, "%u actions", mgpu::hotkeys::count());
+    if (ui_section(SEC_HK, "Hotkeys", sm))
     {
-        mgpu::probe::readout pr;
-        mgpu::probe::read(pr);
-
-        int pm = (int)pr.m;
-        ImGui::TextUnformatted("Mode");
-        ImGui::SameLine();
-        bool changed = false;
-        changed |= ImGui::RadioButton("off",   &pm, 0); ImGui::SameLine();
-        changed |= ImGui::RadioButton("depth", &pm, 1); ImGui::SameLine();
-        changed |= ImGui::RadioButton("mvec",  &pm, 2); ImGui::SameLine();
-        changed |= ImGui::RadioButton("both",  &pm, 3);
-        if (changed) mgpu::probe::set_mode((mgpu::probe::mode)pm);
-
-        if (pm != 0)
+        ImGui::TextDisabled("Click a hotkey, then select the new combination below the list.");
+        ImGui::TextDisabled("They work only while the game or the bridge window is in front.");
+        const int cap = mgpu::hotkeys::capturing();
+        // HK7: the panel's own keyboard (ImGui) is a second source for the
+        // capture, beside the mod's keyboard hook - whichever sees the key first.
+        if (cap >= 0)
         {
-            char pb[320];
-            snprintf(pb, sizeof pb,
-                     "game device %s | %llu resources examined | %llu frames",
-                     pr.game_device_found ? "found" : "NOT FOUND",
-                     pr.examined, pr.frames);
-            ImGui::TextUnformatted(pb);
-
-            snprintf(pb, sizeof pb, "cost: depth %.0f ns/frame, mvec %.0f ns/frame",
-                     pr.depth_ns_per_frame, pr.mvec_ns_per_frame);
-            ImGui::TextUnformatted(pb);
-
-            for (unsigned i = 0; i < pr.depth_n && i < 4; ++i)
+            struct km { ImGuiKey k; int vk; };
+            static const km map[] = {
+                { ImGuiKey_Tab, VK_TAB }, { ImGuiKey_LeftArrow, VK_LEFT }, { ImGuiKey_RightArrow, VK_RIGHT },
+                { ImGuiKey_UpArrow, VK_UP }, { ImGuiKey_DownArrow, VK_DOWN }, { ImGuiKey_PageUp, VK_PRIOR },
+                { ImGuiKey_PageDown, VK_NEXT }, { ImGuiKey_Home, VK_HOME }, { ImGuiKey_End, VK_END },
+                { ImGuiKey_Insert, VK_INSERT }, { ImGuiKey_Delete, VK_DELETE }, { ImGuiKey_Backspace, VK_BACK },
+                { ImGuiKey_Space, VK_SPACE }, { ImGuiKey_Enter, VK_RETURN }, { ImGuiKey_Escape, VK_ESCAPE },
+                { ImGuiKey_Apostrophe, VK_OEM_7 }, { ImGuiKey_Comma, VK_OEM_COMMA }, { ImGuiKey_Minus, VK_OEM_MINUS },
+                { ImGuiKey_Period, VK_OEM_PERIOD }, { ImGuiKey_Slash, VK_OEM_2 }, { ImGuiKey_Semicolon, VK_OEM_1 },
+                { ImGuiKey_Equal, VK_OEM_PLUS }, { ImGuiKey_LeftBracket, VK_OEM_4 }, { ImGuiKey_Backslash, VK_OEM_5 },
+                { ImGuiKey_RightBracket, VK_OEM_6 }, { ImGuiKey_GraveAccent, VK_OEM_3 }, { ImGuiKey_Pause, VK_PAUSE },
+                { ImGuiKey_KeypadDecimal, VK_DECIMAL }, { ImGuiKey_KeypadDivide, VK_DIVIDE },
+                { ImGuiKey_KeypadMultiply, VK_MULTIPLY }, { ImGuiKey_KeypadSubtract, VK_SUBTRACT },
+                { ImGuiKey_KeypadAdd, VK_ADD },
+            };
+            int vk = 0;
+            for (const km &e : map) if (ImGui::IsKeyPressed(e.k, false)) { vk = e.vk; break; }
+            for (int i = 0; vk == 0 && i < 10; ++i)
             {
-                snprintf(pb, sizeof pb, "depth #%u  %ux%u  binds=%llu clears=%llu", i,
-                         pr.depth_top[i].width, pr.depth_top[i].height,
-                         pr.depth_top[i].binds, pr.depth_top[i].clears);
-                ImGui::TextUnformatted(pb);
+                if (ImGui::IsKeyPressed((ImGuiKey)(ImGuiKey_0 + i), false)) vk = '0' + i;
+                else if (ImGui::IsKeyPressed((ImGuiKey)(ImGuiKey_Keypad0 + i), false)) vk = VK_NUMPAD0 + i;
             }
-            for (unsigned i = 0; i < pr.mvec_n && i < 4; ++i)
+            for (int i = 0; vk == 0 && i < 26; ++i) if (ImGui::IsKeyPressed((ImGuiKey)(ImGuiKey_A + i), false)) vk = 'A' + i;
+            for (int i = 0; vk == 0 && i < 24; ++i) if (ImGui::IsKeyPressed((ImGuiKey)(ImGuiKey_F1 + i), false)) vk = VK_F1 + i;
+            if (vk != 0)
             {
-                snprintf(pb, sizeof pb, "mvec  #%u  %ux%u  srvs=%llu", i,
-                         pr.mvec_top[i].width, pr.mvec_top[i].height,
-                         pr.mvec_top[i].binds);
-                ImGui::TextUnformatted(pb);
+                const ImGuiIO &io = ImGui::GetIO();
+                const unsigned char mods = (unsigned char)((io.KeyCtrl ? 1 : 0) | (io.KeyAlt ? 2 : 0) | (io.KeyShift ? 4 : 0));
+                if (vk == VK_ESCAPE) mgpu::hotkeys::cancel_capture();
+                else (void)mgpu::hotkeys::capture_from_panel(mods, vk);
             }
-            ImGui::TextDisabled("Watching only. Nothing is bound, nothing crosses the bus.");
+        }
+        // UI5: a table sized from the text (the fixed 260/180 px overlapped
+        // at the panel's font size).
+        float lw = 0.0f;
+        for (unsigned i = 0; i < mgpu::hotkeys::count(); ++i)
+        {
+            const float w = ImGui::CalcTextSize(mgpu::hotkeys::label(i)).x;
+            if (w > lw) lw = w;
+        }
+        const float bw = ImGui::CalcTextSize("CTRL+ALT+SHIFT+PAGE DOWN").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        if (ImGui::BeginTable("##hktable", 3, ImGuiTableFlags_SizingFixedFit))
+        {
+            ImGui::TableSetupColumn("##l", ImGuiTableColumnFlags_WidthFixed, lw);
+            ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, bw);
+            ImGui::TableSetupColumn("##c", ImGuiTableColumnFlags_WidthStretch);
+            for (unsigned i = 0; i < mgpu::hotkeys::count(); ++i)
+            {
+                char nm[48], lab[96];
+                mgpu::hotkeys::name(i, nm, sizeof nm);
+                snprintf(lab, sizeof lab, "%s##hk%u", (cap == (int)i) ? "Select below..." : nm, i);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(mgpu::hotkeys::label(i));
+                ImGui::TableSetColumnIndex(1);
+                if (ui_tip(ImGui::Button(lab, ImVec2(bw, 0.0f)), "Click, then select the new combination below the list."))
+                {
+                    if (cap == (int)i) mgpu::hotkeys::cancel_capture();
+                    else mgpu::hotkeys::begin_capture(i);
+                }
+                const int c = mgpu::hotkeys::conflict(i);
+                if (c != 0)
+                {
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                                       c == 1 ? "same keys as another action"
+                                       : c == 2 ? "another program also uses these keys"
+                                                : "no CTRL/ALT: the game sees this key too");
+                }
+            }
+            ImGui::EndTable();
+        }
+        // HK9: pick the new combination with the mouse. On 2026-11-08 the
+        // keyboard never reached the game process while the panel was open
+        // (HK7/HK8: 0 key events at the hook, 0 at the panel), so a capture
+        // that waits for keys could not finish. While a row is waiting, this
+        // sets it directly; pressing the keys still works where they arrive.
+        if (cap >= 0)
+        {
+            struct kn { const char *name; int vk; };
+            static const kn keys[] = {
+                {"A",'A'},{"B",'B'},{"C",'C'},{"D",'D'},{"E",'E'},{"F",'F'},{"G",'G'},{"H",'H'},{"I",'I'},{"J",'J'},
+                {"K",'K'},{"L",'L'},{"M",'M'},{"N",'N'},{"O",'O'},{"P",'P'},{"Q",'Q'},{"R",'R'},{"S",'S'},{"T",'T'},
+                {"U",'U'},{"V",'V'},{"W",'W'},{"X",'X'},{"Y",'Y'},{"Z",'Z'},
+                {"0",'0'},{"1",'1'},{"2",'2'},{"3",'3'},{"4",'4'},{"5",'5'},{"6",'6'},{"7",'7'},{"8",'8'},{"9",'9'},
+                {"F1",VK_F1},{"F2",VK_F2},{"F3",VK_F3},{"F4",VK_F4},{"F5",VK_F5},{"F6",VK_F6},{"F7",VK_F7},{"F8",VK_F8},
+                {"F9",VK_F9},{"F10",VK_F10},{"F11",VK_F11},{"F12",VK_F12},
+                {"Insert",VK_INSERT},{"Delete",VK_DELETE},{"Home",VK_HOME},{"End",VK_END},{"Page Up",VK_PRIOR},
+                {"Page Down",VK_NEXT},{"Up",VK_UP},{"Down",VK_DOWN},{"Left",VK_LEFT},{"Right",VK_RIGHT},
+                {",",VK_OEM_COMMA},{".",VK_OEM_PERIOD},{"/",VK_OEM_2},{";",VK_OEM_1},{"'",VK_OEM_7},{"[",VK_OEM_4},
+                {"]",VK_OEM_6},{"\\",VK_OEM_5},{"-",VK_OEM_MINUS},{"=",VK_OEM_PLUS},{"`",VK_OEM_3},
+                {"Num 0",VK_NUMPAD0},{"Num 1",VK_NUMPAD1},{"Num 2",VK_NUMPAD2},{"Num 3",VK_NUMPAD3},{"Num 4",VK_NUMPAD4},
+                {"Num 5",VK_NUMPAD5},{"Num 6",VK_NUMPAD6},{"Num 7",VK_NUMPAD7},{"Num 8",VK_NUMPAD8},{"Num 9",VK_NUMPAD9},
+                {"Pause",VK_PAUSE},
+            };
+            static int pk_for = -1, pk_key = 0;
+            static bool pk_c = true, pk_a = true, pk_s = false;
+            if (pk_for != cap) { pk_for = cap; pk_key = 0; pk_c = true; pk_a = true; pk_s = false; }
+            ImGui::Spacing();
+            ImGui::Text("Set \"%s\" to:", mgpu::hotkeys::label((unsigned)cap));
+            ui_tip(ImGui::Checkbox("Ctrl##hkp", &pk_c), "Hold Ctrl as part of the combination.");
+            ImGui::SameLine();
+            ui_tip(ImGui::Checkbox("Alt##hkp", &pk_a), "Hold Alt as part of the combination.");
+            ImGui::SameLine();
+            ui_tip(ImGui::Checkbox("Shift##hkp", &pk_s), "Hold Shift as part of the combination.");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::CalcTextSize("Page Down").x + ImGui::GetFrameHeight() * 2.0f);
+            if (ImGui::BeginCombo("##hkpk", keys[pk_key].name))
+            {
+                for (int i = 0; i < (int)(sizeof keys / sizeof keys[0]); ++i)
+                    if (ImGui::Selectable(keys[i].name, i == pk_key)) pk_key = i;
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            if (ui_tip(ImGui::Button("Set##hkp"), "Makes this the action's hotkey and saves it to mgpu.ini."))
+                (void)mgpu::hotkeys::capture_from_panel(
+                    (unsigned char)((pk_c ? 1 : 0) | (pk_a ? 2 : 0) | (pk_s ? 4 : 0)), keys[pk_key].vk);
+            ImGui::SameLine();
+            if (ui_tip(ImGui::Button("Cancel##hkp"), "Keeps the hotkey as it was.")) mgpu::hotkeys::cancel_capture();
+            if (!pk_c && !pk_a)
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "Without Ctrl or Alt the game sees this key too.");
+        }
+        if (ui_tip(ImGui::Button("Reset hotkeys to defaults"), "Puts every hotkey back to its default.")) mgpu::hotkeys::reset_defaults();
+    }
+
+    {
+        const bool dlg = mgpu::gpu1::ui_detailed_log(), plg = mgpu::gpu1::ui_perf_log();
+        snprintf(sm, sizeof sm, "%s", (dlg && plg) ? "detailed and performance log"
+                                      : dlg ? "detailed log" : plg ? "performance log" : "");
+    }
+    if (ui_section(SEC_DIAG, "Logs And Diagnostics", sm))
+    {
+        // ---- P9.1: the lateral acquisition probe ----
+        //
+        // Drawn on the GAME runtime as well as the bridge one, which is what makes
+        // the toggle safe: register_event and unregister_event are called from the
+        // render thread of the runtime being drawn, never from the bridge thread.
+        ImGui::SeparatorText("Probe (P9.1) - Acquisition Lateral");
+        {
+            mgpu::probe::readout pr;
+            mgpu::probe::read(pr);
+
+            int pm = (int)pr.m;
+            ImGui::TextUnformatted("Mode");
+            ImGui::SameLine();
+            bool changed = false;
+            changed |= ui_tip(ImGui::RadioButton("Off",   &pm, 0), "Probe off."); ImGui::SameLine();
+            changed |= ui_tip(ImGui::RadioButton("Depth", &pm, 1), "Watches the game's depth buffers and lists the busiest. Watching only:\nnothing is bound and nothing crosses the bus."); ImGui::SameLine();
+            changed |= ui_tip(ImGui::RadioButton("MVec",  &pm, 2), "Watches the game's motion vector textures and lists the busiest.\nWatching only."); ImGui::SameLine();
+            changed |= ui_tip(ImGui::RadioButton("Both",  &pm, 3), "Watches depth buffers and motion vector textures. Watching only.");
+            if (changed) mgpu::probe::set_mode((mgpu::probe::mode)pm);
+
+            if (pm != 0)
+            {
+                char pb[320];
+                snprintf(pb, sizeof pb,
+                         "game device %s | %llu resources examined | %llu frames",
+                         pr.game_device_found ? "found" : "NOT FOUND",
+                         pr.examined, pr.frames);
+                ImGui::TextUnformatted(pb);
+
+                snprintf(pb, sizeof pb, "cost: depth %.0f ns/frame, mvec %.0f ns/frame",
+                         pr.depth_ns_per_frame, pr.mvec_ns_per_frame);
+                ImGui::TextUnformatted(pb);
+
+                for (unsigned i = 0; i < pr.depth_n && i < 4; ++i)
+                {
+                    snprintf(pb, sizeof pb, "depth #%u  %ux%u  binds=%llu clears=%llu", i,
+                             pr.depth_top[i].width, pr.depth_top[i].height,
+                             pr.depth_top[i].binds, pr.depth_top[i].clears);
+                    ImGui::TextUnformatted(pb);
+                }
+                for (unsigned i = 0; i < pr.mvec_n && i < 4; ++i)
+                {
+                    snprintf(pb, sizeof pb, "mvec  #%u  %ux%u  srvs=%llu", i,
+                             pr.mvec_top[i].width, pr.mvec_top[i].height,
+                             pr.mvec_top[i].binds);
+                    ImGui::TextUnformatted(pb);
+                }
+                ImGui::TextDisabled("Watching only. Nothing is bound, nothing crosses the bus.");
+            }
+        }
+        {   // PF1
+            bool dl = mgpu::gpu1::ui_detailed_log();
+            if (ui_tip(ImGui::Checkbox("Detailed log", &dl), "Writes the repeating diagnostic lines to ReShade.log. Turn on before a\nrun you want to report.")) mgpu::gpu1::ui_set_detailed_log(dl);
+            ImGui::SameLine();
+            bool pl = mgpu::gpu1::ui_perf_log();
+            if (ui_tip(ImGui::Checkbox("Performance log", &pl), "Every 10 s, a summary of NR GPU time and frame pacing in ReShade.log.")) mgpu::gpu1::ui_set_perf_log(pl);
+            ImGui::TextDisabled("Off by default. Turn on before a run you want to report.");
+        }
+    }
+
+    ui_scope_end();
+    ImGui::Spacing();
+    // ---- Counters ----
+    if (st.armed)
+    {
+        ImGui::SeparatorText("Counters");
+        char c1[200];
+        snprintf(c1, sizeof c1,
+                 "produced %llu  consumed %llu  dropped %llu  overrun %llu  skipped %llu",
+                 st.produced, st.consumed, st.dropped, st.overrun, st.skipped);
+        ImGui::TextUnformatted(c1);
+        if (st.overrun != 0)
+            ImGui::TextDisabled("Overrun climbing = GPU 1 is past its budget at this pass count.");
+    }
+
+    // ---- Live ----
+    //
+    // EVERY NUMBER HERE IS THE ONE ITS END-OF-RUN LOG LINE PRINTS, over the
+    // same divisor. If the panel and the log ever disagree, the panel is wrong
+    // and it is a bug, not a second opinion.
+    if (st.armed)
+    {
+        ImGui::SeparatorText("Live");
+        char lv[260];
+
+        snprintf(lv, sizeof lv, "fps   game %.1f   GPU 1 %.1f",
+                 st.fps_produced, st.fps_consumed);
+        ImGui::TextUnformatted(lv);
+        {   // BW1: what crosses the bus right now
+            double tx = 0.0, rx = 0.0;
+            mgpu::gpu1::ui_bus_rates(tx, rx);
+            snprintf(lv, sizeof lv, "bus   mod sent %.2f GB/s   received %.2f GB/s", tx, rx);
+            ImGui::TextUnformatted(lv);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Sent: what the render card copies out each frame (picture, depth, motion\n"
+                                  "vectors, HUD-less copy). Received: what the neural card reads in.\n"
+                                  "Exact, last full second.");
+            double gm = 0.0, to = -1.0, ti = -1.0;   // BW5
+            mgpu::gpu1::ui_bus_more(gm, to, ti);
+            if (to >= 0.0 || ti >= 0.0)
+                snprintf(lv, sizeof lv, "      game frames ~%.2f GB/s   total: render out %.2f, neural in %.2f GB/s", gm, to, ti);
+            else
+                snprintf(lv, sizeof lv, "      game frames ~%.2f GB/s   total: not available", gm);
+            ImGui::TextUnformatted(lv);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Game frames: the game's own frames, which Windows copies to the monitor's card\n"
+                                  "(estimate: frame size x frame rate). Total: everything on each card's PCIe link,\n"
+                                  "from the NVIDIA driver's counter (includes packet overhead and other programs).\n"
+                                  "Links: 3080 Ti PCIe 4.0 x8 (~14 GB/s), 5060 Ti PCIe 4.0 x4 (~7 GB/s).");
+        }
+        if (st.fps_consumed + 1.0 < st.fps_produced)
+            ImGui::TextDisabled("GPU 1 behind the game - frames are being skipped, not dropped.");
+
+        if (st.gpu1_ts_ok)
+        {
+            snprintf(lv, sizeof lv,
+                     "GPU 1 ms  copy %.3f   unpack %.3f   EVALUATE %.3f   out %.3f",
+                     st.gpu1_copy_ms, st.gpu1_unpack_ms, st.gpu1_eval_ms, st.gpu1_out_ms);
+            ImGui::TextUnformatted(lv);
+            ImGui::TextDisabled(st.sr_on
+                ? "Evaluate spans every pass AND the reduce and upscale - not the neural cost alone."
+                : "Evaluate spans every pass - divide by the pass count to compare against one.");
+        }
+
+        snprintf(lv, sizeof lv, "latency  ready-to-consume %.2f ms   submit-to-consume %.2f ms",
+                 st.lat_ready_ms, st.lat_submit_ms);
+        ImGui::TextUnformatted(lv);
+        ImGui::TextDisabled("Bridge share only - the game's render before and the present after are not in it.");
+
+        snprintf(lv, sizeof lv, "GPU 0 queue  mean %.2f   max %llu frames behind",
+                 st.backlog_mean, st.backlog_max);
+        if (st.backlog_mean >= 2.5)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "%s", lv);
+            ImGui::TextDisabled("Queueing deep. Reflex=1 in mgpu.ini, or turn it on in the game.");
+        }
+        else
+        {
+            ImGui::TextUnformatted(lv);
+            if (st.backlog_mean > 0.0 && st.backlog_mean <= 1.6)
+                ImGui::TextDisabled("1.0 is the structural floor, not an error. This is what low latency looks like.");
+        }
+
+        snprintf(lv, sizeof lv, "ring  %u slots%s   skipped by window %llu",
+                 st.ring_depth,
+                 (st.ring_window != 0) ? "  (window ON)" : "  (window off)",
+                 st.ring_skipped);
+        ImGui::TextUnformatted(lv);
+
+        if (st.reordered != 0 || st.bad_magic != 0 || st.contract != 0)
+        {
+            snprintf(lv, sizeof lv, "SEAL FAULTS  reordered %llu  bad magic %llu  contract %llu",
+                     st.reordered, st.bad_magic, st.contract);
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "%s", lv);
         }
     }
 
     ImGui::Separator();
     ImGui::TextDisabled("Do not change resolution, DLSS mode or presets while armed - disarm first.");
-    ImGui::TextDisabled("Frame generation is untested. Changes here make this a tuning run.");
 
     // ---- V20: WHERE TO SEND A LOG ----
     //
@@ -3145,14 +3605,6 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (drv != 0) ImGui::TextDisabled("Driver %u.%02u | DLLs: %s", drv / 100u, drv % 100u, dv);
             else          ImGui::TextDisabled("DLLs: %s", dv);
         }
-        {   // PF1
-            bool dl = mgpu::gpu1::ui_detailed_log();
-            if (ImGui::Checkbox("detailed log", &dl)) mgpu::gpu1::ui_set_detailed_log(dl);
-            ImGui::SameLine();
-            bool pl = mgpu::gpu1::ui_perf_log();
-            if (ImGui::Checkbox("performance log", &pl)) mgpu::gpu1::ui_set_perf_log(pl);
-            ImGui::TextDisabled("Off by default. Turn on before a run you want to report.");
-        }
         ImGui::Spacing();
     }
 
@@ -3162,7 +3614,15 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("MGPU Bridge %s (davidm71 fork) | build %s | %s %s",
                         MGPU_VERSION_STR, MGPU_SOURCE_TAG, __DATE__, __TIME__);
     ImGui::TextDisabled("Something wrong? Send ReShade.log from the game's exe folder to:");
-    ImGui::TextDisabled("github.com/maohgad-web/Neural-coprocessor");
+    ImGui::TextDisabled("github.com/davidm71/Neural-coprocessor");
+
+    // UI6: Expand all / Collapse all lasts one frame; the open set is saved once.
+    g_ui_force = -1;
+    if (g_ui_dirty)
+    {
+        g_ui_dirty = false;
+        (void)mgpu::gpu1::ui_ini_write("UiOpen", g_ui_open);
+    }
 }
 #endif
 
@@ -3549,6 +4009,14 @@ static void on_present(reshade::api::command_queue *queue,
                        uint32_t, const reshade::api::rect *)
 {
     if (queue == nullptr) return;
+    // SO2: a present reached - the milestone a Steam overlay step-over is judged
+    // by. One relaxed atomic per frame; the device check runs only for a few
+    // seconds after a step-over.
+    mgpu::crashlog::note_present(0, 0);
+    if (mgpu::crashlog::wants_device_check() && queue->get_device() != nullptr &&
+        queue->get_device()->get_api() == reshade::api::device_api::d3d12)
+        if (auto *d12 = reinterpret_cast<ID3D12Device *>(static_cast<uintptr_t>(queue->get_device()->get_native())))
+            mgpu::crashlog::note_device((long)d12->GetDeviceRemovedReason());
     // HP1: the present-time feed, BEFORE the signal below so the copies it
     // flushes are ahead of it on the game's queue. Inert while the effect
     // event feeds the bridge (HookPoint=0) or always (HookPoint=1).
@@ -3615,6 +4083,9 @@ static void on_present(reshade::api::command_queue *queue,
                 auto *rt = (reshade::api::effect_runtime *)target;
                 if (rt != nullptr)
                 {
+                    if (!p_is_game && live_mode && rt == mgpu::live_panel::host_target(nullptr) &&
+                        mgpu::live_panel::take_reopen())
+                        pend.store(1, std::memory_order_relaxed);   // UI4: as if the overlay key were pressed
                     const int want = pend.exchange(-1, std::memory_order_relaxed);
                     if (want >= 0)
                     {
@@ -3725,7 +4196,7 @@ static void on_present(reshade::api::command_queue *queue,
                          ? "ERROR 204 - THE GAME'S EFFECT RUNTIME HAS NEVER RUN, AND THAT IS "
                            "THE FAULT. Same code as the bridge window is showing. [R138] above "
                            "states it once with what to check, and "
-                           "github.com/maohgad-web/Neural-coprocessor/issues if that does not "
+                           "github.com/davidm71/Neural-coprocessor/issues if that does not "
                            "resolve it."
                          : ((tap == 0ull)
                                 ? "The effect pass runs; ReShade has no depth bound yet."
@@ -3752,7 +4223,7 @@ static void on_present(reshade::api::command_queue *queue,
              "many - a BRIDGE line reading '0 of N' with no GAME line means all N went to the "
              "bridge. Measured on 007 First Light, 2026-09-15: 14 effects compiled, all of "
              "them enumerated by the BRIDGE runtime, none by the game's. IF THAT DOES NOT "
-             "RESOLVE IT: github.com/maohgad-web/Neural-coprocessor/issues - attach this file.",
+             "RESOLVE IT: github.com/davidm71/Neural-coprocessor/issues - attach this file.",
              n);
     mgpu::diag::error(l138);
 }
@@ -4312,7 +4783,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // SLT3: must be in place before the engine resolves Streamline, so it
         // runs here. Does nothing unless mgpu.ini says SLTags=3.
         mgpu::sltags::early_install(hModule);
-        // CR1: name whatever crashes the game (no file I/O here; it writes only on a crash).
+        // CR1: name whatever crashes the game. SO2: also opens mgpu\\crash.txt for appending and reads
+        // SteamOverlayGuard from mgpu.ini (plain file calls; nothing that loads a DLL).
         mgpu::crashlog::install(hModule);
         mgpu::crashlog::announce();
         // T2: per-event logging, provisional LUID capture, one-time table

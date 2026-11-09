@@ -392,12 +392,30 @@ bool on()
 #endif
 }
 
+// UI4: switching HDR output (or anything else that rebuilds the neural chain)
+// destroys the panel's host runtime while the panel is open. It was dropped
+// and the user had to press the overlay key twice to get it back - meanwhile
+// the game runtime's half of the panel stayed up at the game window's place,
+// without the pointer mapping. Now, if the host goes while the panel is live,
+// the panel is reopened on the new host as soon as it is recorded (within
+// 10 s), through the same pending-open path a keypress takes.
+std::atomic<unsigned long long> g_reopen_ms{0};
+std::atomic<int> g_reopen_go{0};
+
 void note_runtime(reshade::api::effect_runtime *runtime, bool is_game)
 {
     if (!on() || runtime == nullptr) return;
     if (is_game) { g_game.store(runtime, std::memory_order_relaxed); return; }
     if (runtime->get_hwnd() != nullptr) return;   // only the windowless chain is the neural picture
     g_windowless.store(runtime, std::memory_order_relaxed);
+    {   // UI4
+        const unsigned long long t = g_reopen_ms.exchange(0, std::memory_order_relaxed);
+        if (t != 0ull && GetTickCount64() - t < 10000ull)
+        {
+            g_reopen_go.store(1, std::memory_order_relaxed);
+            mgpu::diag::info("[MGPU][UI4] the neural chain was rebuilt with the panel open - reopening it on the new host.");
+        }
+    }
     if (g_said_host.exchange(1, std::memory_order_relaxed) == 0)
     {
         char l[300];
@@ -418,7 +436,8 @@ void runtime_destroyed(reshade::api::effect_runtime *runtime)
     if (g_host.load(std::memory_order_relaxed) == r)
     {
         g_host.store(nullptr, std::memory_order_relaxed);
-        if (g_live.exchange(0, std::memory_order_relaxed) != 0 && (mgpu::gpu1::sc_set_panel_live(false), true))
+        if (g_live.exchange(0, std::memory_order_relaxed) != 0 && (mgpu::gpu1::sc_set_panel_live(false), true) &&
+            (g_reopen_ms.store(GetTickCount64(), std::memory_order_relaxed), true))   // UI4
             mgpu::diag::info("[MGPU][R294] the panel's host runtime is being destroyed (the neural chain was "
                              "re-armed or resized): the panel is dropped and the game's input is released. "
                              "The overlay key opens it again on the new runtime.");
@@ -426,6 +445,7 @@ void runtime_destroyed(reshade::api::effect_runtime *runtime)
 }
 
 bool live() { return g_live.load(std::memory_order_relaxed) != 0; }
+bool take_reopen() { return g_reopen_go.exchange(0, std::memory_order_relaxed) != 0; }   // UI4
 
 void set_drawer(void (*fn)(reshade::api::effect_runtime *)) { g_drawer = fn; }
 bool drawing_own() { return t_own; }

@@ -36,6 +36,14 @@ int  sharpness();       void set_sharpness(int pct);   // 0..100
 // fast-moving pixels (8+ px per frame); still pixels keep all of it.
 int  mas();             void set_mas(int on);
 int  mas_motion();      void set_mas_motion(int pct);   // 0..100
+// NH1: NIS in half precision (NIS_USE_HALF_PRECISION=1, min16float). Live.
+// The half pipeline is compiled the first time it is wanted, in the background
+// (NH1b/c); full precision runs until it is ready.
+// half_state: 0 not compiled yet, 1 half pipeline unavailable, 2 built but the
+// card does not report 16-bit min precision (runs as full), 3 in effect,
+// 4 being prepared.
+int  half();            void set_half(int on);
+int  half_state();
 
 // MAS1. Neural stage's list, while the motion vectors are a shader resource:
 // builds the motion mask (fastest motion per 16x16 cell, in display pixels per

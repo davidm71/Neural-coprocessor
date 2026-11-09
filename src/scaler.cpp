@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <climits>
 #include <string>
+#include <thread>
 #include "d3dc.hpp"
 #include <cmath>
 
@@ -42,6 +43,17 @@ std::atomic<bool> g_failed{false};
 // motion mask the neural stage builds out of the game's motion vectors.
 std::atomic<int>  g_mas{0};
 std::atomic<int>  g_mas_move{30};
+// NH1: NIS in half precision (min16float). Off (full precision) by default.
+// The half pipeline is compiled at its first use (NH1b); the switch is live.
+std::atomic<int>  g_half{0};
+std::atomic<int>  g_half_st{0};   // half_state(), read by the panel without the scaler lock
+// NH1c/BG1: the slow compiles (FSR 1, NIS, NIS half) run on their own threads
+// - NIS alone took about 3 s on the present thread, which froze the picture
+// and the panel. gen: bumped by release(), so a compile that finishes after a
+// teardown discards its result. busy: threads still running; release() waits
+// for them before the module can go.
+std::atomic<unsigned> g_bg_gen{0};
+std::atomic<int>  g_bg_busy{0};
 const unsigned kMasTile = 16u;     // source pixels per mask cell
 
 // ---- the shaders ----
@@ -224,7 +236,8 @@ struct state
     ID3D12Device *dev = nullptr;
     bool built = false;
     ID3D12RootSignature *rs = nullptr;
-    ID3D12PipelineState *pso_easu = nullptr, *pso_rcas = nullptr, *pso_nis = nullptr, *pso_bil = nullptr;
+    ID3D12PipelineState *pso_easu = nullptr, *pso_rcas = nullptr, *pso_nis = nullptr, *pso_bil = nullptr,
+                        *pso_nis_h = nullptr;   // NH1
     ID3D12DescriptorHeap *heap = nullptr;
     UINT inc = 0;
     ID3D12Resource *coef_s = nullptr, *coef_u = nullptr, *coef_up = nullptr;
@@ -241,6 +254,10 @@ struct state
     unsigned tw = 0, th = 0;
     DXGI_FORMAT tfmt = DXGI_FORMAT_UNKNOWN;
     bool said = false;
+    bool half16 = false;   // NH1: the card reports 16-bit min precision
+    bool half_tried = false;   // NH1b: the half pipeline was compiled (or failed) this build
+    bool nis_tables = false;   // BG1: NIS coefficient tables created
+    int  said_m = -1;          // BG1: the filter the last "scaling ... with" line named
 };
 state g_s;
 
@@ -299,6 +316,60 @@ ID3D12PipelineState *make_pso(ID3D12Device *dev, ID3D12RootSignature *rs, pfn_co
 const UINT kRootDwords = 32u;
 static_assert(offsetof(NISConfig, reserved1) + 4u <= kRootDwords * 4u, "NIS constants do not fit");
 
+// BG1: FSR 1 (EASU + RCAS) and NIS, compiled off the present thread. Until
+// they land, run() falls back to bilinear exactly as it does when either is
+// unavailable. Called from build(), under g_s.mx.
+void start_bg_compile(ID3D12Device *dev, pfn_compile cmp)
+{
+    ID3D12RootSignature *rs = g_s.rs;
+    const bool want_nis = g_s.nis_tables;
+    dev->AddRef(); rs->AddRef();
+    const unsigned gen = g_bg_gen.load();
+    g_bg_busy.fetch_add(1);
+    try
+    {
+        std::thread([dev, rs, cmp, gen, want_nis]()
+        {
+            const D3D_SHADER_MACRO easu[] = { { "SC_EASU", "1" }, { nullptr, nullptr } };
+            const D3D_SHADER_MACRO rcas[] = { { "SC_EASU", "0" }, { nullptr, nullptr } };
+            char bw[8], bh[8], tg[8];
+            snprintf(bw, sizeof bw, "%u", NIS_BW); snprintf(bh, sizeof bh, "%u", NIS_BH); snprintf(tg, sizeof tg, "%u", NIS_TG);
+            const D3D_SHADER_MACRO nis[] = { { "NIS_SCALER", "1" }, { "NIS_HDR_MODE", "0" }, { "NIS_BLOCK_WIDTH", bw },
+                                             { "NIS_BLOCK_HEIGHT", bh }, { "NIS_THREAD_GROUP_SIZE", tg },
+                                             { "NIS_USE_HALF_PRECISION", "0" }, { nullptr, nullptr } };
+            const ULONGLONG t0 = GetTickCount64();
+            ID3D12PipelineState *pe = make_pso(dev, rs, cmp, kFsrHLSL, easu, "FSR1 EASU");
+            ID3D12PipelineState *pr = make_pso(dev, rs, cmp, kFsrHLSL, rcas, "FSR1 RCAS");
+            ID3D12PipelineState *pn = want_nis ? make_pso(dev, rs, cmp, kNisHLSL, nis, "NIS") : nullptr;
+            const unsigned ms = (unsigned)(GetTickCount64() - t0);
+            bool kept = false;
+            {
+                std::lock_guard<std::mutex> lk(g_s.mx);
+                if (gen == g_bg_gen.load() && g_s.built && g_s.dev == dev)
+                {
+                    g_s.pso_easu = pe; g_s.pso_rcas = pr; g_s.pso_nis = pn; kept = true;
+                }
+            }
+            if (!kept) { if (pe) pe->Release(); if (pr) pr->Release(); if (pn) pn->Release(); }
+            char l[260];
+            if (kept)
+                snprintf(l, sizeof l, "[MGPU][SC1] compiled in the background in %u ms: FSR1 %s, NIS %s.", ms,
+                         (pe && pr) ? "ready" : "UNAVAILABLE", pn ? "ready" : "UNAVAILABLE");
+            else
+                snprintf(l, sizeof l, "[MGPU][SC1] background compile discarded (%u ms): the scaler was rebuilt meanwhile.", ms);
+            mgpu::diag::info(l);
+            rs->Release(); dev->Release();
+            g_bg_busy.fetch_sub(1);
+        }).detach();
+    }
+    catch (...)
+    {
+        rs->Release(); dev->Release();
+        g_bg_busy.fetch_sub(1);
+        mgpu::diag::error("[MGPU][SC1] could not start the background compile - bilinear only.");
+    }
+}
+
 bool build(ID3D12Device *dev)
 {
     pfn_compile cmp = (pfn_compile)mgpu::d3dcompile();   // RV1
@@ -342,18 +413,12 @@ bool build(ID3D12Device *dev)
         return false;
     }
 
-    const D3D_SHADER_MACRO easu[] = { { "SC_EASU", "1" }, { nullptr, nullptr } };
-    const D3D_SHADER_MACRO rcas[] = { { "SC_EASU", "0" }, { nullptr, nullptr } };
-    char bw[8], bh[8], tg[8];
-    snprintf(bw, sizeof bw, "%u", NIS_BW); snprintf(bh, sizeof bh, "%u", NIS_BH); snprintf(tg, sizeof tg, "%u", NIS_TG);
-    const D3D_SHADER_MACRO nis[] = { { "NIS_SCALER", "1" }, { "NIS_HDR_MODE", "0" }, { "NIS_BLOCK_WIDTH", bw },
-                                     { "NIS_BLOCK_HEIGHT", bh }, { "NIS_THREAD_GROUP_SIZE", tg },
-                                     { "NIS_USE_HALF_PRECISION", "0" }, { nullptr, nullptr } };
-    g_s.pso_easu = make_pso(dev, g_s.rs, cmp, kFsrHLSL, easu, "FSR1 EASU");
-    g_s.pso_rcas = make_pso(dev, g_s.rs, cmp, kFsrHLSL, rcas, "FSR1 RCAS");
-    g_s.pso_nis  = make_pso(dev, g_s.rs, cmp, kNisHLSL, nis, "NIS");
-    g_s.pso_bil  = make_pso(dev, g_s.rs, cmp, kBilinearHLSL, nullptr, "bilinear");
+    // BG1: FSR 1 and NIS are compiled by start_bg_compile(), at the end of this function.
+    g_s.pso_bil  = make_pso(dev, g_s.rs, cmp, kBilinearHLSL, nullptr, "bilinear");   // small: here
     if (g_s.pso_bil == nullptr) return false;
+    // BG1: the patched NIS header is made here, once, before any thread reads it.
+    for (const auto &f : scaler_src::kFiles)
+        if (_stricmp(f.name, "NIS_Scaler.h") == 0) (void)nis_source(f.data, f.size);
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -372,7 +437,7 @@ bool build(ID3D12Device *dev)
                                             IID_PPV_ARGS(&g_s.coef_s))) ||
         FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                             IID_PPV_ARGS(&g_s.coef_u))))
-    { relt(g_s.pso_nis); }
+    { g_s.nis_tables = false; }
     else
     {
         const UINT row = 256u;   // >= 2 x 16 bytes, D3D12 row pitch alignment
@@ -394,13 +459,82 @@ bool build(ID3D12Device *dev)
                 g_s.coef_up->Unmap(0, nullptr);
             }
         }
-        if (g_s.coef_up == nullptr) relt(g_s.pso_nis);
+        g_s.nis_tables = (g_s.coef_up != nullptr);
     }
     char l[300];
-    snprintf(l, sizeof l, "[MGPU][SC1] scaler built: FSR1 %s, NIS %s, bilinear ready.",
-             (g_s.pso_easu && g_s.pso_rcas) ? "ready" : "UNAVAILABLE", g_s.pso_nis ? "ready" : "UNAVAILABLE");
+    start_bg_compile(dev, cmp);   // BG1
+    snprintf(l, sizeof l, "[MGPU][SC1] scaler built: bilinear ready; FSR 1 and NIS%s are compiling in the background "
+             "(bilinear is used until they are ready).", g_s.nis_tables ? "" : " (NIS: tables UNAVAILABLE)");
     mgpu::diag::info(l);
+    {   // NH1: whether this card runs min16float at 16 bits at all; if not, half = full.
+        D3D12_FEATURE_DATA_D3D12_OPTIONS o{};
+        const HRESULT oh = dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o);
+        g_s.half16 = SUCCEEDED(oh) && (o.MinPrecisionSupport & D3D12_SHADER_MIN_PRECISION_SUPPORT_16_BIT) != 0;
+        snprintf(l, sizeof l, "[MGPU][NH1] card 16-bit min precision %s; NIS half precision %s.",
+                 SUCCEEDED(oh) ? (g_s.half16 ? "yes" : "no") : "unknown",
+                 g_half.load(std::memory_order_relaxed) ? "on - compiled at its first NIS frame"
+                                                        : "off - compiled only if turned on");
+        mgpu::diag::info(l);
+    }
     return true;
+}
+
+// NH1b/NH1c: the half-precision NIS is compiled the first time it is wanted,
+// not at start, and on a thread of its own: FXC plus the driver take about
+// 3 s for NIS, which on the present thread froze the picture and the panel.
+// Until it is ready, full precision is used. Called under g_s.mx; once per
+// scaler build, even if it fails (then full precision stays).
+void build_nis_half(ID3D12Device *dev)
+{
+    if (g_s.half_tried) return;
+    g_s.half_tried = true;
+    pfn_compile cmp = (pfn_compile)mgpu::d3dcompile();
+    if (cmp == nullptr || g_s.rs == nullptr) { g_half_st.store(1); return; }
+    ID3D12RootSignature *rs = g_s.rs;
+    dev->AddRef(); rs->AddRef();          // the thread's own references
+    const unsigned gen = g_bg_gen.load();
+    const bool half16 = g_s.half16;
+    g_half_st.store(4);                   // preparing
+    g_bg_busy.fetch_add(1);
+    try
+    {
+        std::thread([dev, rs, cmp, gen, half16]()
+        {
+            char bw[8], bh[8], tg[8];
+            snprintf(bw, sizeof bw, "%u", NIS_BW); snprintf(bh, sizeof bh, "%u", NIS_BH); snprintf(tg, sizeof tg, "%u", NIS_TG);
+            const D3D_SHADER_MACRO nish[] = { { "NIS_SCALER", "1" }, { "NIS_HDR_MODE", "0" }, { "NIS_BLOCK_WIDTH", bw },
+                                              { "NIS_BLOCK_HEIGHT", bh }, { "NIS_THREAD_GROUP_SIZE", tg },
+                                              { "NIS_USE_HALF_PRECISION", "1" }, { nullptr, nullptr } };
+            const ULONGLONG t0 = GetTickCount64();
+            ID3D12PipelineState *p = make_pso(dev, rs, cmp, kNisHLSL, nish, "NIS half");
+            const unsigned ms = (unsigned)(GetTickCount64() - t0);
+            bool kept = false;
+            {
+                std::lock_guard<std::mutex> lk(g_s.mx);
+                if (gen == g_bg_gen.load() && g_s.built && g_s.dev == dev)
+                {
+                    g_s.pso_nis_h = p; kept = true;
+                    g_half_st.store(p == nullptr ? 1 : half16 ? 3 : 2);
+                }
+            }
+            if (!kept && p != nullptr) p->Release();
+            char l[220];
+            snprintf(l, sizeof l, "[MGPU][NH1] NIS half precision compiled in the background: %s (%u ms)%s.",
+                     !kept ? "discarded (the scaler was rebuilt meanwhile)"
+                           : p ? "ready" : "UNAVAILABLE - full precision used",
+                     ms, (kept && p && !half16) ? "; this card runs it at full precision" : "");
+            mgpu::diag::info(l);
+            rs->Release(); dev->Release();
+            g_bg_busy.fetch_sub(1);
+        }).detach();
+    }
+    catch (...)
+    {
+        rs->Release(); dev->Release();
+        g_bg_busy.fetch_sub(1);
+        g_half_st.store(1);
+        mgpu::diag::error("[MGPU][NH1] could not start the half-precision compile - full precision used.");
+    }
 }
 
 bool ensure_targets(ID3D12Device *dev, unsigned w, unsigned h, DXGI_FORMAT fmt)
@@ -500,6 +634,9 @@ int  mode()                 { return g_mode.load(std::memory_order_relaxed); }
 void set_mode(int m)        { if (m < 0 || m > 3) m = 0; g_mode.store(m, std::memory_order_relaxed); }
 int  sharpness()            { return g_sharp.load(std::memory_order_relaxed); }
 int  mas()                  { return g_mas.load(std::memory_order_relaxed); }
+int  half()                 { return g_half.load(std::memory_order_relaxed); }                  // NH1
+void set_half(int on)       { g_half.store(on ? 1 : 0, std::memory_order_relaxed); }
+int  half_state()           { return g_half_st.load(std::memory_order_relaxed); }
 void set_mas(int on)        { g_mas.store(on ? 1 : 0, std::memory_order_relaxed); }
 int  mas_motion()           { return g_mas_move.load(std::memory_order_relaxed); }
 void set_mas_motion(int pct){ if (pct < 0) pct = 0; if (pct > 100) pct = 100; g_mas_move.store(pct, std::memory_order_relaxed); }
@@ -616,6 +753,7 @@ bool run(ID3D12Device *dev, ID3D12GraphicsCommandList *cl,
     int m = g_mode.load(std::memory_order_relaxed);
     if (m == 2 && (g_s.pso_easu == nullptr || g_s.pso_rcas == nullptr)) m = 1;
     if (m == 3 && g_s.pso_nis == nullptr) m = 1;
+    if (m == 3 && g_half.load(std::memory_order_relaxed) != 0) build_nis_half(dev);   // NH1b
     if (m == 0) m = 1;   // the chain is at monitor size: enlarge plainly
     const float sharp = (float)g_sharp.load(std::memory_order_relaxed) / 100.0f;
     // MAS1: the mask, if it is on, fresh (written in the last 250 ms) and of this frame's size.
@@ -689,7 +827,8 @@ bool run(ID3D12Device *dev, ID3D12GraphicsCommandList *cl,
             const float on = (mbuf != nullptr && g_nis_patch_ok) ? 1.0f : 0.0f;
             std::memcpy(&k[28], &mmove, 4); std::memcpy(&k[29], &on, 4); k[30] = mcw; k[31] = mch;
         }
-        cl->SetPipelineState(g_s.pso_nis);
+        const bool hp = g_half.load(std::memory_order_relaxed) != 0 && g_s.pso_nis_h != nullptr;   // NH1
+        cl->SetPipelineState(hp ? g_s.pso_nis_h : g_s.pso_nis);
         cl->SetComputeRootDescriptorTable(0, table(dev, set, src, g_s.coef_s, g_s.coef_u, g_s.out, mbuf, mcw * mch));
         cl->SetComputeRoot32BitConstants(1, kRootDwords, k, 0);
         cl->Dispatch((dw + NIS_BW - 1u) / NIS_BW, (dh + NIS_BH - 1u) / NIS_BH, 1u);
@@ -708,9 +847,9 @@ bool run(ID3D12Device *dev, ID3D12GraphicsCommandList *cl,
     cl->CopyResource(bb, g_s.out);
     barrier(cl, g_s.out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    if (!g_s.said)
+    if (!g_s.said || g_s.said_m != m)   // BG1: again when the filter in use changes (e.g. NIS lands)
     {
-        g_s.said = true;
+        g_s.said = true; g_s.said_m = m;
         static const char *const names[4] = { "off", "bilinear", "FSR 1", "NIS" };
         char l[200];
         snprintf(l, sizeof l, "[MGPU][SC1] scaling %ux%u -> %ux%u with %s (sharpness %d%%).",
@@ -897,9 +1036,13 @@ void draw_cursor(ID3D12Device *dev, ID3D12GraphicsCommandList *cl, ID3D12Resourc
 
 void release()
 {
+    // NH1c: a half compile in flight takes the scaler lock when it finishes;
+    // let it finish (bounded) before tearing down, outside the lock.
+    for (int i = 0; i < 1000 && g_bg_busy.load() != 0; ++i) Sleep(10);
+    g_bg_gen.fetch_add(1);
     std::lock_guard<std::mutex> lk(g_s.mx);
     relt(g_s.tmp); relt(g_s.out); relt(g_s.coef_s); relt(g_s.coef_u); relt(g_s.coef_up);
-    relt(g_s.pso_easu); relt(g_s.pso_rcas); relt(g_s.pso_nis); relt(g_s.pso_bil);
+    relt(g_s.pso_easu); relt(g_s.pso_rcas); relt(g_s.pso_nis); relt(g_s.pso_bil); relt(g_s.pso_nis_h);
     {   // MAS1
         std::lock_guard<std::mutex> ml(g_m.mx);
         relt(g_m.buf); relt(g_m.pso); relt(g_m.rs); relt(g_m.heap);
@@ -908,7 +1051,7 @@ void release()
     relt(g_s.heap); relt(g_s.rs);
     relt(g_s.cur_pso); relt(g_s.cur_rs); relt(g_s.cur_tex); relt(g_s.cur_up); relt(g_s.rtv);
     g_s.cur_fmt = DXGI_FORMAT_UNKNOWN; g_s.cur_failed = false; g_s.cur_w = g_s.cur_h = g_s.cur_serial = 0;
-    g_s.built = false; g_s.coef_uploaded = false; g_s.tw = g_s.th = 0; g_s.dev = nullptr; g_s.said = false;
+    g_s.built = false; g_s.half_tried = false; g_half_st.store(0); g_s.coef_uploaded = false; g_s.tw = g_s.th = 0; g_s.dev = nullptr; g_s.said = false; g_s.said_m = -1; g_s.nis_tables = false;
     g_failed.store(false);
 }
 

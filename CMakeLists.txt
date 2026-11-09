@@ -81,6 +81,8 @@ add_library(mgpu_bridge SHARED
     # GT1: the neural card's busy time from GPU timestamps (dynamic resolution).
     src/gputime.cpp
     src/crashlog.cpp
+    # SH1: a one-time report of how Steam's overlay hooks Present.
+    src/steam_hooks.cpp
     src/scaler.cpp
     src/cursormap.cpp
     src/live_panel.cpp
@@ -206,4 +208,12 @@ if(MGPU_BUILD_TESTS)
     )
     add_test(NAME mgpu_adapter_selection_test
              COMMAND mgpu_adapter_selection_test)
+    # SO2: the Steam overlay guard's decisions (portable; also builds with g++/clang).
+    add_executable(mgpu_steam_guard_test tests/steam_guard_test.cpp)
+    target_include_directories(mgpu_steam_guard_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME mgpu_steam_guard_test COMMAND mgpu_steam_guard_test)
+    # FC1: the even frame clock against simulated games (portable).
+    add_executable(mgpu_fg_clock_test tests/fg_clock_test.cpp)
+    target_include_directories(mgpu_fg_clock_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME mgpu_fg_clock_test COMMAND mgpu_fg_clock_test)
 endif()

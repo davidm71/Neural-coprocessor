@@ -68,6 +68,9 @@ void panel_mouse(bool on);
 bool panel_mouse_get(int *x, int *y, unsigned *btn, int *wheel);
 // PP3: a key's state as the keyboard hook saw it (ReShade freezes GetAsyncKeyState).
 bool key_down(int vk);
+// SV3: how long ago a real (not injected) key press / mouse action was, in ms (~0 = never).
+// False when the hooks are not running.
+bool real_input_ages(unsigned long long &key_ms, unsigned long long &mouse_ms);
 
 // Bridge thread, once per loop iteration. Fills `out`; returns true when any
 // key fired. Does nothing (and reports nothing) unless a window of this
@@ -84,6 +87,9 @@ int         conflict(unsigned a);
 void        begin_capture(unsigned a);   // next combination pressed becomes the binding
 void        cancel_capture();
 int         capturing();                 // action being captured, -1 = none
+// HK7: a key the PANEL saw (ImGui) while capturing - a second source beside the
+// keyboard hook. mods: 1 CTRL, 2 ALT, 4 SHIFT. True if it became the binding.
+bool        capture_from_panel(unsigned char mods, int vk);
 void        reset_defaults();
 
 } // namespace hotkeys

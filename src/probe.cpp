@@ -3115,7 +3115,7 @@ mode mode_from_ini()
         const char *sk = mgpu::config::find(buf, strlen(buf), "SLTags");
         int sv = 0;
         if (sk != nullptr) sv = atoi(sk);
-        g_sltags.store((sv < 0 || sv > 3) ? 0 : sv, std::memory_order_relaxed);   // 3 = SLT3
+        g_sltags.store((sv < 0 || sv > 4) ? 0 : sv, std::memory_order_relaxed);   // 3 = SLT3, 4 = SLD1 observe only
     }
     {
         // R180/R182. SFPath: the Starfield path. ABSENT IS NOT OFF.

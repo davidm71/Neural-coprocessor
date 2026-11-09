@@ -40,6 +40,7 @@
 // ---------------------------------------------------------------------------
 
 #include "calibrator.hpp"
+#include "sl_tags.hpp"   // SLD2
 #include "diag.hpp"
 
 #include <tlhelp32.h>
@@ -260,6 +261,11 @@ std::atomic<bool> g_handle_known{false};
 // says so and the set is full rather than silently wrong.
 constexpr unsigned int SCENE_FEATURE_SLOTS = 4u;
 std::atomic<unsigned long long> g_scene_handles[SCENE_FEATURE_SLOTS];
+// LT1: when each slot was last latched or matched by an evaluate (a running
+// count, not a clock), so a full set can give up the slot least recently used.
+std::atomic<unsigned long long> g_scene_used[SCENE_FEATURE_SLOTS];
+std::atomic<unsigned long long> g_scene_tick{0};
+std::atomic<unsigned long long> g_latch_evicted{0};
 std::atomic<unsigned int> g_scene_handle_n{0};
 
 // 13 IS A MEASUREMENT, NOT A HEADER CONSTANT. It is the id this title creates
@@ -317,11 +323,36 @@ void latch_scene_handle(unsigned long long hv)
     for (unsigned int i = 0; i < n && i < SCENE_FEATURE_SLOTS; ++i)
         if (g_scene_handles[i].load(std::memory_order_relaxed) == 0ull)
         {
+            g_scene_used[i].store(g_scene_tick.fetch_add(1, std::memory_order_relaxed) + 1ull, std::memory_order_relaxed);   // LT1
             g_scene_handles[i].store(hv, std::memory_order_relaxed);
             g_relatches.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-    if (n >= SCENE_FEATURE_SLOTS) { g_latch_refused.fetch_add(1, std::memory_order_relaxed); return; }
+    if (n >= SCENE_FEATURE_SLOTS)
+    {
+        // LT1: full. Measured on RoboCop: Rogue City (84b1bb8c, 6afab052): the
+        // game recreates its DLSS feature during the first seconds of a level
+        // and sometimes creates the new one before releasing the old, so five
+        // handles were briefly live-or-latched; four creates were refused and
+        // five evaluates skipped. A newly created feature is the one about to
+        // be evaluated, so it takes the slot used least recently (a dead or
+        // idle handle) instead of being turned away. Only when unlatching is
+        // off (SceneFeaturePath=0, nothing ever freed) is it still refused.
+        if (g_sf_path.load(std::memory_order_relaxed) != 1)
+        { g_latch_refused.fetch_add(1, std::memory_order_relaxed); return; }
+        unsigned int v = 0;
+        unsigned long long best = ~0ull;
+        for (unsigned int i = 0; i < SCENE_FEATURE_SLOTS; ++i)
+        {
+            const unsigned long long u = g_scene_used[i].load(std::memory_order_relaxed);
+            if (u < best) { best = u; v = i; }
+        }
+        g_scene_used[v].store(g_scene_tick.fetch_add(1, std::memory_order_relaxed) + 1ull, std::memory_order_relaxed);
+        g_scene_handles[v].store(hv, std::memory_order_relaxed);
+        g_latch_evicted.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_scene_used[n].store(g_scene_tick.fetch_add(1, std::memory_order_relaxed) + 1ull, std::memory_order_relaxed);   // LT1
     g_scene_handles[n].store(hv, std::memory_order_relaxed);
     // RELEASE, paired with the acquire in is_latched_scene_handle: the handle
     // has to be visible before the count that makes it readable. Writers are
@@ -336,7 +367,11 @@ bool is_latched_scene_handle(unsigned long long hv)
     if (hv == 0ull) return false;                 // R180: never match the free marker
     const unsigned int n = g_scene_handle_n.load(std::memory_order_acquire);
     for (unsigned int i = 0; i < n && i < SCENE_FEATURE_SLOTS; ++i)
-        if (g_scene_handles[i].load(std::memory_order_relaxed) == hv) return true;
+        if (g_scene_handles[i].load(std::memory_order_relaxed) == hv)
+        {
+            g_scene_used[i].store(g_scene_tick.fetch_add(1, std::memory_order_relaxed) + 1ull, std::memory_order_relaxed);   // LT1
+            return true;
+        }
     return false;
 }
 
@@ -2025,7 +2060,7 @@ bool sf_path_should_promote()
     // second-guessed by a heuristic; an explicit 1 has nothing to promote.
     if (g_sf_path.load(std::memory_order_relaxed) != -2) return false;
     if (g_latch_refused.load(std::memory_order_relaxed) == 0ull) return false;
-    bool expected = false;
+    bool expected = false;   // (LT1 never evicts while the path is absent: refusal still promotes)
     // Once per process, whoever asks first.
     return g_sf_promoted.compare_exchange_strong(expected, true,
                                                  std::memory_order_relaxed);
@@ -2182,6 +2217,13 @@ void install(int packed)
             "instruction byte is modified anywhere.");
         hits = scan_and_patch((void *)g_real_gpa, (void *)&hook_gpa);
         g_slots.fetch_add(hits, std::memory_order_relaxed);
+        if (mgpu::sltags::early_active())   // SLD2
+        {
+            mgpu::sltags::chain_gpa((void *)&hook_gpa);
+            mgpu::diag::info("[MGPU][SLD2] the game exe's GetProcAddress slot is held by the SLTags hook "
+                             "(SLTags=3/4, installed at load): the NGX catch is chained behind it, so the "
+                             "game's own NGX lookups still reach it.");
+        }
         char sl[256];
         std::snprintf(sl, sizeof sl,
             "[MGPU][R110] CALIB step 1/2 DONE: %u slot(s) across %llu module(s).",
@@ -2247,6 +2289,7 @@ void uninstall()
     if (!g_installed.load(std::memory_order_relaxed)) return;
 
     unscan_cached_pointers();
+    mgpu::sltags::chain_gpa(nullptr);   // SLD2: before the hook stops being ours to hand out
     scan_and_patch((void *)&hook_gpa, (void *)g_real_gpa);
     g_mode.store(0, std::memory_order_relaxed);
     g_installed.store(false, std::memory_order_relaxed);
@@ -2332,7 +2375,7 @@ void log_summary()
     int w = std::snprintf(line, sizeof line,
         "[MGPU][R101] CALIBRATOR mode=%d rung=%d site=%s | slots=%llu data-slots=%llu modules=%llu gpa-calls=%llu "
         "| resolved=%llu creates=%llu releases=%llu live=%lld sr-handle=%s "
-        "| latch: freed=%llu reused=%llu REFUSED=%llu "
+        "| latch: freed=%llu reused=%llu evicted=%llu REFUSED=%llu "
         "| evaluates=%llu captured=%llu "
         "| cost %.0f ns/frame | eval-copies=%llu eval-skips=%llu. "
         "R183: LIVE IS CREATES MINUS RELEASES and it is the field to read. A live "
@@ -2342,7 +2385,7 @@ void log_summary()
         "climbs means recreation is matched and the pressure is somewhere else. A "
         "NEGATIVE live means we are missing creates rather than that releases "
         "exceeded them: some route resolved ReleaseFeature past our hooks, and the "
-        "number is then a floor, not a count. R180: REFUSED is the one that must stay at zero. It counts scene features the latch set had no room for, and every one of them is a feature whose evaluates are skipped for the rest of the run. Four slots, freed on release since 0.2.5-dev; before that the set was append-only and a fifth create killed the velocity lane permanently. ",
+        "number is then a floor, not a count. R180: REFUSED is the one that must stay at zero. It counts scene features the latch set had no room for, and every one of them is a feature whose evaluates are skipped for the rest of the run. Four slots, freed on release since 0.2.5-dev; before that the set was append-only and a fifth create killed the velocity lane permanently. LT1: a full set now gives the least recently used slot to the new feature (EVICTED) instead of refusing it, so REFUSED can only rise with SceneFeaturePath=0. ",
         g_mode.load(std::memory_order_relaxed),
         g_rung.load(std::memory_order_relaxed), g_site,
         g_slots.load(std::memory_order_relaxed),
@@ -2357,6 +2400,7 @@ void log_summary()
         g_handle_known.load(std::memory_order_relaxed) ? "known" : "UNFILTERED",
         g_unlatches.load(std::memory_order_relaxed),
         g_relatches.load(std::memory_order_relaxed),
+        g_latch_evicted.load(std::memory_order_relaxed),
         g_latch_refused.load(std::memory_order_relaxed),
         g_evals.load(std::memory_order_relaxed),
         g_captures.load(std::memory_order_relaxed),

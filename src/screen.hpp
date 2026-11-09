@@ -216,9 +216,15 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl,
                   double input_fps, double consumed_fps, double nr_eval_fps,
                   double nr_skip_fps, double present_fps, double nr_gpu_ms,
                   double gen_fps = -1.0,    // FG1: < 0 hides the GENERATED line
-                  const char (*status)[48] = nullptr, int n_status = 0);   // ST1: StatusHud=1 lines
+                  const char (*status)[48] = nullptr, int n_status = 0,   // ST1: StatusHud=1 lines
+                  double bus_out_gbs = -1.0, double bus_in_gbs = -1.0,   // BW1: < 0 hides the BUS lines
+                  double lat_ms = -1.0, double ready_ms = -1.0, double queue = -1.0,   // HUD3: ADVANCED (mode 3)
+                  double game_gbs = -1.0, double tot_out = -1.0, double tot_in = -1.0);   // BW5
 
 // CK1: up to two short lines (clock, stopwatch) in a box at the top-right.
+// SV1: screen saver - black, or (style 1) MGPU BRIDGE drifting in dim grey.
+void draw_saver(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                unsigned width, unsigned height, int style, unsigned long long ms);
 void draw_clock_box(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                     unsigned width, unsigned height, const char (*lines)[24], int n);
 

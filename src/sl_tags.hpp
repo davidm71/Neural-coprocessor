@@ -83,6 +83,13 @@ namespace mgpu::sltags
     // other value: touches nothing. Reports through tick().
     void early_install(void *self_module);
 
+    // SLD2. True when SLTags=3/4 holds the game exe's GetProcAddress slot.
+    // chain_gpa: the calibrator's own GetProcAddress hook (or nullptr), which
+    // the SLTags hook then calls instead of the real one, so the NGX catch
+    // still sees every lookup the exe makes.
+    bool early_active();
+    void chain_gpa(void *next);
+
     // The authoritative motion-vector resource the game declared, or 0 if the
     // tap never fired or never saw kBufferTypeMotionVectors. Read by whoever
     // wants to override a ranked guess; zero means "no answer", which every
