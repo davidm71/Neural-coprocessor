@@ -63,10 +63,10 @@
 // a wrong name, on the one line whose entire job is to stop a report
 // misidentifying a build. Caught by a control run rather than by a reader,
 // which is the only reason it is not in somebody's issue thread.
-#define MGPU_VERSION_STR "0.2.5-dev"
+#define MGPU_VERSION_STR "2.0"
 // VR2: the fork's build tag, shared by the R141 log line and the panel footer
 // so the two can never disagree. Bump it with every shipped change.
-#define MGPU_SOURCE_TAG "HK11"
+#define MGPU_SOURCE_TAG "RX1"
 
 
 // ---- P6.4: the overlay panel ----

@@ -21704,9 +21704,15 @@ namespace reflex
         if (dev == nullptr) return;
         if (ini_mirror_get("ReflexApplied", 0) == 0) return;
 
-        mgpu::diag::warn("[MGPU][RFX] ReflexApplied=1 from a previous launch - that launch set "
-                         "low latency on GPU 0 and did not exit cleanly, so the mode is still "
-                         "set in the driver. Putting it back to OFF now.");
+        // RX1: not a crash report. This game normally quits without releasing
+        // its device, so the teardown that clears the key (restore(), from
+        // stream_shutdown) does not run after an ordinary quit either; the
+        // 2026-11-08 12:51 run ended with "Finished exiting" and the next launch
+        // still found the key. Info, worded for that.
+        mgpu::diag::info("[MGPU][RFX] ReflexApplied=1 from the previous launch - it set low "
+                         "latency on GPU 0 and the bridge's shutdown did not run (normal here: "
+                         "the game quits without releasing its device, so this follows an "
+                         "ordinary quit as well as a crash). Putting it back to OFF now.");
 
         HMODULE m = GetModuleHandleW(L"nvapi64.dll");
         if (m == nullptr) m = LoadLibraryW(L"nvapi64.dll");
@@ -21999,8 +22005,8 @@ namespace reflex
         // It cares what the last run actually did.
         if (applied)
         {
-            mgpu::diag::info("[MGPU][RFX] writing ReflexApplied=1. If this launch does not exit "
-                             "cleanly, the next one reads this key and puts low latency back to "
+            mgpu::diag::info("[MGPU][RFX] writing ReflexApplied=1. If this launch's shutdown does "
+                             "not run, the next one reads this key and puts low latency back to "
                              "OFF before anything else - which is the only way a mode that "
                              "outlives the process can be undone after a crash.");
             (void)ui_ini_write("ReflexApplied", 1);
