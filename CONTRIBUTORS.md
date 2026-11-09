@@ -152,3 +152,13 @@ His test system: an AMD card renders the game, an RTX card runs DLSS-NR, HDR10 d
   picture on HDR displays. In 0.5.0 it also follows the game's own colour space (`ChainColorSpace=auto`).
 - **`tools/flicker-probe.ps1` (R347).** Measures flicker from a desktop capture, frame by frame.
 
+**davidm71** – Test system: RTX 3080 Ti (game) and RTX 5060 Ti (DLSS-NR), 2560x1440 render on a 4K 240 Hz G-SYNC display.
+His fork explores frame generation on the neural card, faster transport and a HUD-less path. Four of his designs are in 0.5.0, written here from his fork with his permission:
+
+- GPU 0 staging (R333, `StageCopy`). The copies to the neural card leave the game's queue for a copy queue on GPU 0. On by default in 0.5.0.
+- Frame generation on the neural card (R341, `FrameGen=4`). DLSS Frame Generation runs on the DLSS 5 card.
+- Vector validity by the frame tag (R331, `MVecSealValid`). Optional.
+- Late latch (R343, `LateLatch`). The neural card takes the newest frame that has arrived. Optional.
+
+The multi-display composition behaviour (`DcompMultiDisplay=1`) also came from his fork.
+His fork continues at github.com/davidm71/Neural-coprocessor (dynamic frame generation with an even frame clock, a Steam overlay crash guard, and a reworked panel).
