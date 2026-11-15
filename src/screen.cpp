@@ -492,7 +492,7 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv
 }
 
 // SV1: the screen saver. Black over everything; style 1 adds the words
-// MGPU BRIDGE in dim grey, drifting and bouncing off the edges slowly (a full
+// ATOMIC MGPU BRIDGE in dim grey, drifting and bouncing off the edges slowly (a full
 // crossing takes about a minute), so no pixel stays lit for long.
 void draw_saver(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                 unsigned width, unsigned height, int style, unsigned long long ms)
@@ -502,7 +502,7 @@ void draw_saver(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
     const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     cl->ClearRenderTargetView(rtv, black, 0, nullptr);
     if (style != 1) return;
-    const char *t = "MGPU BRIDGE";
+    const char *t = "ATOMIC MGPU BRIDGE";
     int px = W / 320; if (px < 2) px = 2;
     const int gap = px;
     const int tw = text_width(t, px, gap), th = 7 * px;

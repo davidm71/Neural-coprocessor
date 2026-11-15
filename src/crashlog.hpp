@@ -33,6 +33,7 @@ void flush_dll_events();      // DW1: bridge thread, a few times a second (also 
 // SO2: milestones for judging a Steam overlay step-over. Cheap enough for every
 // frame (one relaxed atomic add and one load unless a step-over is being judged).
 void note_present(int source, long hr);   // 0 = ReShade's present event (hr 0), 1 = the bridge's own Present
+void present_begin();                     // SO5: the calling thread is about to Present (one TLS write)
 bool wants_device_check();                // true for ~5 s after a step-over
 void note_device(long removed_reason);    // GetDeviceRemovedReason of the presenting device
 

@@ -176,3 +176,19 @@ derivative of it.
 
 Nothing in this repository is a fork of LumeniteFX or of any other
 third-party repository.
+
+## ReShade (bundled in the release, not in the source)
+
+The release zip carries `reshade/ReShade64.dll` - the add-on support build of
+[ReShade](https://github.com/crosire/reshade) by crosire, version `RESHADE_VER` in
+`.github/workflows/build.yml` - fetched unmodified from reshade.me at build time, so the
+installer can put it into a game as `dxgi.dll`. ReShade is BSD 3-clause; its licence text
+ships beside it as `reshade/ReShade-LICENSE.txt`, and CI does not ship the DLL without it.
+
+## AMD FidelityFX frame generation (not bundled)
+
+AMD FSR 3 frame generation (`FrameGen=3`) loads AMD's signed
+`amd_fidelityfx_framegeneration_dx12.dll` from the game's `mgpu` folder. Neither the source nor
+the release carries it (releases from IN6 to IN13 did): the user copies it from the
+[FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+(`Kits\FidelityFX\signedbin`; the API headers in `src/ffx` are from v2.3.0), under AMD's licence.

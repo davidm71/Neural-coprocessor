@@ -47,7 +47,7 @@ namespace
 
 const int N_SLOTS = 256;      // lists in flight or waiting to be read, per device
 const int N_DEV = 2;          // the present chain and the neural stage may use two device objects
-const int N_Q = 4;
+const int N_Q = 6;   // WT1: + the copy queue
 
 enum { FREE = 0, REC = 1, SUB = 2, ORPH = 3, PIN = 4 };
 
@@ -60,6 +60,8 @@ struct qinfo
     UINT64 freq = 0;
     UINT64 gpu0 = 0, cpu0 = 0;           // last calibration pair
     ULONGLONG cal_ms = 0;
+    LONGLONG ticks = 0;                  // DR8: executed list time on this queue, QPC ticks (unmerged)
+    bool aux = false;                    // WT1: history only (the copy queue) - never in busy / queue_seconds
 };
 
 struct slot
@@ -92,6 +94,12 @@ LONGLONG g_qpc_freq = 0;
 
 struct ival { LONGLONG a, b; };
 std::vector<ival> g_pending;
+
+// WT1: every finished list of the last ~30 s, by queue, for "what else ran then".
+struct hist { LONGLONG a, b; int qi; };
+const int N_HIST = 16384;
+hist g_hist[N_HIST];
+int g_hist_next = 0, g_hist_n = 0;
 LONGLONG g_covered = 0;                   // QPC up to which busy time is accounted
 LONGLONG g_win_start = 0;                 // current 1 s window (QPC)
 LONGLONG g_win_busy = 0;
@@ -102,6 +110,7 @@ LONGLONG qpc_now() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return t.Qu
 
 void reset_accounting()
 {
+    g_hist_n = 0; g_hist_next = 0;   // WT1: queue indices may be reused
     g_pending.clear();
     g_covered = 0; g_win_start = 0; g_win_busy = 0;
     g_last_frac = -1.0; g_last_frac_ms = 0;
@@ -306,9 +315,16 @@ void account(LONGLONG upto)
 
 } // namespace
 
-int begin(ID3D12Device *dev, ID3D12CommandQueue *q, ID3D12GraphicsCommandList *cl)
+static int begin_impl(ID3D12Device *dev, ID3D12CommandQueue *q, ID3D12GraphicsCommandList *cl, bool aux);
+int begin(ID3D12Device *dev, ID3D12CommandQueue *q, ID3D12GraphicsCommandList *cl) { return begin_impl(dev, q, cl, false); }
+int begin_aux(ID3D12Device *dev, ID3D12CommandQueue *q, ID3D12GraphicsCommandList *cl) { return begin_impl(dev, q, cl, true); }
+
+static int begin_impl(ID3D12Device *dev, ID3D12CommandQueue *q, ID3D12GraphicsCommandList *cl, bool aux)
 {
     if (dev == nullptr || q == nullptr || cl == nullptr) return -1;
+    // CQ1: a TIMESTAMP heap may not be written from a COPY list (that needs a
+    // COPY_QUEUE_TIMESTAMP heap); doing it makes the list fail to Close.
+    if (cl->GetType() == D3D12_COMMAND_LIST_TYPE_COPY) return -1;
     std::lock_guard<std::mutex> lk(g_mx);
     if (g_qpc_freq == 0) { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); g_qpc_freq = f.QuadPart ? f.QuadPart : 1; }
     const int di = ctx_for(dev);
@@ -316,6 +332,7 @@ int begin(ID3D12Device *dev, ID3D12CommandQueue *q, ID3D12GraphicsCommandList *c
     devctx &d = g_d[di];
     const int qi = qindex(q, di);
     if (qi < 0) return -1;
+    if (aux) g_q[qi].aux = true;
     for (int n = 0; n < N_SLOTS; ++n)
     {
         const int i = (d.next + n) % N_SLOTS;
@@ -414,7 +431,13 @@ void poll()
             const double k = (double)g_qpc_freq / (double)q.freq;
             const LONGLONG a = (LONGLONG)q.cpu0 + (LONGLONG)(((double)(LONGLONG)(t0 - q.gpu0)) * k);
             const LONGLONG b = (LONGLONG)q.cpu0 + (LONGLONG)(((double)(LONGLONG)(t1 - q.gpu0)) * k);
-            if (b > a) g_pending.push_back({ a, b });
+            if (b > a)
+            {
+                if (!q.aux) { g_pending.push_back({ a, b }); q.ticks += b - a; }   // DR8: per-queue tally
+                g_hist[g_hist_next] = hist{ a, b, qi };                            // WT1
+                g_hist_next = (g_hist_next + 1) % N_HIST;
+                if (g_hist_n < N_HIST) ++g_hist_n;
+            }
         }
         if (lost && !d.retiring)
         {
@@ -433,6 +456,82 @@ void poll()
     // Lists on another queue that overlap these may finish a little later:
     // only intervals that started more than 200 ms ago are final.
     account(qpc_now() - g_qpc_freq / 5);
+}
+
+bool queue_seconds(ID3D12CommandQueue *nr, double *nr_s, double *other_s)
+{
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (g_qpc_freq == 0) return false;
+    LONGLONG a = 0, b = 0;
+    bool seen = false;
+    for (int i = 0; i < N_Q; ++i)
+    {
+        if (g_q[i].q == nullptr) continue;
+        if (g_q[i].q == nr) { a += g_q[i].ticks; seen = true; }
+        else if (!g_q[i].aux) b += g_q[i].ticks;
+    }
+    if (nr_s) *nr_s = (double)a / (double)g_qpc_freq;
+    if (other_s) *other_s = (double)b / (double)g_qpc_freq;
+    return seen;
+}
+
+bool to_qpc(ID3D12CommandQueue *q, unsigned long long ticks, long long *qpc)
+{
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (q == nullptr || qpc == nullptr || g_qpc_freq == 0) return false;
+    for (int i = 0; i < N_Q; ++i)
+    {
+        qinfo &qi = g_q[i];
+        if (qi.q != q || qi.freq == 0) continue;
+        calibrate(qi);
+        if (qi.cal_ms == 0) return false;
+        const double k = (double)g_qpc_freq / (double)qi.freq;
+        *qpc = (LONGLONG)qi.cpu0 + (LONGLONG)(((double)(LONGLONG)(ticks - qi.gpu0)) * k);
+        return true;
+    }
+    return false;
+}
+
+namespace
+{
+// Length of the union of [x.a, x.b] clipped to [a, b], for the intervals given.
+double union_ms(std::vector<ival> &v, LONGLONG a, LONGLONG b)
+{
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end(), [](const ival &x, const ival &y) { return x.a < y.a; });
+    LONGLONG cov = 0, end = a;
+    for (const ival &x : v)
+    {
+        LONGLONG s = x.a < a ? a : x.a, e = x.b > b ? b : x.b;
+        if (s < end) s = end;
+        if (e > s) { cov += e - s; end = e; }
+    }
+    return (double)cov * 1000.0 / (double)g_qpc_freq;
+}
+}   // namespace
+
+bool around(long long a, long long b, ID3D12CommandQueue *self, overlap *out)
+{
+    if (out == nullptr) return false;
+    *out = overlap{};
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (g_qpc_freq == 0 || b <= a) return false;
+    std::vector<ival> pres, copy, any;
+    for (int k = 0; k < g_hist_n; ++k)
+    {
+        const hist &h = g_hist[k];
+        if (h.b <= a || h.a >= b || h.qi < 0 || h.qi >= N_Q) continue;
+        const qinfo &q = g_q[h.qi];
+        if (q.q == self) continue;               // the call's own queue: that is the call
+        if (q.aux) { copy.push_back({ h.a, h.b }); ++out->copy_n; }
+        else       { pres.push_back({ h.a, h.b }); ++out->present_n; }
+        any.push_back({ h.a, h.b });
+    }
+    out->present_ms = union_ms(pres, a, b);
+    out->copy_ms = union_ms(copy, a, b);
+    out->any_ms = union_ms(any, a, b);
+    out->len_ms = (double)(b - a) * 1000.0 / (double)g_qpc_freq;
+    return true;
 }
 
 bool busy(double *frac)

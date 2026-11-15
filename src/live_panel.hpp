@@ -11,11 +11,11 @@
 // file feeds its ImGui input, and the game's input is blocked while the panel
 // is drawn.
 //
-// OFF BY DEFAULT. PanelOverPicture=1 in mgpu.ini turns it on. The key is read
-// ONCE, in DllMain (attach), because the reshade_overlay event this needs must
-// be registered there with every other event. Key absent or 0: the event is
-// not registered, on() is false, every hook below returns at once, and the
-// add-on behaves exactly as 0.3.1.
+// ON BY DEFAULT (PO1). PanelOverPicture=0 in mgpu.ini turns it off. The key is
+// read ONCE, in DllMain (attach), because the reshade_overlay event this needs
+// must be registered there with every other event. Key 0: the event is not
+// registered, on() is false, every hook below returns at once, and the add-on
+// behaves exactly as 0.3.1.
 //
 // OWNERSHIP. Contributed in the N01950 pull request; this file is that path's
 // home. dllmain.cpp only calls the functions below; gpu1_context.cpp only
@@ -29,7 +29,7 @@
 namespace mgpu::live_panel
 {
     // DllMain, DLL_PROCESS_ATTACH, at the place of the other registrations.
-    // Reads PanelOverPicture once; registers reshade_overlay only when it is 1
+    // Reads PanelOverPicture once; registers reshade_overlay unless it is 0
     // (and the build has ImGui). One log line only when it is on.
     void attach(void *module);
 
@@ -48,6 +48,10 @@ namespace mgpu::live_panel
 // the caller reopens it on the new host.
 bool take_reopen();
     void set_live(bool up);
+
+    // WH1: inside a window (the panel, or an open combo list), scroll it by the
+    // mouse wheel turned since the last frame, if the pointer is over it.
+    void wheel_here();
 
     // The GPU 1 runtime to open the overlay on: the windowless one, or
     // `fallback` (R158's bridge slot) before it has been seen.

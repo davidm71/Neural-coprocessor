@@ -25,6 +25,7 @@ struct hcand
     std::atomic<unsigned long long> bars;   // barriers seen on it, all time
     std::atomic<unsigned> last_old, last_new;
     std::atomic<unsigned long long> seen;   // HL5: frame of its last barrier (table replacement)
+    std::atomic<unsigned long long> born;   // HL7: frame it was created (read-only diagnostic)
 };
 
 const unsigned HMAX = 128;
@@ -82,6 +83,26 @@ std::atomic<unsigned long long> g_hl_relocks{ 0 };
 // the first, the table replacement below the second. HudFollow=0 turns the
 // following off (the vote alone, as before).
 bool g_hl_follow = true;
+// HL8: copy a texture the game has only just created when it finishes like
+// the scene (display size, back-buffer format, render target -> shader
+// resource), without waiting a frame to learn it is the scene. HL7 (2026-11-09
+// 21:27): in combat the game destroys and remakes its scene texture every few
+// frames; most textures joining the scene set were created within 5 frames,
+// and the frames they joined on are the frames that went out without a
+// HUD-less copy. A copy that turns out not to be the scene is overwritten by
+// the real scene's copy later in the same frame (the last copy wins, as with
+// the set). HudNewCopy=0 turns it off.
+bool g_hl_new = true;
+const unsigned long long kNewFrames = 8ull;   // "just created": within this many frames
+std::atomic<unsigned long long> g_hl8_copies{0};
+// HL9 (read-only): was the frame's LAST copy the texture the back buffer then
+// confirmed as the scene (the last candidate before it)? A review of HL8
+// (2026-11-09) asked for this: a just-created non-scene texture that finished
+// after the scene would leave the wrong picture as the frame's copy. Order is
+// the order the barriers were recorded in.
+std::atomic<unsigned long long> g_h9_copy{0}, g_h9_frame{~0ull};
+std::atomic<bool> g_h9_new{false};
+std::atomic<unsigned long long> g_h9_ok{0}, g_h9_ok_new{0}, g_h9_bad{0}, g_h9_bad_new{0}, g_h9_over_new{0};
 // HLD1: a one-time trace for the save that still flickered on HL5b (the
 // follow still ran every other frame). Armed after 50 follows; then for 40
 // frames every barrier on a display-size texture of the back buffer's format
@@ -110,6 +131,16 @@ std::atomic<unsigned long long> g_hl_follows{ 0 };
 // the locked texture's copy has always done. A set member that is not the
 // last this frame may be copied first; the real last one is copied after it
 // on the same queue and wins.
+// HL7 (read-only): what joins the scene set. HL6's 2026-11-09 21:02 run kept
+// no set member from replacement and never lost one from the table, yet the
+// set took 94 additions in 90 s while the HUD-less misses peaked. Is each
+// addition a texture the game just created, or one it used before (more than
+// the set holds, or destroyed and remade at the same address)?
+std::atomic<unsigned long long> g_h7_adds{0}, g_h7_fresh{0}, g_h7_young{0}, g_h7_recur{0},
+                                g_h7_missed{0}, g_h7_destroyed{0};
+const unsigned kHist = 64u;
+std::atomic<unsigned long long> g_h7_hist[kHist];
+std::atomic<unsigned> g_h7_hi{0};
 const unsigned kSet = 4u;
 std::atomic<unsigned long long> g_set[kSet];
 std::atomic<unsigned long long> g_set_t[kSet];   // frame it was last seen as the scene
@@ -120,6 +151,7 @@ bool in_set(unsigned long long h)
     return false;
 }
 bool banned(unsigned long long h);   // HL5d, below
+int find_hc(unsigned long long h);   // HL7, below
 void set_note(unsigned long long h, unsigned long long frame)
 {
     if (banned(h)) return;   // HL5d
@@ -131,6 +163,21 @@ void set_note(unsigned long long h, unsigned long long frame)
         if (t < lt) { lt = t; lru = i; }
     }
     g_set[lru].store(h); g_set_t[lru].store(frame);
+    {   // HL7: classify this addition (counted only; nothing changes)
+        g_h7_adds.fetch_add(1, std::memory_order_relaxed);
+        const int ti = find_hc(h);
+        if (ti >= 0)
+        {
+            const unsigned long long born = g_t[ti].born.load(std::memory_order_relaxed);
+            if (frame >= born && frame - born <= 5ull) g_h7_fresh.fetch_add(1, std::memory_order_relaxed);
+            else if (frame >= born && frame - born <= 240ull) g_h7_young.fetch_add(1, std::memory_order_relaxed);
+        }
+        bool was = false;
+        for (unsigned i = 0; i < kHist; ++i) if (g_h7_hist[i].load(std::memory_order_relaxed) == h) { was = true; break; }
+        if (was) g_h7_recur.fetch_add(1, std::memory_order_relaxed);
+        else g_h7_hist[g_h7_hi.fetch_add(1, std::memory_order_relaxed) % kHist].store(h, std::memory_order_relaxed);
+        if (g_hl_fire_frame.load(std::memory_order_relaxed) != frame) g_h7_missed.fetch_add(1, std::memory_order_relaxed);
+    }
     const unsigned long long nf = g_hl_follows.fetch_add(1, std::memory_order_relaxed) + 1u;
     if (nf <= 4u)
     {
@@ -171,6 +218,7 @@ void ban(unsigned long long h, unsigned bad, unsigned good)
 }
 void set_remove(unsigned long long h)
 {
+    if (h != 0 && in_set(h)) g_h7_destroyed.fetch_add(1, std::memory_order_relaxed);   // HL7
     for (unsigned i = 0; i < kSet; ++i)
         if (g_set[i].load(std::memory_order_relaxed) == h) g_set[i].store(0);
 }
@@ -181,6 +229,9 @@ unsigned set_size()
     return k;
 }
 std::atomic<unsigned long long> g_t_replaced{ 0 };
+// HL6: scene-set members the table-full replacement would have dropped (and
+// now keeps), and frames that began with a set member missing from the table.
+std::atomic<unsigned long long> g_hl_set_kept{ 0 }, g_hl_set_absent{ 0 };
 std::atomic<unsigned long long> g_frame_a{ 0 };
 
 // One recorded event of the capture frame.
@@ -337,15 +388,25 @@ void on_init_resource_hp(reshade::api::device *device, const reshade::api::resou
         // HL5: full. Reuse the entry whose last barrier is oldest (never the
         // locked, voted or newest candidate) instead of ignoring every new
         // texture from here on.
+        // HL6: and never a scene-set member. The game alternates two sets of
+        // post-process textures (HL5c); the set used less often had the
+        // oldest barrier, so in combat (many new textures, 20:26:56 on
+        // 2026-11-09) it was the one replaced - its barrier was then unseen,
+        // no copy ran, and the frame went out without its HUD-less copy.
         const unsigned long long keep1 = g_hl_lock.load(), keep2 = g_hl_vote.load(), keep3 = g_hl_last.load();
-        unsigned long long best = ~0ull;
+        unsigned long long best = ~0ull, best_any = ~0ull;
+        bool any_is_set = false;
         for (unsigned i = 0; i < n; ++i)
         {
             const unsigned long long hh = g_t[i].handle;
             if (hh == keep1 || hh == keep2 || hh == keep3) continue;
             const unsigned long long sn = g_t[i].seen.load(std::memory_order_relaxed);
+            const bool member = hh != 0 && in_set(hh);
+            if (sn < best_any) { best_any = sn; any_is_set = member; }
+            if (member) continue;   // HL6
             if (sn < best) { best = sn; slot = (int)i; }
         }
+        if (any_is_set) g_hl_set_kept.fetch_add(1, std::memory_order_relaxed);   // HL6: the old rule would have dropped it
         if (slot < 0) return;
         if (g_t_replaced.fetch_add(1, std::memory_order_relaxed) == 0)
             mgpu::diag::info("[MGPU][HL5] the texture table is full (128) - the least recently used entries are "
@@ -361,6 +422,7 @@ void on_init_resource_hp(reshade::api::device *device, const reshade::api::resou
     c.last_old.store(0, std::memory_order_relaxed);
     c.last_new.store(0, std::memory_order_relaxed);
     c.seen.store(g_frame_a.load(std::memory_order_relaxed), std::memory_order_relaxed);   // HL5
+    c.born.store(g_frame_a.load(std::memory_order_relaxed), std::memory_order_relaxed);   // HL7
     c.handle = resource.handle;
     if ((unsigned)slot == n) g_n.store(n + 1, std::memory_order_release);
 }
@@ -550,13 +612,26 @@ void on_barrier_hp(reshade::api::command_list *cl, uint32_t count,
             if (cand)
             {
                 g_hl_last.store(h, std::memory_order_relaxed);
-                if ((h == g_hl_lock.load(std::memory_order_relaxed) ||
-                     (g_hl_follow && in_set(h))) && !banned(h) && g_hl_hook != nullptr)   // HL5c/d
+                // HL8: a texture created within kNewFrames, not yet locked or in the set.
+                const unsigned long long fa = g_frame_a.load(std::memory_order_relaxed);
+                const unsigned long long born = g_t[idx].born.load(std::memory_order_relaxed);
+                const bool known = h == g_hl_lock.load(std::memory_order_relaxed) || (g_hl_follow && in_set(h));
+                const bool brand_new = !known && g_hl_new && g_hl_follow &&
+                                       g_hl_ever.load(std::memory_order_relaxed) &&
+                                       fa >= born && fa - born <= kNewFrames;
+                if ((known || brand_new) && !banned(h) && g_hl_hook != nullptr)   // HL5c/d, HL8
                 {
+                    if (brand_new) g_hl8_copies.fetch_add(1, std::memory_order_relaxed);   // HL8
                     ID3D12GraphicsCommandList *gl = reinterpret_cast<ID3D12GraphicsCommandList *>(
                         static_cast<uintptr_t>(cl->get_native()));
                     if (gl != nullptr && gl->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT)
                     {
+                        // HL9: an HL8 copy earlier this frame is being overwritten.
+                        if (g_h9_frame.load(std::memory_order_relaxed) == fa && g_h9_new.load(std::memory_order_relaxed))
+                            g_h9_over_new.fetch_add(1, std::memory_order_relaxed);
+                        g_h9_copy.store(h, std::memory_order_relaxed);
+                        g_h9_new.store(brand_new, std::memory_order_relaxed);
+                        g_h9_frame.store(fa, std::memory_order_relaxed);
                         using ru = reshade::api::resource_usage;
                         const reshade::api::resource r = { h };
                         cl->barrier(r, static_cast<ru>(n), ru::copy_source);
@@ -582,6 +657,16 @@ void on_barrier_hp(reshade::api::command_list *cl, uint32_t count,
             if (bbi >= 0 && o != 0x4u && n == 0x4u)
             {
                 const unsigned long long c = g_hl_last.load(std::memory_order_relaxed);
+                // HL9: compare the frame's last copy with the texture now confirmed as the scene.
+                if (c != 0 && g_h9_frame.load(std::memory_order_relaxed) == g_frame_a.load(std::memory_order_relaxed))
+                {
+                    const bool nw = g_h9_new.load(std::memory_order_relaxed);
+                    if (g_h9_copy.load(std::memory_order_relaxed) == c)
+                        (nw ? g_h9_ok_new : g_h9_ok).fetch_add(1, std::memory_order_relaxed);
+                    else
+                        (nw ? g_h9_bad_new : g_h9_bad).fetch_add(1, std::memory_order_relaxed);
+                    g_h9_frame.store(~0ull, std::memory_order_relaxed);   // once per frame
+                }
                 if (c != 0 && g_hl_follow && g_hl_ever.load(std::memory_order_relaxed))
                 {
                     // HL5: follow the role. When c is the locked texture its
@@ -957,6 +1042,8 @@ void start()
     const bool hl_on = hv != nullptr && atoi(hv) == 1;
     const char *fv = mgpu::config::find(buf, strlen(buf), "HudFollow");   // HL5
     g_hl_follow = !(fv != nullptr && atoi(fv) == 0);
+    const char *nv = mgpu::config::find(buf, strlen(buf), "HudNewCopy");   // HL8
+    g_hl_new = !(nv != nullptr && atoi(nv) == 0);
     if (!probe_on && !hl_on) return;
     g_hl_on.store(hl_on);
     reshade::register_event<reshade::addon_event::init_resource>(on_init_resource_hp);
@@ -1064,6 +1151,14 @@ void note_frame(void *effect_runtime_ptr, void *command_list_ptr)
     }
     g_bb_fmt.store(bb_fmt, std::memory_order_relaxed);
     g_frame_a.store(g_frame, std::memory_order_relaxed);
+    if (g_hl_on.load(std::memory_order_relaxed))   // HL6: a set member the table no longer tracks
+    {
+        for (unsigned i = 0; i < kSet; ++i)
+        {
+            const unsigned long long sh = g_set[i].load(std::memory_order_relaxed);
+            if (sh != 0 && find_hc(sh) < 0) { g_hl_set_absent.fetch_add(1, std::memory_order_relaxed); break; }
+        }
+    }
     if (g_dbg.load(std::memory_order_relaxed) == 1)   // HLD1: one line per frame
     {
         char l[1900];
@@ -1090,12 +1185,58 @@ void note_frame(void *effect_runtime_ptr, void *command_list_ptr)
         }
         if ((g_frame % 3600ull) == 1800ull)
         {
-            char l[300];
+            char l[460];
             snprintf(l, sizeof l, "[MGPU][HL1] probe: locked=0x%llx, copies fired %llu, unlocks %llu, moves followed "
-                     "%llu (2-frame), scene set %u (%llu added), table %u of %u, entries replaced %llu.",
+                     "%llu (2-frame), scene set %u (%llu added), table %u of %u, entries replaced %llu | HL6: scene-set "
+                     "members kept from replacement %llu, frames with a set member not in the table %llu.",
                      g_hl_lock.load(), g_hl_fires.load(), g_hl_unlocks.load(), g_hl_relocks.load(),
-                     set_size(), g_hl_follows.load(), g_n.load(), HMAX, g_t_replaced.load());
+                     set_size(), g_hl_follows.load(), g_n.load(), HMAX, g_t_replaced.load(),
+                     g_hl_set_kept.load(), g_hl_set_absent.load());
             mgpu::diag::info(l);
+        }
+        // HL6: the same two counts every 10 s or so (400 frames at 40 fps), next to FD2.
+        static unsigned long long k0 = 0, a0 = 0, r0 = 0;
+        static unsigned long long s0[6] = {};
+        if ((g_frame % 400ull) == 0ull)
+        {
+            // HL7: what joined the scene set over the same 400 frames.
+            const unsigned long long sv[6] = { g_h7_adds.load(), g_h7_fresh.load(), g_h7_young.load(),
+                                               g_h7_recur.load(), g_h7_missed.load(), g_h7_destroyed.load() };
+            // HL9: every 400 frames, so the last-copy check is seen in quiet stretches too.
+            if (g_hl_ever.load(std::memory_order_relaxed))
+            {
+                char l[820];
+                static unsigned long long c0 = 0;
+                static unsigned long long q0[5] = {};
+                const unsigned long long c8 = g_hl8_copies.load();
+                const unsigned long long q[5] = { g_h9_ok.load(), g_h9_ok_new.load(), g_h9_bad.load(),
+                                                  g_h9_bad_new.load(), g_h9_over_new.load() };
+                snprintf(l, sizeof l, "[MGPU][HL7] last 400 frames: %llu texture(s) joined the scene set - created within "
+                         "5 frames %llu, within 240 frames %llu, older %llu | had been in the set before %llu | on a "
+                         "frame that got no HUD-less copy %llu | set members the game destroyed %llu (scene set %u) | "
+                         "HL8: just-created textures copied on sight %llu%s | HL9: frame's last copy was the "
+                         "confirmed scene %llu (an HL8 copy %llu), was NOT %llu (an HL8 copy %llu), HL8 copies "
+                         "overwritten later in their frame %llu.",
+                         sv[0] - s0[0], sv[1] - s0[1], sv[2] - s0[2],
+                         (sv[0] - s0[0]) - (sv[1] - s0[1]) - (sv[2] - s0[2]),
+                         sv[3] - s0[3], sv[4] - s0[4], sv[5] - s0[5], set_size(), c8 - c0,
+                         g_hl_new ? "" : " (HudNewCopy=0: off)",
+                         q[0] - q0[0], q[1] - q0[1], q[2] - q0[2], q[3] - q0[3], q[4] - q0[4]);
+                c0 = c8;
+                for (unsigned i = 0; i < 5; ++i) q0[i] = q[i];
+                mgpu::diag::info(l);
+            }
+            for (unsigned i = 0; i < 6; ++i) s0[i] = sv[i];
+            const unsigned long long k = g_hl_set_kept.load(), a = g_hl_set_absent.load(), r = g_t_replaced.load();
+            if (k != k0 || a != a0 || r != r0)
+            {
+                char l[260];
+                snprintf(l, sizeof l, "[MGPU][HL6] last 400 frames: table entries replaced %llu, scene-set members kept "
+                         "from replacement %llu, frames with a set member not in the table %llu (scene set %u).",
+                         r - r0, k - k0, a - a0, set_size());
+                mgpu::diag::info(l);
+            }
+            k0 = k; a0 = a; r0 = r;
         }
     }
 

@@ -450,6 +450,7 @@ void periodic_report()
 // public
 // ===========================================================================
 bool enabled()  { return get(S_ON) != 0; }
+bool camera_live() { return g_camera_live.load(std::memory_order_relaxed); }   // FD1: read-only
 void set_enabled(bool on)
 {
     put(S_ON, on ? 1 : 0);

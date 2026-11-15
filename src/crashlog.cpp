@@ -6,6 +6,7 @@
 #include "diag.hpp"
 #include "mgpu_ini_parser.hpp"
 #include "steam_guard.hpp"   // SO2: the guard's decisions (tested in tests/steam_guard_test.cpp)
+#include "hookprobe.hpp"     // SO5: who hooked Present, for the report
 
 #include <tlhelp32.h>
 #include <psapi.h>           // SO3: K32GetProcessMemoryInfo
@@ -434,6 +435,10 @@ namespace sg = mgpu::steam_guard;
 std::atomic<int>      g_so_mode{1};                 // SteamOverlayGuard 0 / 1 / 2
 std::atomic<uint64_t> g_ov_base{0}, g_ov_size{0};   // gameoverlayrenderer64.dll, cached
 sg::rate_window<5>    g_so_rate;
+// SO5: PresentHookGuard - 1 (default) steps over a call into freed memory made
+// from a Present (a hook whose code was just released); 0 off.
+std::atomic<int>      g_fh_mode{1};
+sg::rate_window<5>    g_fh_rate;
 std::atomic<long>     g_so_attempts{0}, g_so_declined{0}, g_so_resumed{0}, g_so_failed{0};
 std::atomic<long>     g_fatal_seen{0};              // every fatal first-chance exception
 thread_local int      t_in_handler = 0;             // a fault inside this handler is never handled
@@ -460,6 +465,9 @@ struct so_rec
     bool     presenting;      //      the faulting thread passed a present event < 250 ms before
     int      evidence;        //      sg::present_evidence: 2, 1, 0 (unverified), -1 (contrary)
     int      hp_slot;         //      its health assessment (-1: none - table full)
+    int      variant;         // SO5: 0 = Steam's overlay faulted in its own code, 1 = a call jumped into freed memory
+    DWORD    mem_state, mem_type;   // SO5: what the memory at the fault was (VirtualQuery)
+    uint64_t mem_base;        //      its allocation base
 };
 // SO4: the records, from any number of exception handlers to the bridge
 // thread, through a ring that never blocks a writer and never hands the
@@ -499,13 +507,17 @@ void so_record(const so_rec &r)
     SYSTEMTIME t{};
     GetLocalTime(&t);
     line_buf l;
-    l.d2(t.wHour); l.s(":"); l.d2(t.wMinute); l.s(":"); l.d2(t.wSecond); l.s(" [MGPU][SO1] ");
+    l.d2(t.wHour); l.s(":"); l.d2(t.wMinute); l.s(":"); l.d2(t.wSecond); l.s(r.variant == 1 ? " [MGPU][SO5] " : " [MGPU][SO1] ");
     if (r.outcome == SO_STEPPED) { l.s("STEPPED OVER #"); l.d((unsigned long long)r.n); l.s(" (attempt; verdict follows as SO2)"); }
     else l.s("NOT stepped over");
-    l.s(": gameoverlayrenderer64.dll+"); l.x(r.rip - r.ov_base);
-    l.s(" reading "); l.x(r.addr); l.s(", thread "); l.d(r.tid);
+    if (r.variant == 1)
+    {
+        l.s(": a call jumped into "); l.s(r.mem_state == MEM_FREE ? "FREED" : r.mem_state == MEM_RESERVE ? "uncommitted" : "non-code");
+        l.s(" memory at "); l.x(r.rip); l.s(" (block "); l.x(r.mem_base); l.s("), thread "); l.d(r.tid);
+    }
+    else { l.s(": gameoverlayrenderer64.dll+"); l.x(r.rip - r.ov_base); l.s(" reading "); l.x(r.addr); l.s(", thread "); l.d(r.tid); }
     if (r.outcome == SO_STEPPED || r.outcome == SO_DECLINED_DEST || r.outcome == SO_DECLINED_RATE)
-    { l.s(", return to "); l.x(r.dest_rip); l.s(" after "); l.d(r.frames); l.s(" overlay frame(s)"); }
+    { l.s(", return to "); l.x(r.dest_rip); if (r.variant == 0) { l.s(" after "); l.d(r.frames); l.s(" overlay frame(s)"); } }
     if (r.outcome == SO_STEPPED)
         l.s(r.evidence >= 2 ? ", in a Present (call + thread)" : r.evidence == 1 ? ", in a Present (one sign)"
                                                                  : ", S_OK UNVERIFIED (no sign of a Present)");
@@ -662,6 +674,97 @@ bool so_try(PEXCEPTION_POINTERS ep)
     return true;
 }
 
+// ---- SO5: A CALL INTO FREED MEMORY FROM A PRESENT ----
+//
+// Six crashes in crash.txt (RoboCop and Black Myth, Oct-Nov 2026) are one
+// shape: "executing address" in memory no module holds, returning into
+// dxgi.dll - Present went through a hook whose code had just been released
+// (most likely while its owner was re-installing it), so the jump landed on
+// nothing. Each happened once per session: a moment, not a broken hook.
+//
+// The jump arrives with the caller's return address on top of the stack and
+// nothing else pushed, so returning is one pop. Stricter than SO1's checks:
+//  - an execute fault on the first byte it tried to run, in memory that is not
+//    committed code and not a loaded module;
+//  - the return lands right after a CALL, in committed executable code, with
+//    the stack aligned, on the thread's own stack (sg::check_dest);
+//  - a POSITIVE sign it was a Present: the thread presented < 250 ms ago, and
+//    the call was not contrary evidence (SO1 refuses only on contrary signs);
+//  - not nested, at most 5 in any 60 s, its own health verdict (SO2).
+// Then that one Present returns S_OK unshown and the game goes on. If the hook
+// stays broken the limit runs out and the crash happens as before - with a
+// line that says what it was.
+bool fh_try(PEXCEPTION_POINTERS ep)
+{
+    if (g_fh_mode.load(std::memory_order_relaxed) == 0) return false;
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    CONTEXT *cx = ep->ContextRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return false;
+    if (er->ExceptionInformation[0] != 8) return false;                    // DEP: an attempt to execute
+    const uint64_t rip = (uint64_t)(uintptr_t)er->ExceptionAddress;
+    if (er->ExceptionInformation[1] != rip || cx->Rip != rip) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery((LPCVOID)(uintptr_t)rip, &mbi, sizeof mbi) != sizeof mbi) return false;
+    if (mbi.State == MEM_COMMIT &&
+        (mbi.Type == MEM_IMAGE ||
+         (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0))
+        return false;                                                      // real code: some other fault
+
+    so_rec r{};
+    r.variant = 1; r.hp_slot = -1;
+    r.sigv = 0; r.tid = GetCurrentThreadId(); r.code = er->ExceptionCode; r.kind = 8; r.addr = rip;
+    r.rip = rip; r.ov_base = 0; r.ms = GetTickCount64();
+    r.mem_state = mbi.State; r.mem_type = mbi.Type; r.mem_base = (uint64_t)(uintptr_t)mbi.AllocationBase;
+    const DWORD64 rg[16] = { cx->Rax, cx->Rcx, cx->Rdx, cx->Rbx, cx->Rsp, cx->Rbp, cx->Rsi, cx->Rdi,
+                             cx->R8, cx->R9, cx->R10, cx->R11, cx->R12, cx->R13, cx->R14, cx->R15 };
+    for (int i = 0; i < 16; ++i) r.regs[i] = rg[i];
+    r.code_ok = false;
+    if (er->ExceptionRecord != nullptr) { r.outcome = SO_DECLINED_NESTED; g_so_declined.fetch_add(1); so_record(r); return false; }
+
+    CONTEXT c = *cx;
+    const NT_TIB *tib = (const NT_TIB *)NtCurrentTeb();
+    const uint64_t lo = (uint64_t)(uintptr_t)tib->StackLimit, hi = (uint64_t)(uintptr_t)tib->StackBase;
+    sg::dest res = sg::dest::ok;
+    DWORD64 ret = 0;
+    const uint64_t old_rsp = c.Rsp;
+    if (!read_mem((const void *)(uintptr_t)c.Rsp, &ret, sizeof ret)) res = sg::dest::unreadable;
+    else
+    {
+        c.Rip = ret; c.Rsp += 8;
+        if (!sg::stack_step_ok(old_rsp, c.Rsp, lo, hi)) res = sg::dest::stack;
+    }
+    if (res == sg::dest::ok)
+    {
+        sg::dest_facts d{};
+        d.rip = c.Rip; d.rsp = c.Rsp; d.walked_out = true; d.in_overlay = false; d.reenters = false;
+        d.executable = so_executable(c.Rip, r.dest_type);
+        d.readable_before = c.Rip > 8 && read_mem((const void *)(uintptr_t)(c.Rip - 8), d.before, 8);
+        res = sg::check_dest(d);
+        if (d.readable_before)
+        {
+            const sg::call_info ci = sg::decode_call(d.before);
+            const sg::call_sem sem = sg::call_semantic(ci);
+            r.call_kind = (int)ci.kind; r.call_disp = ci.disp; r.sem = (int)sem;
+        }
+        r.presenting = t_present_ms != 0 && r.ms - t_present_ms < 250ull;
+        r.evidence = sg::present_evidence((sg::call_sem)r.sem, r.presenting);
+        if (res == sg::dest::ok && (!r.presenting || r.sem == (int)sg::call_sem::other_method)) res = sg::dest::not_present;
+    }
+    r.dest_rip = c.Rip; r.dest_rsp = c.Rsp; r.frames = 0; r.destv = (int)res;
+    if (res != sg::dest::ok) { r.outcome = SO_DECLINED_DEST; g_so_declined.fetch_add(1); so_record(r); return false; }
+    if (!g_fh_rate.take(r.ms, 60000ull)) { r.outcome = SO_DECLINED_RATE; g_so_declined.fetch_add(1); so_record(r); return false; }
+
+    const DWORD keep = cx->ContextFlags;
+    c.Rax = 0;                       // S_OK from that Present
+    *cx = c;
+    cx->ContextFlags = keep;
+    r.n = g_so_attempts.fetch_add(1) + 1;
+    r.outcome = SO_STEPPED;
+    r.hp_slot = g_hp.claim(r.n, (uint32_t)r.tid, r.ms, g_fatal_seen.load(std::memory_order_relaxed));
+    so_record(r);
+    return true;
+}
+
 LONG CALLBACK on_exception(PEXCEPTION_POINTERS ep)
 {
     if (ep == nullptr || ep->ExceptionRecord == nullptr) return EXCEPTION_CONTINUE_SEARCH;
@@ -671,7 +774,7 @@ LONG CALLBACK on_exception(PEXCEPTION_POINTERS ep)
     ++t_in_handler;
     LONG r = EXCEPTION_CONTINUE_SEARCH;
     if (ep->ContextRecord != nullptr && ep->ExceptionRecord->ExceptionCode != EXCEPTION_STACK_OVERFLOW &&
-        so_try(ep))
+        (so_try(ep) || fh_try(ep)))   // SO5: a call into freed memory from a Present
         r = EXCEPTION_CONTINUE_EXECUTION;
     else
         r = log_exception(ep);   // CR1, exactly as before
@@ -750,7 +853,31 @@ void so_log_record(const so_rec &e)
     if (e.dest_rip != 0) where((const void *)(uintptr_t)e.dest_rip, dst, sizeof dst); else snprintf(dst, sizeof dst, "-");
     char l[1400];
     int n = 0;
-    if (e.outcome == SO_STEPPED)
+    if (e.variant == 1)   // SO5
+    {
+        char who[700];
+        mgpu::hookprobe::last(who, sizeof who);
+        const char *mem = e.mem_state == MEM_FREE ? "FREED memory" : e.mem_state == MEM_RESERVE ? "reserved, uncommitted memory"
+                                                                   : "memory that is not code";
+        if (e.outcome == SO_STEPPED)
+            n = snprintf(l, sizeof l, "[MGPU][SO5] STEPPED OVER #%ld (an attempt - the SO2 line says whether rendering came "
+                         "back): a call jumped into %s at 0x%llx (block 0x%llx), thread %lu - a hook on Present whose code was "
+                         "released | returned S_OK to %s, rsp 0x%llx | Present was last seen going through: %s | this "
+                         "session: %ld stepped over, %ld passed on",
+                         e.n, mem, (unsigned long long)e.rip, (unsigned long long)e.mem_base, (unsigned long)e.tid, dst,
+                         (unsigned long long)e.dest_rsp, who, g_so_attempts.load(), g_so_declined.load());
+        else
+            n = snprintf(l, sizeof l, "[MGPU][SO5] NOT STEPPED OVER: a call jumped into %s at 0x%llx (block 0x%llx), thread "
+                         "%lu | %s%s%s | Present was last seen going through: %s | the fault was passed on as before (see "
+                         "the CR1 line)",
+                         mem, (unsigned long long)e.rip, (unsigned long long)e.mem_base, (unsigned long)e.tid,
+                         e.outcome == SO_DECLINED_DEST ? sg::dest_text((sg::dest)e.destv)
+                         : e.outcome == SO_DECLINED_RATE ? "LIMIT REACHED: 5 in the last 60 s"
+                                                         : "raised while another exception was being handled",
+                         e.outcome == SO_DECLINED_DEST ? " - would have returned to " : "",
+                         e.outcome == SO_DECLINED_DEST ? dst : "", who);
+    }
+    else if (e.outcome == SO_STEPPED)
         n = snprintf(l, sizeof l, "[MGPU][SO1] STEPPED OVER #%ld (an attempt - the SO2 line says whether rendering came "
                      "back): %s in %s, reading 0x%llx, thread %lu | %s | returned S_OK to %s (%s memory) after %u overlay "
                      "frame(s) (%u with a handler of their own), rsp 0x%llx | this session: %ld stepped over, %ld passed on",
@@ -1066,6 +1193,8 @@ void install(HMODULE self)
                     buf[got] = 0;
                     const char *v = mgpu::config::find(buf, got, "SteamOverlayGuard");
                     if (v != nullptr && *v >= '0' && *v <= '3') g_so_mode.store(*v - '0');
+                    const char *ph = mgpu::config::find(buf, got, "PresentHookGuard");   // SO5
+                    if (ph != nullptr && (*ph == '0' || *ph == '1')) g_fh_mode.store(*ph - '0');
                 }
                 CloseHandle(f);
             }
@@ -1152,6 +1281,11 @@ void flush_dll_events()
 
 // SO2: the milestones a step-over is judged by. Per frame this is one relaxed
 // atomic add and one load; the rest runs only in the seconds after a step-over.
+void present_begin()
+{
+    t_present_ms = GetTickCount64();   // SO5: the bridge's own present thread is presenting
+}
+
 void note_present(int source, long hr)
 {
     g_pres[source & 1].fetch_add(1, std::memory_order_relaxed);

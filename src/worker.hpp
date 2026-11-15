@@ -24,4 +24,10 @@ namespace mgpu::worker
     // GPU 1 objects itself once it wakes, re-arms the one-shot, and exits;
     // its final log lines are best effort (see the comment in stop()).
     void stop();
+
+    // TR4: Exit from the tray icon. Stops the bridge (the same ordered
+    // teardown as closing its window) and keeps it stopped for the rest of
+    // the game session - a later swapchain event does not start it again.
+    // The game keeps running on its own card. Signal-only, any thread.
+    void user_exit();
 }

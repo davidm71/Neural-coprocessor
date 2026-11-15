@@ -53,6 +53,13 @@ bool sync_colour_space(IDXGISwapChain3 *sc, bool want);
 bool apply(ID3D12Device *dev, ID3D12GraphicsCommandList *cl, ID3D12Resource *bb,
            unsigned w, unsigned h, DXGI_FORMAT fmt);
 
+// HD2: the game's own swap chain colour space (reshade::api::color_space as
+// int: 0 unknown, 1 sRGB, 2 scRGB, 3 HDR10 PQ, 4 HDR10 HLG), from every game
+// Present. With the game's own HDR on (2 or 3) the bridge's picture is marked
+// the same way and the HD1 conversion does not run.
+void note_game_colour_space(int cs);
+bool game_hdr();
+
 // Why HDR is not running right now, for the panel ("" when it is).
 const char *status();
 }

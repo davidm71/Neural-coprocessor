@@ -63,10 +63,17 @@
 // a wrong name, on the one line whose entire job is to stop a report
 // misidentifying a build. Caught by a control run rather than by a reader,
 // which is the only reason it is not in somebody's issue thread.
-#define MGPU_VERSION_STR "2.0"
+#define MGPU_VERSION_STR "3.0"
 // VR2: the fork's build tag, shared by the R141 log line and the panel footer
 // so the two can never disagree. Bump it with every shipped change.
-#define MGPU_SOURCE_TAG "RX1"
+#define MGPU_SOURCE_TAG "IN14"
+
+// TR3: the same identity for the tray icon's About box (tray.cpp).
+namespace mgpu
+{
+const char *about_version() { return MGPU_VERSION_STR; }
+const char *about_build()   { return MGPU_SOURCE_TAG ", built " __DATE__; }
+}
 
 
 // ---- P6.4: the overlay panel ----
@@ -126,11 +133,12 @@
 #include "replay.hpp"    // BM2
 #include "cursormap.hpp" // MC2
 #include "live_panel.hpp" // PP1: PanelOverPicture (upstream 0.4.0, NO1950)
+#include "gamepresent.hpp" // GP1 (experiment)
 #include <shellapi.h>     // SS1: open the captures folder
 
-extern "C" __declspec(dllexport) const char *NAME = "MGPU Bridge";
+extern "C" __declspec(dllexport) const char *NAME = "Atomic MGPU Bridge";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Cross-Adapter Bridge P0: second ReShade effect runtime on a second GPU";
+    "Renders the game on one GPU and runs neural rendering, frame generation and the display on a second GPU";
 
 #define MGPU_STR2(s) #s
 #define MGPU_STR(s) MGPU_STR2(s)
@@ -587,6 +595,8 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             // same one the present chain and the window creation already do.
             if (sc_is_game) { if (void *ghwnd0 = (void *)swapchain->get_hwnd()) mgpu::gpu1::set_game_hwnd(ghwnd0); }   // R273: before the latch
             if (sc_is_game) note_game_fullscreen(swapchain, resize ? "D3D12 game chain at resize" : "D3D12 game chain at init");   // R241d
+            if (sc_is_game && mgpu::gamepresent::on())   // GP1 (experiment, GamePresentSkip=1)
+                mgpu::gamepresent::attach(reinterpret_cast<IUnknown *>(static_cast<uintptr_t>(swapchain->get_native())));
             if (sc_is_game && mgpu::gpu1::dcomp_overlay_mode())
             {
                 if (void *ghwnd = (void *)swapchain->get_hwnd())
@@ -897,9 +907,8 @@ namespace
                      : "NO technique from mgpu_depth_tap.fx was enumerated on this runtime. "
                        "DO NOT ASSUME THE FILE IS MISSING - the more common cause by far is "
                        "that this runtime's EffectSearchPaths does not reach the folder the "
-                       "file is in. The [R142] line below prints both paths. R137: this line "
-                       "did not exist before 0.2.3, so a log without it is an older build "
-                       "and not a missing tap.");
+                       "file is in. The [R142] line below prints both paths. R137: a log "
+                       "without this line is from an older build, not a missing tap.");
         mgpu::diag::info(t53);
 
         // ---- R142: READ THEIR CONFIG AND SAY WHAT IS ACTUALLY WRONG ----
@@ -1059,19 +1068,20 @@ static bool draw_custom_scale_slider(const char *id)
     // DR1: dynamic neural resolution - the scale follows the load.
     {
         bool dr = mgpu::gpu1::ui_dr_on();
-        // DR5: it measures NVIDIA frame generation's delivery, so it only works there.
-        const bool dr_usable = mgpu::gpu1::ui_frame_gen() == 4;
+        // DR5/DR6: it measures frame generation's delivery - NVIDIA's or AMD's.
+        const int dr_fg = mgpu::gpu1::ui_frame_gen();
+        const bool dr_usable = dr_fg == 4 || dr_fg == 3;
         char idc[48]; snprintf(idc, sizeof idc, "Dynamic##dr%s", id);
         ImGui::BeginDisabled(!dr_usable);
         if (ImGui::Checkbox(idc, &dr)) mgpu::gpu1::ui_set_dr_on(dr);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Lowers the neural resolution when the neural card can't keep up\n"
-                              "and raises it again when there is room (NVIDIA frame generation).\n"
-                              "The scale above is where it starts.");
+                              "and raises it again when there is room (NVIDIA or AMD frame\n"
+                              "generation). The scale above is where it starts.");
         if (!dr_usable)
         {
             ImGui::SameLine();
-            ImGui::TextDisabled("NVIDIA frame generation only - fixed scale above in use.");
+            ImGui::TextDisabled("Needs NVIDIA or AMD frame generation - fixed scale above in use.");
         }
         if (dr && dr_usable)
         {
@@ -1409,6 +1419,20 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                                "limit. x1 recommended.");
         else
             ImGui::TextDisabled("x1 leaves the second GPU about half idle.");
+        // NM2: the 2nd pass's network - e.g. small then big, or small then small.
+        if (st.max_passes >= 2)
+        {
+            static int nm2 = -1;
+            if (nm2 < 0) nm2 = mgpu::gpu1::ui_nr_model2();
+            ImGui::TextUnformatted("2nd pass network");
+            ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton("Default##nm2", &nm2, 0), "The 2nd pass runs the same network as the first (as before).")) mgpu::gpu1::ui_set_nr_model2(0);
+            ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton("Original (A)##nm2", &nm2, 1), "The big network on the 2nd pass: finishes the frame and can remove\nthe small network's shimmer on fine detail. Costs about twice B.")) mgpu::gpu1::ui_set_nr_model2(1);
+            ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton("Fast (B)##nm2", &nm2, 2), "The small network on the 2nd pass.")) mgpu::gpu1::ui_set_nr_model2(2);
+            ImGui::TextDisabled("Used at x2. Applies on the next launch.");
+        }
 
         // ---- Intensity ----
         ImGui::SeparatorText("Intensity");
@@ -1633,7 +1657,11 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 if (dyn)
                 {
                     int tg = mgpu::gpu1::ui_fg_dyn_target();
+#if defined(ATOMIC_COMMUNITY_20FPS)
+                    if (ui_tip(ImGui::SliderInt("Shown fps##dmf", &tg, 60, 120, "%d fps"), "Community Edition: dynamic Frame Generation target is limited to 120 fps. Final output is independently limited to 20 fps.")) mgpu::gpu1::ui_set_fg_dyn_target(tg);
+#else
                     if (ui_tip(ImGui::SliderInt("Shown fps##dmf", &tg, 60, 360, "%d fps"), "The frame rate the dynamic multiplier aims to show.")) mgpu::gpu1::ui_set_fg_dyn_target(tg);
+#endif
                     // FC1: frame spacing - the original per-pair spacing (default) or the
                     // even frame clock (FGClock=1). Live; either can be picked at any time.
                     int fc = mgpu::gpu1::ui_fg_clock() ? 1 : 0;
@@ -1710,9 +1738,70 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
                                    "AMD FSR failed to start - using BUILT-IN (see ReShade.log [MGPU][FSR]).");
             else if (fs > 0)
-                ImGui::TextDisabled("AMD FSR 3 running.");
+            {
+                char iu[160];   // DV2: which DLL, and its frame generation version
+                mgpu::gpu1::ui_fsr_in_use(iu, sizeof iu);
+                ImGui::TextDisabled("%s", iu[0] ? iu : "AMD FSR 3 running.");
+            }
             else
                 ImGui::TextDisabled("AMD FSR 3 starts on the next frame (needs the AMD DLL in the mgpu folder).");
+            // SF2/X3: 3x and 4x need the rebuilt AMD DLL; without it, 2x - or, for
+            // 4x only, the old chain (AC1) if allowed, marked not optimal.
+            const bool reb = mgpu::gpu1::ui_fsr_rebuilt();
+            const bool fb = mgpu::gpu1::ui_fsr_chain_fallback();
+            int am = mgpu::gpu1::ui_fsr_mult();
+            if ((am == 3 && !reb) || (am == 4 && !reb && !fb)) am = 2;   // what actually runs
+            ImGui::TextUnformatted("Frames");
+            ImGui::SameLine();
+            if (ui_tip(ImGui::RadioButton("2x##am", &am, 2), "One in-between frame per pair of real frames (AMD's own DLL).")) mgpu::gpu1::ui_set_fsr_mult(2);
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!reb);
+            if (ui_tip(ImGui::RadioButton("3x##am", &am, 3), "Two in-between frames, at 1/3 and 2/3, from one optical flow (rebuilt DLL).\n"
+                                                             "Best when the game holds 50+ fps: quicker response, smaller gaps to fill."))
+                mgpu::gpu1::ui_set_fsr_mult(3);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!reb && !fb);
+            if (ui_tip(ImGui::RadioButton(reb ? "4x##am" : "4x (Chained - not optimal)##am", &am, 4),
+                       reb ? "Three in-between frames, at 1/4, 1/2 and 3/4, from one optical flow (rebuilt DLL)."
+                           : "Two AMD instances: the 1/4 and 3/4 frames are made from the 1/2 frame.\n"
+                             "Heavier, and fast motion may smear more than 2x."))
+                mgpu::gpu1::ui_set_fsr_mult(4);
+            ImGui::EndDisabled();
+            // GV1: the rebuilt DLL's quality preset (3x/4x). Live.
+            if (reb)
+            {
+                const int qs = mgpu::gpu1::ui_fsr_quality_support();
+                int aq = mgpu::gpu1::ui_fsr_quality();
+                ImGui::TextUnformatted("Quality");
+                ImGui::SameLine();
+                ImGui::BeginDisabled(qs == 0);
+                if (ui_tip(ImGui::RadioButton("Quality##aq", &aq, 0), "AMD's full gap filling (as before).")) mgpu::gpu1::ui_set_fsr_quality(0);
+                ImGui::SameLine();
+                if (ui_tip(ImGui::RadioButton("Balanced##aq", &aq, 1), "Lighter gap filling behind moving things (2-pixel steps, at most 64).\n"
+                                                                       "Cheaper, fewer spikes on fast pans; 3x/4x only.")) mgpu::gpu1::ui_set_fsr_quality(1);
+                ImGui::SameLine();
+                if (ui_tip(ImGui::RadioButton("Fast##aq", &aq, 2), "Lightest gap filling (3-pixel steps, at most 24). Most likely to show\n"
+                                                                   "edge artifacts on fast pans; 3x/4x only.")) mgpu::gpu1::ui_set_fsr_quality(2);
+                ImGui::EndDisabled();
+                if (qs == 0)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("needs the GV1 rebuilt DLL");
+                }
+            }
+            if (!reb)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("Rebuilt AMD DLL not found");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Put amd_fidelityfx_framegeneration_mgpu1_dx12.dll in the mgpu folder\n"
+                                      "(next to AMD's DLL) for 3x and full-quality 4x. Running 2x.");
+                bool fbv = fb;
+                if (ui_tip(ImGui::Checkbox("Allow chained 4x without it##acfb", &fbv),
+                           "Uses the older two-instance 4x instead (not optimal)."))
+                    mgpu::gpu1::ui_set_fsr_chain_fallback(fbv);
+            }
         }
         bool hf = mgpu::gpu1::ui_fg_hudfix();
         if (ui_tip(ImGui::Checkbox("HUD fix (keep on-screen text and menus still)", &hf), "Keeps on-screen text, markers and menus still in generated frames."))
@@ -1902,6 +1991,19 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                                   "instead of up to three: a few ms less delay. Best with G-SYNC.");
         }
 
+        // PB2: the bridge window's buffers (needs a restart: the chain is made with them).
+        {
+            static int pb = -1;
+            if (pb < 0) { pb = mgpu::gpu1::ui_ini_read("PresentBuffers", 6); if (pb < 2) pb = 2; if (pb > 6) pb = 6; }
+            int v = pb;
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
+            if (ui_tip(ImGui::SliderInt("Window buffers##pb", &v, 2, 6), "How many buffers the bridge window cycles through.\nMore smooth out Windows' Present stalls; 6 is the default.\nRestart to apply.") &&
+                v != pb && mgpu::gpu1::ui_ini_write("PresentBuffers", v))
+                pb = v;
+            ImGui::SameLine();
+            ImGui::TextDisabled("(restart)");
+        }
+
         // Composition overlay. This fork accepts On with any number of displays.
         ImGui::TextUnformatted("Overlay mode");
         ImGui::SameLine();
@@ -2016,6 +2118,9 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Turns the game's SDR picture into HDR10 for an HDR monitor.\n"
                               "Needs Windows HDR on. Screenshots and video stay SDR.");
+        if (mgpu::hdr::game_hdr())   // HD2
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f),
+                               "The game's own HDR is on: its HDR picture is shown as it is.");
         ImGui::BeginDisabled(!hd);
         int pk = mgpu::hdr::peak();
         char pkf[48];
@@ -2101,7 +2206,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::BeginDisabled(cur == 0);
             ImGui::SetNextItemWidth(ImGui::CalcTextSize("Drifting logo").x + arrow);
             static const char *const styles[] = { "Black", "Drifting logo" };
-            if (ui_tip(ImGui::Combo("##svs", &sty, styles, 2), "Black, or a dim MGPU BRIDGE logo drifting across the screen.")) mgpu::gpu1::ui_set_screensaver_style(sty);
+            if (ui_tip(ImGui::Combo("##svs", &sty, styles, 2), "Black, or a dim ATOMIC MGPU BRIDGE logo drifting across the screen.")) mgpu::gpu1::ui_set_screensaver_style(sty);
             ImGui::EndDisabled();
         }
     }
@@ -2109,6 +2214,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     // ---- SS1 / VR1 / BM1 / BM2: screenshots, video, benchmark ----
     if (ui_section(SEC_CAP, "Screenshots, Video And Benchmark",
                    mgpu::capture::recording_state() != 0 ? "recording"
+                   : mgpu::capture::sweep_state() != 0 ? "sweep running"
                    : mgpu::capture::bench_state() != 0 ? "benchmark running" : ""))
     {
         if (ui_tip(ImGui::Button("Screenshot"), "Saves a PNG of what the bridge shows to mgpu\\captures. CTRL+ALT+P.")) mgpu::capture::request_screenshot();
@@ -2133,13 +2239,19 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         int rf = mgpu::capture::record_fps();
         ImGui::TextUnformatted("video frame rate:");
         ImGui::SameLine();
-        if (ui_tip(ImGui::RadioButton("Every frame shown##rf", rf == 0), "Records every frame shown, generated frames included."))  mgpu::capture::set_record_fps(0);
+        if (ui_tip(ImGui::RadioButton("Every frame shown##rf", rf == 0), "Records every frame shown, generated frames included. At 4K, H.264 is\nlimited to about 60 fps: a higher rate drops to 120/60/30 by itself."))  mgpu::capture::set_record_fps(0);
         ImGui::SameLine();
         if (ui_tip(ImGui::RadioButton("30##rf", rf == 30), "Records at 30 fps."))   mgpu::capture::set_record_fps(30);
         ImGui::SameLine();
         if (ui_tip(ImGui::RadioButton("60##rf", rf == 60), "Records at 60 fps."))   mgpu::capture::set_record_fps(60);
         ImGui::SameLine();
         if (ui_tip(ImGui::RadioButton("120##rf", rf == 120), "Records at 120 fps.")) mgpu::capture::set_record_fps(120);
+        int rc = mgpu::capture::record_codec();   // VR2
+        ImGui::TextUnformatted("video format:");
+        ImGui::SameLine();
+        if (ui_tip(ImGui::RadioButton("H.264##rc", rc == 0), "Plays everywhere. At 4K, about 60 fps at most.")) mgpu::capture::set_record_codec(0);
+        ImGui::SameLine();
+        if (ui_tip(ImGui::RadioButton("H.265 (HEVC)##rc", rc == 1), "Higher frame rates at 4K and smaller files. Some players need Windows'\nHEVC Video Extensions to play it. Falls back to H.264 if refused.")) mgpu::capture::set_record_codec(1);
         bool ra = mgpu::capture::record_audio();
         if (ui_tip(ImGui::Checkbox("Record game audio", &ra), "Records the game's own sound with the video.")) mgpu::capture::set_record_audio(ra);
         bool sh = mgpu::capture::screenshot_hud();
@@ -2152,6 +2264,45 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (ui_tip(ImGui::SliderInt("Benchmark length (s)", &bsec, 5, 300), "How long the measured part of a benchmark runs.")) mgpu::capture::set_bench_seconds(bsec);
         int bd = mgpu::capture::bench_delay();
         if (ui_tip(ImGui::SliderInt("Benchmark countdown (s)", &bd, 0, 10), "Seconds before measuring starts, to close the panel and get ready.")) mgpu::capture::set_bench_delay(bd);
+        // BM3: the sweep
+        {
+            const bool swr = mgpu::capture::sweep_state() != 0;
+            int stp = 0, stps = 0; mgpu::capture::sweep_progress(&stp, &stps);
+            char bl[64];
+            if (swr) snprintf(bl, sizeof bl, "Stop sweep (%d/%d)###swb", stp + 1 > stps ? stps : stp + 1, stps);
+            else     snprintf(bl, sizeof bl, "Run sweep###swb");
+            if (ui_tip(ImGui::Button(bl), "Runs the benchmark once per configuration below, round after round, and\n"
+                       "writes one table to mgpu\\benchmarks\\MGPU_sweep_*.txt. Your settings are not\n"
+                       "changed (mgpu.ini is left alone and they come back at the end). CTRL+ALT+W."))
+                mgpu::capture::toggle_sweep();
+            ImGui::SameLine();
+            static char sl[400] = {};
+            static bool sl_loaded = false;
+            static bool sl_bad = false;
+            if (!sl_loaded) { sl_loaded = true; mgpu::capture::sweep_list(sl, sizeof sl); }
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
+            if (ui_tip(ImGui::InputText("##swl", sl, sizeof sl, ImGuiInputTextFlags_EnterReturnsTrue),
+                       "Configurations, comma separated: generator:LIMITERxMULTIPLIER.\n"
+                       "amd = AMD FSR 3 (2-4x), nv = NVIDIA DLSS FG (2-6x). Press Enter to save.\n"
+                       "Example: amd:40x4,amd:50x3,nv:40x4,nv:50x3"))
+                sl_bad = !mgpu::capture::set_sweep_list(sl);
+            if (sl_bad) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "not saved - check it"); }
+            int sws = mgpu::capture::sweep_seconds();
+            if (ui_tip(ImGui::SliderInt("Sweep: measured per step (s)", &sws, 5, 120), "Seconds measured per configuration per round.\nWith input replay on, each step replays the path instead."))
+                mgpu::capture::set_sweep_seconds(sws);
+            int swt = mgpu::capture::sweep_settle();
+            if (ui_tip(ImGui::SliderInt("Sweep: settle after a switch (s)", &swt, 2, 30), "Seconds after each switch that are not measured, so the new\ngenerator and dynamic resolution can settle."))
+                mgpu::capture::set_sweep_settle(swt);
+            int swn = mgpu::capture::sweep_rounds();
+            if (ui_tip(ImGui::SliderInt("Sweep: rounds", &swn, 1, 10), "How many times the whole list runs. Rounds are merged per configuration;\nmore rounds = fairer when the scene changes (a fly-through benchmark)."))
+                mgpu::capture::set_sweep_rounds(swn);
+            int swnr = mgpu::capture::sweep_nr();   // BM5
+            if (ui_tip(ImGui::SliderInt("Sweep: hold neural resolution (%)", &swnr, 0, 90, swnr == 0 ? "off (dynamic)" : "%d%%"),
+                       "Holds dynamic resolution at this % for the whole sweep, so every configuration is\n"
+                       "compared at the same picture quality and no step inherits the scale the one before\n"
+                       "left. 0 = leave it dynamic. It is let go when the sweep ends."))
+                mgpu::capture::set_sweep_nr(swnr);
+        }
         bool br = mgpu::capture::bench_replay();
         if (ui_tip(ImGui::Checkbox("Use input replay (repeatable runs)", &br), "Every benchmark replays the recorded keyboard and mouse path, so runs\ncan be compared. Single-player games only.")) mgpu::capture::set_bench_replay(br);
         double ps = 0.0; unsigned pe = 0;
@@ -2527,7 +2678,8 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             unsigned rw = st.sr_w, rh = st.sr_h;
             {
                 const float dn = mgpu::gpu1::ui_dr_now();
-                const bool dr_live = mgpu::gpu1::ui_dr_on() && mgpu::gpu1::ui_frame_gen() == 4 && dn > 0.0f;
+                const int fgx = mgpu::gpu1::ui_frame_gen();   // DR6: AMD too
+                const bool dr_live = mgpu::gpu1::ui_dr_on() && dn > 0.0f && (fgx == 4 || fgx == 3);
                 double pct = 0.0;
                 if (dr_live) pct = dn;
                 else if (st.sr_scale_pct != 0u) pct = (double)st.sr_scale_pct;
@@ -3362,6 +3514,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::SetNextItemWidth(ImGui::CalcTextSize("Page Down").x + ImGui::GetFrameHeight() * 2.0f);
             if (ImGui::BeginCombo("##hkpk", keys[pk_key].name))
             {
+                mgpu::live_panel::wheel_here();   // WH1
                 for (int i = 0; i < (int)(sizeof keys / sizeof keys[0]); ++i)
                     if (ImGui::Selectable(keys[i].name, i == pk_key)) pk_key = i;
                 ImGui::EndCombo();
@@ -3390,6 +3543,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         // Drawn on the GAME runtime as well as the bridge one, which is what makes
         // the toggle safe: register_event and unregister_event are called from the
         // render thread of the runtime being drawn, never from the bridge thread.
+#ifndef MGPU_PRODUCTION   // PR1: a developer tool, not in the release build
         ImGui::SeparatorText("Probe (P9.1) - Acquisition Lateral");
         {
             mgpu::probe::readout pr;
@@ -3435,6 +3589,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 ImGui::TextDisabled("Watching only. Nothing is bound, nothing crosses the bus.");
             }
         }
+#endif
         {   // PF1
             bool dl = mgpu::gpu1::ui_detailed_log();
             if (ui_tip(ImGui::Checkbox("Detailed log", &dl), "Writes the repeating diagnostic lines to ReShade.log. Turn on before a\nrun you want to report.")) mgpu::gpu1::ui_set_detailed_log(dl);
@@ -3492,8 +3647,11 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Game frames: the game's own frames, which Windows copies to the monitor's card\n"
                                   "(estimate: frame size x frame rate). Total: everything on each card's PCIe link,\n"
-                                  "from the NVIDIA driver's counter (includes packet overhead and other programs).\n"
-                                  "Links: 3080 Ti PCIe 4.0 x8 (~14 GB/s), 5060 Ti PCIe 4.0 x4 (~7 GB/s).");
+                                  "from the NVIDIA driver's counter (includes packet overhead and other programs)."
+#ifndef MGPU_PRODUCTION
+                                  "\nLinks: 3080 Ti PCIe 4.0 x8 (~14 GB/s), 5060 Ti PCIe 4.0 x4 (~7 GB/s)."
+#endif
+                                  );
         }
         if (st.fps_consumed + 1.0 < st.fps_produced)
             ImGui::TextDisabled("GPU 1 behind the game - frames are being skipped, not dropped.");
@@ -3611,7 +3769,17 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     // VR2: what is running, at the foot of the panel - the same text the
     // log's R141 line carries, so a screenshot identifies the build.
     ImGui::Separator();
-    ImGui::TextDisabled("MGPU Bridge %s (davidm71 fork) | build %s | %s %s",
+    {   // GP1: which card does what, by name.
+        char g0[128], g1[128];
+        mgpu::adapter::card_names(g0, sizeof g0, g1, sizeof g1);
+        auto shorten = [](char *s) {   // "NVIDIA GeForce RTX 3080 Ti" -> "NVIDIA RTX 3080 Ti"
+            if (char *p = strstr(s, "GeForce ")) memmove(p, p + 8, strlen(p + 8) + 1);
+        };
+        shorten(g0); shorten(g1);
+        if (g1[0] == 0) snprintf(g1, sizeof g1, "%s", mgpu::adapter::topology_block(nullptr) != 0 ? "none" : "not chosen yet");
+        ImGui::TextDisabled("GPU 0 (Renderer): %s | GPU 1 (MGpu): %s", g0[0] ? g0 : "not known yet", g1);
+    }
+    ImGui::TextDisabled("Atomic MGPU Bridge %s (davidm71) | build %s | %s %s",
                         MGPU_VERSION_STR, MGPU_SOURCE_TAG, __DATE__, __TIME__);
     ImGui::TextDisabled("Something wrong? Send ReShade.log from the game's exe folder to:");
     ImGui::TextDisabled("github.com/davidm71/Neural-coprocessor");
@@ -3837,6 +4005,41 @@ static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool 
         return false;   // dcomp mode has no window to disagree with
     }
 
+    // BT5: with PanelOverPicture=1 the overlay key opens the panel on the
+    // PICTURE's own runtime (the bridge window, full screen) instead of in the
+    // game's 1440p window behind it - the same as PP1 does in DcompOverlay=1.
+    // The key reaches the game's runtime (the game has the focus); that open
+    // is refused and handed over, and the next press closes it the same way.
+    if (mgpu::gpu1::bw_active() && runtime != nullptr && mgpu::live_panel::on())
+    {
+        void *g = g_rt_game.load(std::memory_order_relaxed);
+        void *b = g_rt_bridge.load(std::memory_order_relaxed);
+        void *r = runtime;
+        if (r == g && g_ov_echo_game.exchange(false, std::memory_order_relaxed)) return false;
+        if (r == b && g_ov_echo_bridge.exchange(false, std::memory_order_relaxed))
+        {
+            mgpu::gpu1::bw_set_panel(open);
+            return false;
+        }
+        if (r == b) { mgpu::gpu1::bw_set_panel(open); return false; }   // closed from the panel itself
+        if (r == g && b != nullptr && (mgpu::gpu1::bw_on_top() || mgpu::gpu1::bw_panel()))
+        {
+            if (!open) return false;
+            const bool want = !mgpu::gpu1::bw_panel();
+            g_ov_source.store((int)source, std::memory_order_relaxed);
+            g_ov_pend_bridge.store(want ? 1 : 0, std::memory_order_relaxed);
+            mgpu::gpu1::bw_set_panel(want);
+            mgpu::diag::info(want ? "[MGPU][BT5] overlay key: panel opened on the picture (the game's own overlay "
+                                    "stays closed)."
+                                  : "[MGPU][BT5] overlay key: panel on the picture closed.");
+            return true;    // ReShade leaves the overlay closed on the game's runtime
+        }
+    }
+    // BT1/BT2: without PanelOverPicture the picture steps behind the game's
+    // window while the game's own overlay is open (the panel is drawn there).
+    if (mgpu::gpu1::bw_active() && runtime != nullptr && (void *)runtime == g_rt_game.load(std::memory_order_relaxed))
+        mgpu::gpu1::bw_set_aside(open);
+
     // R158. See above. Gated to the one measured configuration.
     if (!mgpu::gpu1::dcomp_explicit_off_single_display()) return false;
 
@@ -4021,6 +4224,13 @@ static void on_present(reshade::api::command_queue *queue,
     // flushes are ahead of it on the game's queue. Inert while the effect
     // event feeds the bridge (HookPoint=0) or always (HookPoint=1).
     hp_present_feed(queue, swapchain);
+    // HD2: follow the game's own HDR setting. The bridge's chain is always on the
+    // second card's D3D12 device, so a D3D11 chain or a D3D12 chain on the game's
+    // card is the game's. ReShade tracks the colour space the game sets.
+    if (swapchain != nullptr)
+        if (reshade::api::device *sd = swapchain->get_device())
+            if (sd->get_api() == reshade::api::device_api::d3d11 || hp_is_game_chain(swapchain))
+                mgpu::hdr::note_game_colour_space((int)swapchain->get_color_space());
     // 0.3.1 backport: SignalAt=1 signals the game's D3D12 queue here. A D3D11
     // game's "queue" is its immediate context - never cast that to a D3D12
     // queue. The DX11 producer signals on its own queue in finish_effects.
@@ -4053,7 +4263,8 @@ static void on_present(reshade::api::command_queue *queue,
     // it. The runtime POINTER still comes from R160's re-latch and from
     // init_effect_runtime; only the moment of the call moved.
     if (swapchain != nullptr && (mgpu::gpu1::dcomp_explicit_off_single_display() ||
-                                 (mgpu::live_panel::on() && mgpu::gpu1::dcomp_overlay_mode())))   // PP1
+                                 (mgpu::live_panel::on() && mgpu::gpu1::dcomp_overlay_mode()) ||   // PP1
+                                 (mgpu::live_panel::on() && mgpu::gpu1::bw_active())))             // BT5
     {
         reshade::api::device *pd = swapchain->get_device();
         if (pd != nullptr && pd->get_api() == reshade::api::device_api::d3d12)
@@ -4072,6 +4283,11 @@ static void on_present(reshade::api::command_queue *queue,
                 if (p_is_game)
                     mgpu::live_panel::block_game_input(
                         (reshade::api::effect_runtime *)g_rt_game.load(std::memory_order_relaxed));
+                // BT5: the same while the panel is open on the picture - the game
+                // gets no input (and ReShade lifts its pointer clip) until it closes.
+                if (p_is_game && mgpu::gpu1::bw_panel())
+                    if (auto *grt = (reshade::api::effect_runtime *)g_rt_game.load(std::memory_order_relaxed))
+                        grt->block_input_next_frame();
 
                 std::atomic<int>  &pend = p_is_game ? g_ov_pend_game : g_ov_pend_bridge;
                 std::atomic<bool> &echo = p_is_game ? g_ov_echo_game : g_ov_echo_bridge;
@@ -4681,6 +4897,8 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
 static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
     (void)resize;
+    if (swapchain != nullptr && mgpu::gamepresent::on())   // GP1: only acts on the chain it attached to
+        mgpu::gamepresent::detach(reinterpret_cast<IUnknown *>(static_cast<uintptr_t>(swapchain->get_native())));
     if (mgpu::dx11probe::on() && swapchain != nullptr &&
         mgpu::dx11probe::is_chain(reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native()))))
         mgpu::dx11probe::shutdown();
@@ -4778,7 +4996,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
             break;
         }
         reshade::log::message(reshade::log::level::info,
-            "[MGPU][T1] MGPU Bridge add-on registered - stock ReShade, add-on API version "
+            "[MGPU][T1] Atomic MGPU Bridge add-on registered - stock ReShade, add-on API version "
             MGPU_STR(RESHADE_API_VERSION));
         // SLT3: must be in place before the engine resolves Streamline, so it
         // runs here. Does nothing unless mgpu.ini says SLTags=3.
@@ -4794,18 +5012,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
             // R141. Before anything else this add-on says, say what it is.
             char v[420];
             snprintf(v, sizeof v,
-                     "[MGPU][R141] MGPU Bridge %s | source " MGPU_SOURCE_TAG " | built %s %s | add-on API 20. IDENTIFY EVERY "
+                     "[MGPU][R141] Atomic MGPU Bridge %s | source " MGPU_SOURCE_TAG " | built %s %s | add-on API 20. IDENTIFY EVERY "
                      "LOG BY THIS LINE. ReShade's own 'Registered add-on' line carries "
                      "v0.0.0.0 because that field has never been filled in, which is why "
                      "reports have had to quote the file size in bytes instead. If this line "
-                     "is absent the build predates 0.2.3.",
+                     "is absent it is an older build.",
                      MGPU_VERSION_STR, __DATE__, __TIME__);
             mgpu::diag::info(v);
         }
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         // PP1: PanelOverPicture reads its key once and registers its
-        // reshade_overlay event only when PanelOverPicture=1 (live_panel.cpp).
+        // reshade_overlay event unless mgpu.ini says PanelOverPicture=0 (PO1, live_panel.cpp).
         mgpu::live_panel::attach(hModule);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);   // D1
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);   // R241d observe / R242 refuse
@@ -4837,7 +5055,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // on the game's render thread with the loader lock long released - the
         // same thread the probe's own register_event calls belong on anyway.
 #if defined(MGPU_HAVE_IMGUI)
-        reshade::register_overlay("MGPU Bridge", draw_mgpu_overlay);
+        reshade::register_overlay("Atomic MGPU Bridge", draw_mgpu_overlay);
         mgpu::live_panel::set_drawer(draw_mgpu_overlay);   // UX1
         reshade::log::message(reshade::log::level::info,
             "[MGPU][P6.4] overlay panel registered - open the ReShade overlay (Home) over the "
@@ -4910,7 +5128,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
             mgpu::hotkeys::emergency_unhook();   // HK2
         }
 #if defined(MGPU_HAVE_IMGUI)
-        reshade::unregister_overlay("MGPU Bridge", draw_mgpu_overlay);
+        reshade::unregister_overlay("Atomic MGPU Bridge", draw_mgpu_overlay);
 #endif
         // P9.1 before worker::stop: unregistering our events while the game
         // thread may still raise them is the one ordering that matters here,

@@ -45,6 +45,7 @@ enum action : unsigned
     A_PATH,          // BM2: record the input path start/stop
     A_CLOCK,         // CK1: show/hide the clock
     A_STOPWATCH,     // CK1: show/hide the stopwatch (starts from 0 when shown)
+    A_SWEEP,         // BM3: benchmark sweep start/stop
     A_COUNT
 };
 

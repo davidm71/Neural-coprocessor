@@ -2385,7 +2385,7 @@ void log_summary()
         "climbs means recreation is matched and the pressure is somewhere else. A "
         "NEGATIVE live means we are missing creates rather than that releases "
         "exceeded them: some route resolved ReleaseFeature past our hooks, and the "
-        "number is then a floor, not a count. R180: REFUSED is the one that must stay at zero. It counts scene features the latch set had no room for, and every one of them is a feature whose evaluates are skipped for the rest of the run. Four slots, freed on release since 0.2.5-dev; before that the set was append-only and a fifth create killed the velocity lane permanently. LT1: a full set now gives the least recently used slot to the new feature (EVICTED) instead of refusing it, so REFUSED can only rise with SceneFeaturePath=0. ",
+        "number is then a floor, not a count. R180: REFUSED is the one that must stay at zero. It counts scene features the latch set had no room for, and every one of them is a feature whose evaluates are skipped for the rest of the run. Four slots, freed on release; in older builds the set was append-only and a fifth create killed the velocity lane permanently. LT1: a full set now gives the least recently used slot to the new feature (EVICTED) instead of refusing it, so REFUSED can only rise with SceneFeaturePath=0. ",
         g_mode.load(std::memory_order_relaxed),
         g_rung.load(std::memory_order_relaxed), g_site,
         g_slots.load(std::memory_order_relaxed),

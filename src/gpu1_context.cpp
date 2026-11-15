@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>   // atoll, malloc/free - used throughout; made explicit for P5.0
 #include <cstring>
+#include <cctype>
 #include <cmath>     // FSR1: atanf/tanf for the vertical FOV
 #include <cwchar>    // V45: wcsrchr, for splitting our own module path. Pulled in
                      // transitively by windows.h on MSVC, made explicit because a
@@ -42,8 +43,10 @@
 #include "adapter.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#include "d3dc.hpp"   // FD1
 #include "calibrator.hpp"   // R104: jitter compensation
 #include "mgpu_ini_parser.hpp"
+#include "tray.hpp"     // TR1
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
 #include "live_panel.hpp"   // SV1: no screen saver while the panel is open
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
@@ -51,6 +54,8 @@
 #include "scaler.hpp"     // SC1: FSR 1 / NIS enlargement to the monitor
 #include "hotkeys.hpp"
 #include "crashlog.hpp"
+#include "hookprobe.hpp"   // SO5
+#include "gamepresent.hpp" // GP1
 #include "cursormap.hpp"  // MC1: the pointer on the enlarged picture
 #include "dx11_producer.hpp"   // 0.3.1 backport: HudLess is D3D12-only
 #include "nr16.hpp"   // 0.3.1 R208: optional FP16 input to DLSS-NR (NRInput16=4)
@@ -61,11 +66,13 @@
 #include "gputime.hpp"   // GT1
 #include "hud_probe.hpp" // HL3
 #include "fg_clock.hpp"  // FC1: the even frame clock (tests/fg_clock_test.cpp)
+#include "dllid.hpp"     // ID1: what each loaded DLL is, and who signed it
 // FSR1: AMD FidelityFX API headers (MIT), for FrameGen=3. Types only - the
 // functions come from AMD's signed DLL, loaded at run time from the mgpu folder.
 #include "ffx/ffx_api.h"
 #include "ffx/ffx_api_types.h"
 #include "ffx/ffx_api_dx12.h"
+#include "fsr_chain.hpp"   // AC3
 #include "ffx/ffx_framegeneration.h"
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
@@ -99,6 +106,10 @@ namespace mgpu::gpu1
 {
 namespace
 {
+    // PB1: the bridge window's back buffers, 2..6 (PresentBuffers, read when the
+    // chain is created; a restart applies a change). Upstream R348 (ZhizhenS):
+    // 6 removed horizontal bands with frame generation. 2 is the old chain.
+    static const unsigned MAX_BB = 6;
     struct state
     {
         std::mutex cs;
@@ -131,7 +142,8 @@ namespace
         UINT chain_flags = 0;
         unsigned long long chain_gen = 0;   // RV1: bumped for every present chain created
         ID3D12DescriptorHeap *rtv_heap = nullptr;
-        ID3D12Resource *backbuffer[2] = {};
+        ID3D12Resource *backbuffer[MAX_BB] = {};
+        unsigned bb_count = 2;   // PB1: how many the chain has
         // ---- D6: an allocator RING, not a single allocator ----
         //
         // This used to be one allocator and one list, and the thing that made
@@ -432,6 +444,12 @@ static bool g_dcomp_rooted_fwd() { return g_dcomp_rooted; }
 static int g_fps_hud_mode = 1;
 static int clock_lines(char (*out)[24]);   // CK1, defined with the clock settings
 static bool screensaver_tick();            // SV1, defined with the clock settings
+static int ac_on_now();                    // AC1, defined with the clock settings
+static int amd_mult_now();                 // X3: AMD's multiplier, 2/3/4 (defined with ac_on_now)
+static int amd_quality_now();              // GV1: 0 Quality, 1 Balanced, 2 Fast (FSRQuality)
+static int amd_timing_now();               // GV1: 1 = the rebuilt DLL writes its timing log (FSRTiming)
+static std::atomic<int> g_amd_q_support{-1};   // GV1: -1 unknown, 0 the rebuilt DLL predates presets, 1 yes
+static std::atomic<int> g_ac_live{0};      // DR6/X3: the multiplier AMD is really making (3 or 4), 0 = 2x
 static void bus_sample();                  // BW1, defined with the clock settings
 bool ui_bus_hud();                         // BW3
 extern std::atomic<unsigned long long> g_bus_tx;   // BW1, defined with the clock settings
@@ -493,13 +511,25 @@ static std::atomic<int> g_rs_up{0};      // SRUpFilter: 0 bilinear, 1 bicubic, 2
 // at the current scale (NR takes a working area per evaluate - FV2 already
 // relies on it), so the scale moves without rebuilding anything. A move resets
 // NR's history for one frame. The scale is steered from what is SHOWN against
-// game fps x multiplier (TF4's measurement, NVIDIA FG only): short -> down,
+// game fps x multiplier (TF4's measurement; NVIDIA FG, and AMD FG since DR6): short -> down,
 // clean -> a slow probe up whose wait doubles each time a probe fails.
 static std::atomic<int> g_dr_on{0};       // SRDynamic
 static std::atomic<int> g_dr_min{50};     // SRDynMin, %
 static std::atomic<int> g_dr_max{80};     // SRDynMax, % (textures are made at this size: restart)
 static std::atomic<int> g_dr_pct_x10{0};  // current scale x10, 0 = not running
 static std::atomic<int> g_dr_alloc{0};    // % the reduced textures were made at
+static std::atomic<int> g_bs_nr{0};       // BM5: the sweep holds the scale here (x10; 0 = not held)
+static int              g_bs_nr_saved = 0; // BM5: the scale before the hold (x10)
+static std::atomic<unsigned> g_dr_reset_seq{0};   // BM6: a sweep step restarts the controller from a common scale
+// DR6: SRDynAggressive - keeps more room on the neural card: lowers sooner and
+// in bigger steps, raises only with clear room. Both generators.
+static std::atomic<int> g_dr_aggr{0};
+static std::atomic<int> g_dr_late{1};   // DR5: late frame pairs steer the scale (SRDynLatePairs)
+// DR8: what a DR decision is compared against - the neural stage's queue (NR,
+// AMD, composition), the present path's queues, AMD's call and the composition
+// (smoothed, from the AC timestamps), and the driver's own utilisation.
+static std::atomic<ID3D12CommandQueue *> g_gt_nrq{nullptr};
+static std::atomic<double> g_ac_ms_call{-1.0}, g_ac_ms_comp{-1.0};
 // DR3: present-gap watch (present thread writes, game thread reads and resets),
 // the bottleneck verdict and why the last window was skipped (for the panel).
 static std::atomic<long long> g_pres_last_qpc{0}, g_pres_max_gap{0};
@@ -532,11 +562,37 @@ static std::atomic<int> g_fov_feather{15};// FovFeather: soft edge, % of the cen
 static std::atomic<int> g_nr_uic{0};     // NRUICorrection: 0 auto (unset), 1 off, 2 on
 // DV1: versions of the NVIDIA DLLs this session loaded, for the panel.
 static std::mutex g_dv_mx;
-static char g_dv[4][48] = {};   // 0 NR, 1 SR, 2 FG, 3 AMD FSR
+static char g_dv[5][48] = {};   // 0 NR, 1 SR, 2 FG, 3 AMD FSR (AMD's DLL), 4 rebuilt AMD DLL (DV2)
+// DV2: the frame generation version each AMD DLL runs ("3.1.6", "3.1.6-mgpu1"),
+// which is what matters - the file version names the whole DLL (4.0.1 = AMD's
+// ML generator, which this mod does not use).
+static char g_dv_prov[2][32] = {};   // 0 AMD's DLL, 1 rebuilt
+static std::atomic<int> g_amd_mode_now{-1};   // DV2: -1 AMD not running, else 0 2x, 1 4x rebuilt, 2 4x chained
+// ID1: a rebuilt AMD provider names itself "<version>-mgpu<N>" - any N, so a
+// later rebuild is recognised without a mod update.
+static bool is_mgpu_rebuild(const char *v)
+{
+    if (v == nullptr) return false;
+    const char *p = strstr(v, "-mgpu");
+    return p != nullptr && p[5] >= '0' && p[5] <= '9';
+}
+// GV1: the N of "-mgpu<N>" (0 = not a rebuild). 2+ takes the quality and timing keys.
+static int mgpu_rebuild_gen(const char *v)
+{
+    if (!is_mgpu_rebuild(v)) return 0;
+    return atoi(strstr(v, "-mgpu") + 5);
+}
+static void dv_provider(int i, const char *name)
+{
+    if (i < 0 || i > 1 || name == nullptr) return;
+    std::lock_guard<std::mutex> lk(g_dv_mx);
+    snprintf(g_dv_prov[i], sizeof g_dv_prov[i], "%s", name);
+}
 static void dv_record(int k, HMODULE m, const char *src)
 {
-    if (k < 0 || k > 3 || m == nullptr) return;
+    if (k < 0 || k > 4 || m == nullptr) return;
     (void)src;
+    mgpu::dllid::check(k, m);   // ID1: one log line per slot, signature on its own thread
     char v[32] = "?";
     (void)mgpu::slprobe::file_version(m, v, sizeof v);
     // "system" = the driver's own copy (NGX model store, DriverStore,
@@ -885,6 +941,512 @@ static void sc_cover_sync(bool force_log)
     sc_apply_click_mode(panel && g_sc_cover_shown.load());
     mgpu::cursormap::tick(g_sc_cover_shown.load() && !panel);
 }
+// ---- BT1: the bridge window as the picture on top (DcompOverlay=0, one monitor) ----
+//
+// Measured 2026-11-14 (Black Myth, 40x4): with DcompOverlay=0 and Monitor=0
+// the mod's own window on the game's monitor reached "Hardware Composed:
+// Independent Flip" for 99.8% of its frames - 0.2% never shown (the composed
+// overlay: 8-30%), 2.9 ms from Present to screen (about 10 ms), and shown
+// frame spacing anywhere from 4 to 8.5 ms instead of 240 Hz steps, i.e.
+// G-SYNC following the picture. But the game's own 1440p window, being the
+// active one, sat on top of it.
+//
+// BridgeOnTop=1 (default; 0 = off): while the bridge window shares the game's
+// monitor and the picture is live, it is kept TOP-MOST and never activated
+// (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW), so the game stays the active window
+// (keyboard, pad, raw-input mouse) and its window is hidden behind ours. Mouse
+// messages that land on the bridge window are posted on to the game's window
+// in its own client coordinates (the real pointer is in the game's window: MC1
+// confines it while the game shows one, the game does in play), and MC1 draws
+// the game's pointer into the enlarged picture. The picture steps aside (to
+// the bottom of the Z-order) while the game's ReShade overlay is open, on
+// CTRL+ALT+F6, and when another program has the foreground for 400 ms.
+// Bridge thread only, ~10x a second; the forwarding runs in the window's own
+// procedure on the same thread.
+static std::atomic<bool> g_bw_on{false};      // acting as the top picture (styled, same monitor)
+static std::atomic<bool> g_bw_console{false}; // the game's ReShade overlay is open (BT2)
+static std::atomic<bool> g_bw_peek{false};    // CTRL+ALT+F6
+static std::atomic<bool> g_bw_panel{false};   // BT5: the ReShade panel is open on the picture's own runtime
+static std::atomic<bool> g_bw_top_pub{false}; // g_bw_top for other threads
+static bool g_bw_top = false;                 // bridge thread: currently top-most
+static bool g_bw_styled = false;
+static int bw_cfg()
+{
+    static int v = -1;
+    if (v < 0) v = ui_ini_read("BridgeOnTop", 1);
+    return v;
+}
+// GF1: the game in front when it loads. MEASURED 2026-11-14 (RoboCop, TR5):
+// launched from Steam while File Explorer and another app were in front, the
+// game's window opened BEHIND them and kept that place - so the picture, which
+// only goes on top while the game is in front (BT2), stepped aside and the
+// game's small window sat under other programs until it was clicked. Twice per
+// launch - when the bridge starts and at the first picture - the game is
+// brought to the front once. Never again after that, so Alt+Tab to another
+// program is left alone. GameToFront=0 turns it off.
+static std::atomic<int> g_gf_want{0};   // 1 = startup, 2 = first picture (bridge thread acts on it)
+static int g_gf_done = 0;               // bitmask of the two, bridge thread
+static void gf_bring_game_front(const char *why)
+{
+    HWND g = g_game_hwnd;
+    if (g == nullptr || !IsWindow(g)) return;
+    HWND fg = GetForegroundWindow();
+    DWORD fpid = 0;
+    const DWORD ft = fg ? GetWindowThreadProcessId(fg, &fpid) : 0;
+    if (fg == g || (fpid != 0 && fpid == GetCurrentProcessId())) return;   // already in front
+    char cls[96] = "-";
+    if (fg != nullptr) GetClassNameA(fg, cls, sizeof cls);
+    if (IsIconic(g)) ShowWindow(g, SW_RESTORE);
+    bool ok = SetForegroundWindow(g) != FALSE && GetForegroundWindow() == g;
+    if (!ok && ft != 0 && !IsHungAppWindow(fg))
+    {
+        // Windows only lets the program that has the keyboard hand the front
+        // to another; joining its input queue for the call is the documented
+        // way round that. Undone at once.
+        const DWORD me = GetCurrentThreadId();
+        const bool att = ft != me && AttachThreadInput(me, ft, TRUE) != FALSE;
+        BringWindowToTop(g);
+        SetForegroundWindow(g);
+        if (att) AttachThreadInput(me, ft, FALSE);
+        ok = GetForegroundWindow() == g;
+    }
+    char l[300];
+    snprintf(l, sizeof l, "[MGPU][GF1] %s: the game was not in front (window class %s) - %s.", why, cls,
+             ok ? "brought it to the front" : "Windows refused to bring it to the front; click the game");
+    mgpu::diag::info(l);
+}
+static void gf_tick()
+{
+    static int cfg = -1;
+    if (cfg < 0) cfg = ui_ini_read("GameToFront", 1) != 0 ? 1 : 0;
+    if (cfg == 0) return;
+    if (!(g_gf_done & 1) && g_game_hwnd != nullptr) { g_gf_done |= 1; gf_bring_game_front("bridge started"); }
+    if (!(g_gf_done & 2) && g_gf_want.load(std::memory_order_relaxed) == 2) { g_gf_done |= 2; gf_bring_game_front("first picture"); }
+}
+
+// HW1: the bridge window stays hidden until it has something to show - the
+// first neural frame, or an error / AutoArm-off notice the user must read.
+// Before that, a full-size "ATOMIC MGPU BRIDGE / WAITING" window on top of the
+// game is only in the way. BridgeShowIdle=1 shows it from the start, as
+// before. With DcompOverlay on the window is never shown at all (V49).
+static std::atomic<int>  g_hw_cfg{-1};
+static std::atomic<bool> g_hw_revealed{false};
+static bool hw_show_idle()
+{
+    int v = g_hw_cfg.load(std::memory_order_relaxed);
+    if (v < 0) { v = ui_ini_read("BridgeShowIdle", 0) != 0 ? 1 : 0; g_hw_cfg.store(v, std::memory_order_relaxed); }
+    return v != 0;
+}
+bool bridge_window_hidden()
+{
+    return !dcomp_overlay_mode() && !hw_show_idle() && !g_hw_revealed.load(std::memory_order_relaxed);
+}
+static void hw_reveal(const char *why)
+{
+    if (dcomp_overlay_mode() || g_hw_revealed.exchange(true)) return;
+    HWND w = nullptr;
+    { auto &S = st(); std::lock_guard<std::mutex> lk(S.cs); w = S.hwnd; }
+    if (w == nullptr) { g_hw_revealed.store(false); return; }
+    if (hw_show_idle()) return;   // already shown at creation
+    ShowWindowAsync(w, SW_SHOWNOACTIVATE);
+    g_gf_want.store(2, std::memory_order_relaxed);   // GF1: the game in front for its first picture
+    char l[240];
+    snprintf(l, sizeof l, "[MGPU][HW1] the bridge window is shown now: %s.", why);
+    mgpu::diag::info(l);
+}
+
+// HW1/TR1: the status window on request from the tray menu (before the first
+// picture only - after it the window is the picture). Hide undoes the reveal
+// and takes the picture-on-top rules down with it, so Home goes back to the game.
+void hw_status_window(bool show)
+{
+    if (dcomp_overlay_mode()) return;
+    if (show) { hw_reveal("asked for from the tray icon"); return; }
+    bool ns = false;
+    HWND w = nullptr;
+    { auto &S = st(); std::lock_guard<std::mutex> lk(S.cs); ns = S.neural_shown; w = S.hwnd; }
+    if (ns || w == nullptr || hw_show_idle()) return;
+    if (!g_hw_revealed.exchange(false)) return;
+    g_bw_on.store(false);
+    mgpu::cursormap::tick(false);
+    ShowWindowAsync(w, SW_HIDE);
+    mgpu::diag::info("[MGPU][HW1] the status window is hidden again (tray icon).");
+}
+
+// TR1: what the status box would say, for the tray icon. The idle screen's
+// state and lines are cached by the present path (tray_note_screen); the
+// frame rate is counted from the bridge's own Presents.
+static std::mutex g_tray_mx;
+static int  g_tray_sst = -1;
+static char g_tray_l1[64] = {};
+static char g_tray_l2[200] = {};
+static std::atomic<unsigned long long> g_tray_presents{0};
+static void tray_note_screen(int sst, const char *l1, const char *l2)
+{
+    std::lock_guard<std::mutex> lk(g_tray_mx);
+    g_tray_sst = sst;
+    if (l1 != nullptr && strcmp(g_tray_l1, l1) != 0) strncpy_s(g_tray_l1, l1, _TRUNCATE);
+    if (l2 != nullptr && strcmp(g_tray_l2, l2) != 0) strncpy_s(g_tray_l2, l2, _TRUNCATE);
+}
+// The idle screen is all capitals (a bitmap font). Sentence case for the
+// tooltip, with a few names kept as they are written.
+static void tray_sentence(const char *in, char *out, size_t n)
+{
+    static const char *const keep[][2] = {
+        { "DLSS-NR", "DLSS-NR" }, { "RESHADE.LOG", "ReShade.log" }, { "MGPU.INI", "mgpu.ini" },
+        { "AUTOARM", "AutoArm" }, { "GPU", "GPU" }, { "NR", "NR" }, { "FPS", "fps" },
+        { "DCOMPOVERLAY", "DcompOverlay" }, { "D3D12", "D3D12" }, { "DX11", "DX11" } };
+    size_t o = 0;
+    bool first = true;
+    for (size_t i = 0; in[i] != 0 && o + 1 < n;)
+    {
+        if (isalnum((unsigned char)in[i]))
+        {
+            size_t j = i;
+            while (in[j] != 0 && (isalnum((unsigned char)in[j]) || in[j] == '-' || in[j] == '.')) ++j;
+            while (j > i && (in[j - 1] == '.' || in[j - 1] == '-')) --j;   // trailing punctuation is not part of a word
+            const size_t len = j - i;
+            const char *rep = nullptr;
+            for (auto &k : keep)
+                if (strlen(k[0]) == len && _strnicmp(in + i, k[0], len) == 0) { rep = k[1]; break; }
+            for (size_t q = 0; q < len && o + 1 < n; ++q)
+            {
+                char ch = rep ? rep[q] : (char)tolower((unsigned char)in[i + q]);
+                if (first && !rep && q == 0) ch = (char)toupper((unsigned char)ch);
+                out[o++] = ch;
+            }
+            first = false;
+            i = j;
+        }
+        else
+        {
+            if (in[i] == '.' || in[i] == ':') first = true;
+            out[o++] = in[i++];
+        }
+    }
+    out[o] = 0;
+}
+// TR3: the tray menu's Status box - a snapshot of what the bridge is doing.
+void tray_details(char *out, size_t n)
+{
+    if (out == nullptr || n == 0) return;
+    char st_text[200];
+    const int state = tray_status(st_text, sizeof st_text);
+    static const char *const kState[] = { "Waiting", "Arming", "Running", "Error" };
+    mgpu::adapter::selection_result sel;
+    mgpu::adapter::get_selection(sel);
+    const char *mode = dcomp_overlay_mode() ? "overlay on the game's window (DcompOverlay=1)"
+                     : bw_active()          ? "picture window on top of the game (DcompOverlay=0)"
+                     : bridge_window_hidden() ? "own window, hidden until the first picture"
+                                              : "own window (DcompOverlay=0)";
+    char fg[96];
+    const int fgm = ui_frame_gen();
+    if (fgm == 4)
+    {
+        const int run = ui_fg_mult_running();
+        if (run > 0) snprintf(fg, sizeof fg, "NVIDIA DLSS frame generation, %dx", run);
+        else snprintf(fg, sizeof fg, "NVIDIA DLSS frame generation, %dx (not generating yet)", ui_fg_mult());
+    }
+    else if (fgm == 3) snprintf(fg, sizeof fg, "AMD FSR 3 frame generation, %dx", ui_fsr_mult());
+    else if (fgm == 1 || fgm == 2) snprintf(fg, sizeof fg, "the bridge's own (mode %d)", fgm);
+    else snprintf(fg, sizeof fg, "off");
+    const char *hdr = mgpu::hdr::game_hdr() ? "the game's own HDR, passed through"
+                    : mgpu::hdr::enabled()  ? "HDR output (SDR game made HDR10)"
+                                            : "off (SDR)";
+    ui_state ast;
+    ui_read(ast);
+    snprintf(out, n,
+             "Status:  %s - %s\n"
+             "\n"
+             "Display mode:  %s\n"
+             "Neural / display card:  %s\n"
+             "Frame generation:  %s\n"
+             "HDR:  %s\n"
+             "Frames from the game:  %llu received, %llu dropped\n"
+             "\n"
+             "This is a snapshot from when you opened it. The full record is ReShade.log "
+             "(menu: Open the log folder).",
+             kState[(state >= 0 && state < 4) ? state : 0], st_text, mode,
+             sel.valid ? sel.selected_desc : "not chosen yet", fg, hdr,
+             ast.consumed, ast.dropped);
+}
+
+int tray_status(char *text, size_t n)
+{
+    if (text == nullptr || n == 0) return 0;
+    static unsigned long long p_prev = 0;
+    static ULONGLONG t_prev = 0;
+    static double fps = 0.0;
+    const ULONGLONG now = GetTickCount64();
+    const unsigned long long p = g_tray_presents.load(std::memory_order_relaxed);
+    if (t_prev == 0) { t_prev = now; p_prev = p; }
+    else if (now - t_prev >= 900)
+    {
+        fps = (double)(p - p_prev) * 1000.0 / (double)(now - t_prev);
+        t_prev = now; p_prev = p;
+    }
+    bool ns = false;
+    { auto &S = st(); std::lock_guard<std::mutex> lk(S.cs); ns = S.neural_shown; }
+    ui_state ast;
+    ui_read(ast);
+    int sst; char l1[64], l2[200];
+    { std::lock_guard<std::mutex> lk(g_tray_mx); sst = g_tray_sst; strncpy_s(l1, g_tray_l1, _TRUNCATE); strncpy_s(l2, g_tray_l2, _TRUNCATE); }
+    char a[200], b[200];
+    if (ns)
+    {
+        if (fps >= 0.5) snprintf(text, n, "running - %.0f fps", fps);
+        else snprintf(text, n, "running - no new frames right now");
+        return 2;
+    }
+    if (sst == mgpu::screen::st_error)
+    {
+        tray_sentence(l1, a, sizeof a); tray_sentence(l2, b, sizeof b);
+        snprintf(text, n, "%s: %s", a, b);
+        return 3;
+    }
+    if (l2[0] != 0) tray_sentence(l2, b, sizeof b); else strncpy_s(b, "Waiting", _TRUNCATE);
+    if (ast.armed) { snprintf(text, n, "%s", b); return 1; }
+    snprintf(text, n, "%s", b);
+    return 0;
+}
+
+// HP1: HidePointer=1 - Windows' pointer is hidden over the picture, for a game
+// that draws its own pointer into the picture. MEASURED on the Resident Evil
+// Requiem demo: the game does not import SetCursor (MC1 not available), draws an
+// animated pointer itself, and the bridge window's arrow showed on top of it -
+// two pointers, only the game's meaning anything. Read once (bridge thread).
+static bool hide_pointer_cfg()
+{
+    static int v = -1;
+    if (v < 0) v = ui_ini_read("HidePointer", 0) != 0 ? 1 : 0;
+    return v == 1;
+}
+
+static void bw_sync()
+{
+    if (bw_cfg() == 0 || dcomp_overlay_mode() || g_game_hwnd == nullptr) return;
+    if (bridge_window_hidden()) return;   // HW1: nothing on top until there is a picture (Home stays on the game)
+    HWND w = nullptr;
+    bool shown = false;
+    { auto &S = st(); std::lock_guard<std::mutex> lk(S.cs); w = S.hwnd; shown = S.neural_shown; }
+    if (w == nullptr || !IsWindow(w)) return;
+    const bool same = MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST) == MonitorFromWindow(g_game_hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!same)
+    {
+        if (g_bw_on.exchange(false))
+        {
+            if (g_bw_top) { SetWindowPos(w, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); g_bw_top = false; }
+            mgpu::cursormap::tick(false);
+            mgpu::diag::info("[MGPU][BT1] the bridge window is no longer on the game's monitor - it stays an ordinary window.");
+        }
+        return;
+    }
+    if (!g_bw_styled)
+    {
+        g_bw_styled = true;
+        LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        SetWindowLongPtrW(w, GWL_EXSTYLE, ex | (LONG_PTR)(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW));
+        SetWindowPos(w, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        const bool mc = mgpu::cursormap::install(g_game_hwnd);
+        char l[420];
+        snprintf(l, sizeof l, "[MGPU][BT1] the bridge window shares the game's monitor: it becomes the picture on top - "
+                 "never activated, out of Alt+Tab, mouse passed on to the game%s. BridgeOnTop=0 turns this off.",
+                 mc ? ", the game's pointer drawn into the picture (MC1)"
+                    : hide_pointer_cfg() ? " (MC1 not available; HidePointer=1: Windows' pointer is hidden over the picture "
+                                           "- the game draws its own)"
+                                         : " (MC1 pointer mapping NOT available: Windows' pointer is left visible. If the "
+                                           "game draws its own pointer too and you see two, set HidePointer=1)");
+        mgpu::diag::info(l);
+    }
+    g_bw_on.store(true);
+
+    // The game (or anything of this process) in front; another program only
+    // counts once it has held the foreground for 400 ms (SC8).
+    bool game_fg = true;
+    static char fg_who[160] = {};   // TB1: what was in front, for the step-aside line
+    {
+        HWND fg = GetForegroundWindow();
+        DWORD pid = 0;
+        if (fg != nullptr) GetWindowThreadProcessId(fg, &pid);
+        bool ours = (fg == g_game_hwnd) || (pid != 0 && pid == GetCurrentProcessId());
+        if (!ours && fg != nullptr)
+        {
+            // TB1: the taskbar and its pop-ups are not "another program". MEASURED
+            // 2026-11-14 (RoboCop, TR5): opening the tray's hidden-icons flyout to
+            // reach this mod's own icon put TopLevelWindowForOverflowXamlIsland in
+            // front, and the picture stepped aside - showing the game's small
+            // window on the desktop until the game was clicked. Taskbar, tray,
+            // its flyouts, Start/search/notification surfaces and pop-up menus
+            // keep the picture where it is; a real program in front still does not.
+            char cls[96] = {};
+            GetClassNameA(fg, cls, sizeof cls);
+            static const char *const kShell[] = {
+                "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "NotifyIconOverflowWindow",
+                "TopLevelWindowForOverflowXamlIsland", "XamlExplorerHostIslandWindow",
+                "Windows.UI.Core.CoreWindow", "#32768", "TaskListThumbnailWnd",
+                "Xaml_WindowedPopupClass", "ForegroundStaging" };
+            for (const char *k : kShell)
+                if (strcmp(cls, k) == 0) { ours = true; break; }
+            if (!ours)
+            {
+                char exe[MAX_PATH] = "?";
+                if (HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))
+                {
+                    DWORD n = MAX_PATH;
+                    if (QueryFullProcessImageNameA(ph, 0, exe, &n) == FALSE) strcpy_s(exe, "?");
+                    CloseHandle(ph);
+                }
+                const char *base = strrchr(exe, '\\');
+                snprintf(fg_who, sizeof fg_who, "%s, window class %s", base ? base + 1 : exe, cls);
+            }
+        }
+        static ULONGLONG lost_since = 0;
+        if (ours) lost_since = 0;
+        else
+        {
+            const ULONGLONG now = GetTickCount64();
+            if (lost_since == 0) lost_since = now;
+            game_fg = now - lost_since < 400;
+        }
+    }
+    const bool console = g_bw_console.load(), peek = g_bw_peek.load();
+    const bool panel = g_bw_panel.load();   // BT5: the panel is drawn on the picture itself - stay on top
+    const bool aside = console || peek;
+    const bool want = shown && game_fg && !aside;
+    // BT2: for the console or a peek the picture goes right BEHIND the game's
+    // window rather than to the bottom - so it still covers the desktop and
+    // whatever else is open - and with the console open the Windows magnifier
+    // enlarges the game's window to fill the monitor (SC9, ScalerConsole=0 off).
+    const bool behind = shown && game_fg && aside;
+    {
+        // BT3/BT4: the Windows magnifier enlarges the WHOLE desktop, every
+        // monitor - with a second screen it showed part of the game and the
+        // desktop there (2026-11-14, twice: BT3's one-monitor test still read
+        // ON on that two-screen rig). So in this mode the zoom is OFF unless
+        // mgpu.ini says ScalerConsole=1; the line logs what decided it.
+        static int zoom_cfg = -1;
+        if (zoom_cfg < 0)
+        {
+            const bool has = ini_has_key("ScalerConsole");
+            const bool val = has && ini_read_flag("ScalerConsole");
+            zoom_cfg = (has && val) ? 1 : 0;
+            char l[420];
+            snprintf(l, sizeof l, "[MGPU][BT4] console zoom in this mode: %s (ScalerConsole %s; Windows counts %d "
+                     "monitor(s)). The Windows magnifier enlarges every monitor at once, so it is off unless asked "
+                     "for: the console stays in the game's window, with the picture behind it.",
+                     zoom_cfg ? "ON" : "OFF", has ? (val ? "=1 in mgpu.ini" : "=0 in mgpu.ini") : "not set",
+                     GetSystemMetrics(SM_CMONITORS));
+            mgpu::diag::info(l);
+        }
+        const bool want_mag = console && game_fg && zoom_cfg == 1;
+        if (want_mag != g_sc_mag_on) sc_magnify(want_mag);
+    }
+    static bool was_behind = false;
+    if (behind)
+    {
+        // Directly under the game's window; re-placed if anything gets between.
+        if (!was_behind || GetWindow(g_game_hwnd, GW_HWNDNEXT) != w)
+        {
+            if (GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOPMOST)
+                SetWindowPos(w, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            SetWindowPos(w, g_game_hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        }
+    }
+    if (behind != was_behind)
+    {
+        char l[260];
+        snprintf(l, sizeof l, "[MGPU][BT2] picture %s.", behind ? (console ? "behind the game's window for the ReShade "
+                 "console (it still covers the desktop)" : "behind the game's window (CTRL+ALT+F6)") :
+                 "no longer held behind the game's window");
+        mgpu::diag::info(l);
+    }
+    was_behind = behind;
+    if (want)
+    {
+        bool game_above = false;
+        for (HWND z = GetWindow(w, GW_HWNDPREV); z != nullptr; z = GetWindow(z, GW_HWNDPREV))
+            if (z == g_game_hwnd) { game_above = true; break; }
+        if (!g_bw_top || game_above || !(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOPMOST))
+            SetWindowPos(w, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+    else if (g_bw_top && !behind)
+    {
+        // Another program in front (or no picture yet): out of the way entirely.
+        SetWindowPos(w, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(w, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    if (want != g_bw_top)
+    {
+        char l[400];
+        char other[220];
+        snprintf(other, sizeof other, "stepped aside (another program is in front: %s - click the game to bring "
+                 "the picture back)", fg_who[0] ? fg_who : "?");
+        snprintf(l, sizeof l, "[MGPU][BT1] picture %s.", want ? "on top of the game's window" :
+                 (!shown ? "not live yet - the game's window stays in front" :
+                  aside ? "behind the game's window (ReShade console or CTRL+ALT+F6)" : other));
+        mgpu::diag::info(l);
+    }
+    g_bw_top = want;
+    g_bw_top_pub.store(want);
+    // BT5: while the panel is up on the picture the real pointer moves freely
+    // over it (not confined to the game's window, not drawn by MC1).
+    mgpu::cursormap::tick(want && !panel);
+    static bool was_panel = false;
+    if (panel != was_panel)
+    {
+        mgpu::diag::info(panel ? "[MGPU][BT5] ReShade panel open on the picture (full screen, the bridge window's own "
+                                 "runtime): the mouse goes to the panel, the game's window stays behind."
+                               : "[MGPU][BT5] ReShade panel closed: the mouse goes back to the game.");
+        was_panel = panel;
+    }
+}
+bool bw_active() { return g_bw_on.load(); }
+bool bw_on_top() { return g_bw_top_pub.load(); }
+bool bw_panel() { return g_bw_panel.load(); }
+void bw_set_panel(bool up) { g_bw_panel.store(up); }
+void bw_set_aside(bool on) { g_bw_console.store(on); }
+bool bw_peek_toggle()   // true = the picture is on screen after the call
+{
+    const bool now_peek = !g_bw_peek.load();
+    g_bw_peek.store(now_peek);
+    return !now_peek;
+}
+// The bridge window's procedure, same (bridge) thread. True = handled.
+bool bw_mouse(HWND self, UINT msg, WPARAM wp, LPARAM lp, LRESULT *res)
+{
+    if (!g_bw_on.load() || g_sc_panel.load()) return false;
+    if (msg == WM_MOUSEACTIVATE) { *res = MA_NOACTIVATE; return true; }   // never activated, panel or not
+    if (g_bw_panel.load()) return false;   // BT5: the panel on this window's runtime takes the mouse
+    HWND g = g_game_hwnd;
+    if (g == nullptr || !IsWindow(g)) return false;
+    switch (msg)
+    {
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT && (mgpu::cursormap::installed() || hide_pointer_cfg())) { SetCursor(nullptr); *res = TRUE; return true; }
+        return false;
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+    case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
+    {
+        POINT p{ (LONG)(short)LOWORD(lp), (LONG)(short)HIWORD(lp) };
+        ClientToScreen(self, &p);
+        ScreenToClient(g, &p);
+        PostMessageW(g, msg, wp, MAKELPARAM((WORD)(short)p.x, (WORD)(short)p.y));
+        *res = (msg >= WM_XBUTTONDOWN && msg <= WM_XBUTTONDBLCLK) ? TRUE : 0;
+        return true;
+    }
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+        PostMessageW(g, msg, wp, lp);   // screen coordinates already
+        *res = 0;
+        return true;
+    default:
+        return false;
+    }
+}
+
 static thread_local D3D12_RESOURCE_STATES t_fg_rest = D3D12_RESOURCE_STATE_COMMON;
 // FIX8: what the last present_frame call on THIS thread left on the GPU.
 //   0          nothing submitted (failed before ExecuteCommandLists)
@@ -926,6 +1488,111 @@ static double pf_pct(const unsigned *h, unsigned nb, double w, unsigned n, doubl
     for (unsigned i = 0; i < nb; ++i) { acc += h[i]; if (acc >= want) return (i + 1) * w; }
     return nb * w;
 }
+static void nvml_start();                          // DR8: defined with the NVML thread
+static void pf_nvx_append(char *out, size_t n);    // DR8: both cards' clocks/power/temp for PF1
+// ---- GB1: the neural card's time budget, stage by stage ----
+// Per finished neural-stage list (stream thread): ms spent on each stage,
+// from the list's own timestamps (P2.2 marks 0-4) plus two around the DLSS SR
+// evaluate (GB1's own heap). Reported every 10 s next to PF1 as a share of
+// each second, with the AMD call and composition (AC3 marks), the rest of the
+// neural-stage queue (NVIDIA frame generation's own work when it runs) and the
+// present queues (scaling, HUD, showing every frame), so the part nothing
+// accounts for is visible. GpuBudget=0 turns it off.
+static std::mutex g_gb_mx;
+static double g_gb_unpack = 0, g_gb_nr = 0, g_gb_sr = 0, g_gb_post_sr = 0, g_gb_post = 0, g_gb_list = 0;
+static unsigned g_gb_n = 0, g_gb_n_sr = 0;
+// GB4: the unpack (P2.2 marks 0-2) in five: the header read from the shared
+// buffer (0-1), the input's transitions (1-B), depth (B-C), MVec (C-D) and the
+// synthetic vector field (D-2).
+static double g_gb_hdr = 0, g_gb_u[4] = {0, 0, 0, 0};
+static unsigned g_gb_u_n = 0;
+// GB5: per evaluated frame, did the copy queue carry the unpack or did it fall
+// back to the inline copy on the neural queue (and why: queue off, or this
+// frame's copy-queue submission did not land in the half being read)?
+static std::atomic<unsigned> g_gb_cq_yes{0}, g_gb_cq_fallback{0}, g_gb_cq_off{0};
+static void gb_note_unpack(double hdr, const double u[4])
+{
+    std::lock_guard<std::mutex> lk(g_gb_mx);
+    g_gb_hdr += hdr;
+    if (u[0] >= 0.0) { for (int i = 0; i < 4; ++i) g_gb_u[i] += u[i]; ++g_gb_u_n; }
+}
+static void gb_note(double unpack, double nr, double sr, double post_sr, double post, double list, bool have_sr)
+{
+    std::lock_guard<std::mutex> lk(g_gb_mx);
+    g_gb_unpack += unpack; g_gb_nr += nr; g_gb_sr += sr; g_gb_post_sr += post_sr; g_gb_post += post; g_gb_list += list;
+    ++g_gb_n; if (have_sr) ++g_gb_n_sr;
+}
+int ui_frame_gen();
+static void gb_report(double dt, double real_fps, double shown_fps)
+{
+    static int on = -1;
+    if (on < 0) on = ui_ini_read("GpuBudget", 1) != 0 ? 1 : 0;
+    if (on == 0 || dt <= 0.0) return;
+    double unpack, nr, sr, post_sr, post, list; unsigned n, n_sr;
+    double hdr, uu[4]; unsigned un;   // GB4
+    {
+        std::lock_guard<std::mutex> lk(g_gb_mx);
+        hdr = g_gb_hdr; for (int i = 0; i < 4; ++i) { uu[i] = g_gb_u[i]; g_gb_u[i] = 0.0; } un = g_gb_u_n;
+        g_gb_hdr = 0.0; g_gb_u_n = 0;
+        unpack = g_gb_unpack; nr = g_gb_nr; sr = g_gb_sr; post_sr = g_gb_post_sr; post = g_gb_post; list = g_gb_list;
+        n = g_gb_n; n_sr = g_gb_n_sr;
+        g_gb_unpack = g_gb_nr = g_gb_sr = g_gb_post_sr = g_gb_post = g_gb_list = 0.0; g_gb_n = g_gb_n_sr = 0;
+    }
+    static double nq_last = -1.0, pq_last = -1.0;
+    double nq_s = 0.0, pq_s = 0.0;
+    const bool haveq = mgpu::gputime::queue_seconds(g_gt_nrq.load(std::memory_order_relaxed), &nq_s, &pq_s);
+    double nq = -1.0, pq = -1.0;   // ms per second
+    if (haveq && nq_last >= 0.0 && nq_s >= nq_last && pq_s >= pq_last)
+    { nq = (nq_s - nq_last) * 1000.0 / dt; pq = (pq_s - pq_last) * 1000.0 / dt; }
+    if (haveq) { nq_last = nq_s; pq_last = pq_s; }
+    if (n == 0) return;
+    const double per = 1.0 / (dt * 10.0);   // ms in the window -> % of each second
+    const int fg = ui_frame_gen();
+    double amd = -1.0, comp = -1.0;
+    if (fg == 3)
+    {
+        const double c = g_ac_ms_call.load(std::memory_order_relaxed), m = g_ac_ms_comp.load(std::memory_order_relaxed);
+        if (c >= 0.0) amd = c * real_fps / 10.0;    // ms per real frame x real frames/s -> %
+        if (m >= 0.0) comp = m * real_fps / 10.0;
+    }
+    const double listp = list * per;
+    double rest_nq = -1.0;   // the neural-stage queue beyond the NR list and AMD's call: NVIDIA FG, other lists
+    if (nq >= 0.0) { rest_nq = nq / 10.0 - listp - (amd > 0.0 ? amd : 0.0) - (comp > 0.0 ? comp : 0.0); if (rest_nq < 0.0) rest_nq = 0.0; }
+    double busy = -1.0;
+    const bool hb = mgpu::gputime::busy(&busy);
+    const double measured = (nq >= 0.0 ? nq / 10.0 : listp + (amd > 0 ? amd : 0) + (comp > 0 ? comp : 0)) + (pq >= 0.0 ? pq / 10.0 : 0.0);
+    char a[160] = "", r[200] = "", q[120] = "", b[200] = "";
+    if (amd >= 0.0) snprintf(a, sizeof a, " | AMD frame generation %.1f%% | composition %.1f%%", amd, comp >= 0.0 ? comp : 0.0);
+    if (rest_nq >= 0.0) snprintf(r, sizeof r, " | other neural-queue work%s %.1f%%", fg == 4 ? " (NVIDIA frame generation)" : "", rest_nq);
+    if (pq >= 0.0) snprintf(q, sizeof q, " | presenting + scaling to the screen %.1f%% (%.2f ms per shown frame)", pq / 10.0,
+                            shown_fps > 0.0 ? pq / shown_fps : 0.0);
+    char bz[16] = "-";
+    if (hb) snprintf(bz, sizeof bz, "%d%%", (int)(busy * 100.0 + 0.5));
+    snprintf(b, sizeof b, " | measured %.0f%%, timestamps say busy %s - the rest of PF1's driver-busy is work outside these lists or gaps between them",
+             measured, bz);
+    char l[1300];
+    snprintf(l, sizeof l, "[MGPU][GB1] neural card, share of each second over %.0f s (%u neural frames, %.1f real fps): "
+             "frame unpack %.1f%% | neural rendering %.1f%% (%.2f ms each) | %s %.1f%% (%.2f ms each) | colour/after-SR %.1f%% | "
+             "sample/HUD/other %.1f%%%s%s%s%s",
+             dt, n, real_fps, unpack * per, nr * per, nr / n,
+             n_sr ? "upscale (DLSS SR)" : "upscale (none in this list)", sr * per, n_sr ? sr / n_sr : 0.0,
+             post_sr * per, post * per, a, r, q, b);
+    mgpu::diag::info(l);
+    // GB4: where the unpack's time goes, per frame. GB5: and who did the copy.
+    const unsigned cy = g_gb_cq_yes.exchange(0u), cf = g_gb_cq_fallback.exchange(0u), co = g_gb_cq_off.exchange(0u);
+    char ul[900];
+    if (un > 0)
+        snprintf(ul, sizeof ul, "[MGPU][GB4] the frame unpack, ms per neural frame: header read from the shared buffer %.2f | "
+                 "input transitions %.2f | depth %.2f | motion vectors %.2f | vector field %.2f (%u of %u frames split) | "
+                 "GB5: copy queue carried the copy on %u frame(s), fell back to the inline copy on the neural queue on %u, "
+                 "copy queue off on %u. Inline, these three steps ARE the PCIe copies (about 15 MB each).",
+                 hdr / n, uu[0] / un, uu[1] / un, uu[2] / un, uu[3] / un, un, n, cy, cf, co);
+    else
+        snprintf(ul, sizeof ul, "[MGPU][GB4] the frame unpack, ms per neural frame: header read from the shared buffer %.2f | "
+                 "the rest %.2f (not split this window)", hdr / n, (unpack - hdr) / n);
+    mgpu::diag::info(ul);
+}
+
 static void perf_present(unsigned long long evals, unsigned long long gens)
 {
     if (!g_pf_on.load(std::memory_order_relaxed))
@@ -937,7 +1604,13 @@ static void perf_present(unsigned long long evals, unsigned long long gens)
     LARGE_INTEGER now{}, fq{};
     QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
     if (fq.QuadPart == 0) return;
-    char line[600]; line[0] = 0;
+    {   // DR8: keep the NVML thread sampling while PF1 is on (it idles 5 s after the last ask)
+        static ULONGLONG asked = 0;
+        const ULONGLONG t = GetTickCount64();
+        if (t - asked >= 1000ull) { asked = t; nvml_start(); }
+    }
+    char line[1400]; line[0] = 0;
+    double gb_dt = 0.0, gb_real = 0.0, gb_shown = 0.0;   // GB1
     {
         std::lock_guard<std::mutex> lk(g_pf_mx);
         if (g_pf_last != 0)
@@ -973,16 +1646,57 @@ static void perf_present(unsigned long long evals, unsigned long long gens)
                  g_pf_iv_n / dt, iv_avg, std::sqrt(var), (std::min)(pf_pct(g_pf_iv_hist, 250u, 0.1, g_pf_iv_n, 0.99), g_pf_iv_max),
                  g_pf_iv_max, hitch,
                  (double)(evals - g_pf_eval0) / dt, (double)(gens - g_pf_gen0) / dt, rep_d);
+        { const size_t used = strlen(line); pf_nvx_append(line + used, sizeof line - used); }   // DR8
+        gb_dt = dt; gb_real = (double)(evals - g_pf_eval0) / dt; gb_shown = g_pf_iv_n / dt;   // GB1
         std::memset(g_pf_nr_hist, 0, sizeof g_pf_nr_hist); std::memset(g_pf_iv_hist, 0, sizeof g_pf_iv_hist);
         g_pf_nr_sum = g_pf_nr_max = 0.0; g_pf_nr_n = g_pf_nr_over = 0;
         g_pf_iv_sum = g_pf_iv_sq = g_pf_iv_max = 0.0; g_pf_iv_n = 0;
         g_pf_t0 = now.QuadPart; g_pf_gen0 = gens; g_pf_eval0 = evals;
     }
     if (line[0] != 0) mgpu::diag::info(line);
+    if (gb_dt > 0.0) gb_report(gb_dt, gb_real, gb_shown);   // GB1
 }
 // FG2: present_frame is called from two threads while frame generation runs;
 // one present at a time.
 static std::mutex g_present_mx;
+
+#if defined(ATOMIC_COMMUNITY_20FPS)
+// Community Edition: intentionally cap the BRIDGE's final presentation rate
+// (real AND generated frames) to <= 20 submitted frames/s. This is not a game
+// render-rate cap and is not a licensing/security boundary: MIT source can be
+// modified and rebuilt. Called only while g_present_mx is held, so the timer is
+// serialized across both the ordinary worker and the FG presentation thread.
+// QPC is monotonic and unaffected by wall-clock adjustments.
+static void community_pace_present_20fps()
+{
+    static LARGE_INTEGER frequency = {};
+    static LONGLONG last_start = 0;
+    if (frequency.QuadPart == 0 && !QueryPerformanceFrequency(&frequency))
+        return;
+    if (frequency.QuadPart <= 0) return;
+
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    // Round UP so a nominal 20 FPS never asks for less than 50 ms.
+    const LONGLONG min_ticks = (frequency.QuadPart + 19) / 20;
+    if (last_start > 0 && now.QuadPart > last_start &&
+        now.QuadPart - last_start < min_ticks)
+    {
+        const LONGLONG due = last_start + min_ticks;
+        while (now.QuadPart < due)
+        {
+            const LONGLONG remaining = due - now.QuadPart;
+            const DWORD sleep_ms = static_cast<DWORD>((remaining * 1000) / frequency.QuadPart);
+            // Do not busy-spin the last millisecond, but avoid oversleeping
+            // larger intervals unnecessarily. Windows timer resolution still
+            // affects achieved frame rate; this sets a ceiling, not a guarantee.
+            Sleep(sleep_ms > 1 ? sleep_ms - 1 : 1);
+            QueryPerformanceCounter(&now);
+        }
+    }
+    last_start = now.QuadPart;
+}
+#endif
 
 // ---- FIX7 (audit 2026-10-10): who may write an FG buffer set ----
 //
@@ -1000,6 +1714,29 @@ static std::atomic<unsigned> g_fg_set_busy[3] = {};
 static std::atomic<unsigned long long> g_fg_set_fence[3] = {};
 static std::atomic<ID3D12Fence *> g_fg_pfence{nullptr};   // present fence, AddRef'd
 static std::atomic<unsigned long long> g_fg_set_skips{0};
+// FD2: why a real frame got no in-between frames (read-only counters; the NR
+// thread writes them, FD1's report on the present thread reads them).
+enum fd2_reason : unsigned
+{
+    FD2_MADE = 0,          // generated
+    FD2_NOT_RUN,           // generation not run: NR pass failed, profiling, present mode or menu pass-through
+    FD2_SET_BUSY,          // FIX7: the set to write was still being shown
+    FD2_THIS_ORDINARY,     // this frame has no HUD-less copy, the one before had one
+    FD2_PREV_ORDINARY,     // this frame is HUD-less, the one before had no HUD-less copy
+    FD2_BROKEN_SET_BUSY,   // the pair was broken one frame earlier by a busy set
+    FD2_BROKEN_ORDINARY,   // ... by a switch to a frame without a HUD-less copy
+    FD2_BROKEN_NOT_RUN,    // ... by a frame generation did not run on
+    FD2_BROKEN_OTHER,      // ... by a start, restart or settings change
+    FD2_NO_MV,             // no usable motion vectors this frame
+    FD2_NO_DEPTH,          // no depth this frame
+    FD2_NO_BUFFER,         // previous frame not readable or no output buffer
+    FD2_FG_CALL,           // the generator was asked and made nothing
+    FD2_EARLY,             // nothing to work from (no frame, size changed)
+    FD2_N
+};
+static std::atomic<unsigned long long> g_fd2[FD2_N];
+static unsigned g_fd2_break = FD2_BROKEN_OTHER;   // NR thread only: why the pair was last broken
+static inline void fd2_count(unsigned r) { g_fd2[r].fetch_add(1, std::memory_order_relaxed); }
 static std::atomic<unsigned long long> g_fg_presented{0};
 
 static bool fg_set_writable(unsigned k)
@@ -1121,6 +1858,7 @@ void dcomp_set_visible(bool on)
 // V52. CTRL+ALT+F6. Returns whether the bridge is on screen AFTER the call.
 bool dcomp_peek_toggle()
 {
+    if (g_bw_on.load()) return bw_peek_toggle();   // BT1: the bridge window is the picture on top
     if (g_dcomp_target == nullptr || g_dcomp_visual == nullptr || g_dcomp_device == nullptr)
         return true;   // not composing: nothing is covering the overlay anyway
     return dcomp_set_rooted(!g_dcomp_rooted, "peek");
@@ -1186,8 +1924,9 @@ bool create_present_chain(HWND hwnd)
     bool lp1 = false;            // LP1: chain created waitable
     UINT chain_flags = 0;        // LP1: the flags it was created with
     ID3D12DescriptorHeap *heap = nullptr;
-    ID3D12Resource *back0 = nullptr;
-    ID3D12Resource *back1 = nullptr;
+    ID3D12Resource *back[MAX_BB] = {};   // PB1
+    // PB1: PresentBuffers, 2..6; 2 (no line) is the chain as it always was.
+    const unsigned nbb = [] { int v = ui_ini_read("PresentBuffers", 6);   /* PB2: 6 by default (2026-11-09 runs: ~3x fewer slow Presents, no added delay) */ return (unsigned)(v < 2 ? 2 : v > (int)MAX_BB ? (int)MAX_BB : v); }();
     // D6: one per ring slot. Created together, released together, published
     // together - so a partial failure cannot leave the state holding two of
     // three and nothing saying so.
@@ -1209,8 +1948,8 @@ bool create_present_chain(HWND hwnd)
             if (cl[i] != nullptr)        { cl[i]->Release();        cl[i] = nullptr; }
             if (allocator[i] != nullptr) { allocator[i]->Release(); allocator[i] = nullptr; }
         }
-        if (back1 != nullptr)     { back1->Release(); back1 = nullptr; }
-        if (back0 != nullptr)     { back0->Release(); back0 = nullptr; }
+        for (unsigned i = MAX_BB; i-- > 0;)   // PB1
+            if (back[i] != nullptr) { back[i]->Release(); back[i] = nullptr; }
         if (heap != nullptr)      { heap->Release(); heap = nullptr; }
         if (sc3 != nullptr)       { sc3->Release(); sc3 = nullptr; }
         if (sc1 != nullptr)       { sc1->Release(); sc1 = nullptr; }
@@ -1289,6 +2028,7 @@ bool create_present_chain(HWND hwnd)
                                                reinterpret_cast<void **>(&factory));
         if (FAILED(fhr))
             return fail("CreateDXGIFactory2", fhr);
+        mgpu::hookprobe::init(static_cast<IUnknown *>(queue));   // SO5: who has hooked Present (logged once, then on change)
 
         // SL4. Read-only: one documented QueryInterface, reference released.
         mgpu::slprobe::report_object("bridge DXGI factory", factory);
@@ -1315,7 +2055,7 @@ bool create_present_chain(HWND hwnd)
         scd.SampleDesc.Count = 1;
         scd.SampleDesc.Quality = 0;
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        scd.BufferCount = 2;
+        scd.BufferCount = nbb;   // PB1 (2 = as before)
         scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         scd.Scaling = DXGI_SCALING_STRETCH;
         scd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
@@ -1368,6 +2108,21 @@ bool create_present_chain(HWND hwnd)
 
         if (want_dcomp)
         {
+            // DF1 (experiment): DcompOpaque=1 declares the layer opaque, so the
+            // compositor may lift it onto a hardware plane (direct flip) instead
+            // of composing it every refresh. UNSPECIFIED (0, as before) leaves
+            // Windows assuming what is under it may show through.
+            const bool df_opaque = ui_ini_read("DcompOpaque", 0) == 1;
+            if (df_opaque) scd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+            {
+                char dl[420];
+                snprintf(dl, sizeof dl, "[MGPU][DF1] overlay layer: %ux%u, format %d, %u buffers, alpha %s (DcompOpaque=%d). "
+                         "Check with PresentMon: \"Composed: Flip\" = the desktop compositor draws every frame; "
+                         "\"Hardware Composed: Independent Flip\" = Windows put the layer on its own plane.",
+                         scd.Width, scd.Height, (int)scd.Format, scd.BufferCount,
+                         df_opaque ? "IGNORE (opaque)" : "UNSPECIFIED", df_opaque ? 1 : 0);
+                mgpu::diag::info(dl);
+            }
             swapchain_hr = factory->CreateSwapChainForComposition(
                 static_cast<IUnknown *>(queue), &scd, nullptr, &sc1);
             if (FAILED(swapchain_hr))
@@ -1607,7 +2362,7 @@ bool create_present_chain(HWND hwnd)
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        hd.NumDescriptors = 2;
+        hd.NumDescriptors = MAX_BB;   // PB1: room for any count, so a resize never needs a new heap
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         const HRESULT hr = dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap));
         if (FAILED(hr))
@@ -1621,21 +2376,19 @@ bool create_present_chain(HWND hwnd)
     {
         const UINT rtv_size =
             dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        const HRESULT hr0 = sc3->GetBuffer(0, __uuidof(ID3D12Resource),
-                                           reinterpret_cast<void **>(&back0));
-        if (FAILED(hr0))
-            return fail("GetBuffer(0)", hr0);
-        // CreateRenderTargetView returns void - there is no HRESULT to
-        // check. A bad argument surfaces on the debug layer, not here.
-        dev->CreateRenderTargetView(
-            back0, nullptr, heap->GetCPUDescriptorHandleForHeapStart());
-        const HRESULT hr1 = sc3->GetBuffer(1, __uuidof(ID3D12Resource),
-                                           reinterpret_cast<void **>(&back1));
-        if (FAILED(hr1))
-            return fail("GetBuffer(1)", hr1);
-        D3D12_CPU_DESCRIPTOR_HANDLE h1{};
-        h1.ptr = heap->GetCPUDescriptorHandleForHeapStart().ptr + rtv_size;
-        dev->CreateRenderTargetView(back1, nullptr, h1);
+        // PB1: one per buffer the chain has (nbb, 2..6).
+        for (unsigned i = 0; i < nbb; ++i)
+        {
+            const HRESULT hb = sc3->GetBuffer(i, __uuidof(ID3D12Resource),
+                                              reinterpret_cast<void **>(&back[i]));
+            if (FAILED(hb))
+                return fail(i == 0 ? "GetBuffer(0)" : "GetBuffer(n)", hb);
+            // CreateRenderTargetView returns void - there is no HRESULT to
+            // check. A bad argument surfaces on the debug layer, not here.
+            D3D12_CPU_DESCRIPTOR_HANDLE hh{};
+            hh.ptr = heap->GetCPUDescriptorHandleForHeapStart().ptr + (SIZE_T)i * rtv_size;
+            dev->CreateRenderTargetView(back[i], nullptr, hh);
+        }
     }
 
     // 4. Command allocators + command lists, PRESENT_SLOTS of each (D6).
@@ -1704,8 +2457,8 @@ bool create_present_chain(HWND hwnd)
         S.chain_fmt = DXGI_FORMAT_R10G10B10A2_UNORM;   // must match scd.Format above
         S.swapchain = sc3;
         S.rtv_heap = heap;
-        S.backbuffer[0] = back0;
-        S.backbuffer[1] = back1;
+        for (unsigned i = 0; i < MAX_BB; ++i) S.backbuffer[i] = back[i];   // PB1
+        S.bb_count = nbb;
         for (unsigned i = 0; i < state::PRESENT_SLOTS; ++i)
         {
             S.allocator[i] = allocator[i];
@@ -1728,8 +2481,7 @@ bool create_present_chain(HWND hwnd)
         queue = nullptr;
         sc3 = nullptr;
         heap = nullptr;
-        back0 = nullptr;
-        back1 = nullptr;
+        for (unsigned i = 0; i < MAX_BB; ++i) back[i] = nullptr;   // PB1
         for (unsigned i = 0; i < state::PRESENT_SLOTS; ++i)
         { allocator[i] = nullptr; cl[i] = nullptr; }
         fence = nullptr;
@@ -1743,9 +2495,10 @@ bool create_present_chain(HWND hwnd)
              // created R10G10B10A2 - the string was never updated when P5.0
              // changed scd.Format. A log line that contradicts the code is worse
              // than no log line: it is evidence pointing the wrong way.
-             "[MGPU][T5] present chain created: format=DXGI_FORMAT_R10G10B10A2_UNORM buffers=2 "
+             "[MGPU][T5] present chain created: format=DXGI_FORMAT_R10G10B10A2_UNORM buffers=%u%s "
              "swapeffect=FLIP_DISCARD queue=DIRECT client=%ux%u CreateSwapChainForHwnd "
              "hr=0x%08X hwnd=0x%p (vsync present, non-resizable window - no ResizeBuffers at P0)",
+             nbb, " (PresentBuffers)",
              width, height, (unsigned)swapchain_hr, (void *)hwnd);
     mgpu::diag::info(line);
     return true;
@@ -1847,7 +2600,8 @@ bool present_frame(float r, float g, float b)
     ID3D12CommandQueue *queue = nullptr;
     IDXGISwapChain3 *sc = nullptr;
     ID3D12DescriptorHeap *heap = nullptr;
-    ID3D12Resource *backbuffer[2] = {};
+    ID3D12Resource *backbuffer[MAX_BB] = {};   // PB1
+    unsigned bb_count = 2;
     // D6: the slot this call will use, and the fence value that slot last
     // carried. slot is derived from fence_value, so it advances with the
     // submissions rather than with a counter that could drift from them.
@@ -1868,8 +2622,8 @@ bool present_frame(float r, float g, float b)
         queue = S.queue;
         sc = S.swapchain;
         heap = S.rtv_heap;
-        backbuffer[0] = S.backbuffer[0];
-        backbuffer[1] = S.backbuffer[1];
+        for (unsigned i = 0; i < MAX_BB; ++i) backbuffer[i] = S.backbuffer[i];   // PB1
+        bb_count = S.bb_count;
         fence = S.fence;
         event = S.fence_event;
         fence_value = S.fence_value;
@@ -1887,6 +2641,13 @@ bool present_frame(float r, float g, float b)
     // never hangs the present thread (it then presents as before).
     if (lat_wait != nullptr)
         (void)WaitForSingleObjectEx(lat_wait, 100, TRUE);
+
+#if defined(ATOMIC_COMMUNITY_20FPS)
+    // Both the normal worker and FG presenter reach this point. Limiting here
+    // prevents an INI option, UI setting, or automatic FG multiplier from
+    // bypassing the Community Edition's final 20-FPS presentation ceiling.
+    community_pace_present_20fps();
+#endif
 
     char line[800];   // P5.3 widened: the Present=in banner is longer than 320 and a
                       // truncated banner is a wrong label on a whole run
@@ -1922,9 +2683,9 @@ bool present_frame(float r, float g, float b)
     // GetCurrentBackBufferIndex takes NO parameters and returns UINT
     // directly; it is not an HRESULT call.
     const UINT index = sc->GetCurrentBackBufferIndex();
-    if (index >= 2)
+    if (index >= bb_count || backbuffer[index] == nullptr)   // PB1
     {
-        // Cannot happen with BufferCount 2. Guarded because the index
+        // Cannot happen with the chain's own BufferCount. Guarded because the index
         // feeds both a descriptor offset and backbuffer[], and a wrong
         // one would be a silent out-of-bounds read.
         return fail("GetCurrentBackBufferIndex (index out of range)", index);
@@ -2428,6 +3189,8 @@ bool present_frame(float r, float g, float b)
             // first moment the bridge has anything worth covering the game
             // with. No-op in mode 0, where there is no visual.
             dcomp_root_on_first_neural_frame();
+            hw_reveal("the first neural frame");   // HW1
+            g_gf_want.store(2, std::memory_order_relaxed);   // GF1 (also with BridgeShowIdle=1 / DcompOverlay=1)
             snprintf(line, sizeof line,
                      "[MGPU][P5.0] the bridge window is now showing the %s - %s of the %ux%u "
                      "frame at %ux%u, one CopyTextureRegion, no resampling in this add-on. The "
@@ -2507,6 +3270,10 @@ bool present_frame(float r, float g, float b)
         const char *sl1 = MGPU_IDLE_L1;
         const char *sl2 = MGPU_IDLE_L2;
         present_screen_state(sst, sl1, sl2);
+        tray_note_screen(sst, sl1, sl2);   // TR1
+        // HW1: an error, or the AutoArm-off notice, must be seen.
+        if (sst == mgpu::screen::st_error || (sl2 != nullptr && strcmp(sl2, MGPU_S206_L2) == 0))
+            hw_reveal(sst == mgpu::screen::st_error ? "an error screen" : "the AutoArm-off notice");
 
         UINT sw = 0, sh = 0;
         {
@@ -2580,6 +3347,14 @@ bool present_frame(float r, float g, float b)
     // the trade, and it is the user's to make, not ours to make silently.
     const UINT pi_interval = (g_present_vsync.load(std::memory_order_relaxed) != 0u) ? 1u : 0u;
     (void)mgpu::hdr::sync_colour_space(sc, hdr_applied);   // HD1: HDR10 only for a converted frame
+    g_tray_presents.fetch_add(1, std::memory_order_relaxed);   // TR1: the frame rate on the tray icon
+    if (!g_hw_revealed.load(std::memory_order_relaxed))      // HW1 safety net: whichever thread presents it
+    {
+        bool ns = false;
+        { std::lock_guard<std::mutex> lk(S.cs); ns = S.neural_shown; }
+        if (ns) hw_reveal("the first neural frame");
+    }
+    mgpu::crashlog::present_begin();   // SO5: this thread is presenting (the guard's evidence)
     hr = sc->Present(pi_interval, 0);
     mgpu::crashlog::note_present(1, (long)hr);   // SO2: the bridge's own present, for judging an overlay step-over
     if (FAILED(hr))
@@ -2590,6 +3365,7 @@ bool present_frame(float r, float g, float b)
     // treating it as displayed output would inflate the final FPS score.
     if (hr == S_OK)
     {
+        mgpu::gamepresent::bridge_presented();   // GP1: the bridge is up, the game's own Present may be skipped
         {   // DR3: the longest gap between shown frames since the last check
             LARGE_INTEGER pq{}; QueryPerformanceCounter(&pq);
             const long long prev = g_pres_last_qpc.exchange(pq.QuadPart, std::memory_order_relaxed);
@@ -2739,7 +3515,7 @@ void shutdown()
     ID3D12CommandQueue *queue = nullptr;
     IDXGISwapChain3 *sc = nullptr;
     ID3D12DescriptorHeap *heap = nullptr;
-    ID3D12Resource *backbuffer[2] = {};
+    ID3D12Resource *backbuffer[MAX_BB] = {};   // PB1
     ID3D12CommandAllocator *allocator[state::PRESENT_SLOTS] = {};   // D6
     ID3D12GraphicsCommandList *cl[state::PRESENT_SLOTS] = {};
     ID3D12Fence *fence = nullptr;
@@ -2753,8 +3529,7 @@ void shutdown()
         queue = S.queue;
         sc = S.swapchain;
         heap = S.rtv_heap;
-        backbuffer[0] = S.backbuffer[0];
-        backbuffer[1] = S.backbuffer[1];
+        for (unsigned i = 0; i < MAX_BB; ++i) backbuffer[i] = S.backbuffer[i];   // PB1
         for (unsigned i = 0; i < state::PRESENT_SLOTS; ++i)
         {
             allocator[i] = S.allocator[i];
@@ -2771,8 +3546,7 @@ void shutdown()
         lat_wait_close = S.lat_wait;   // LP1: closed once the chain is gone
         S.lat_wait = nullptr; S.chain_flags = 0;
         S.rtv_heap = nullptr;
-        S.backbuffer[0] = nullptr;
-        S.backbuffer[1] = nullptr;
+        for (unsigned i = 0; i < MAX_BB; ++i) S.backbuffer[i] = nullptr;   // PB1
         S.fence = nullptr;
         S.fence_event = nullptr;
         S.fence_value = 0;
@@ -2828,10 +3602,9 @@ void shutdown()
             if (cl[i] != nullptr)        cl[i]->Release();
             if (allocator[i] != nullptr) allocator[i]->Release();
         }
-        if (backbuffer[1] != nullptr)
-            backbuffer[1]->Release();
-        if (backbuffer[0] != nullptr)
-            backbuffer[0]->Release();
+        for (unsigned i = MAX_BB; i-- > 0;)   // PB1
+            if (backbuffer[i] != nullptr)
+                backbuffer[i]->Release();
         heap->Release();
         sc->Release();
         if (lat_wait_close != nullptr) CloseHandle(lat_wait_close);   // LP1
@@ -4143,7 +4916,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
             "that binds NGX's cubin layer to the GAME's adapter before this add-on's thread even "
             "exists - which is what makes CreateFeature fault on the second adapter. MOVE "
             "nvngx_dlssnr.dll INTO THE mgpu FOLDER beside the add-on and delete the copy next to "
-            "the exe. This is the 0.1.0 layout and it is the bug.");
+            "the exe. This is the old install layout and it is the bug.");
     else if (mods.snippet != nullptr)
         mgpu::diag::info(
             "[MGPU][P1.0c] no copy of nvngx_dlssnr.dll beside the executable - the title cannot "
@@ -9642,6 +10415,11 @@ namespace
         // transit time in GPU time would need - is a separate step and is
         // deliberately not taken here.
         ID3D12QueryHeap *tsheap = nullptr;
+        ID3D12QueryHeap *gb_heap = nullptr;    // GB1: 2 marks around the DLSS SR evaluate; GB4: 3 more in the unpack
+        ID3D12Resource *gb_read = nullptr;     // GB1: READBACK, 40 bytes
+        bool gb_sr_marked = false;             // GB1: this list carries them
+        bool gb_sr_was = false;                // GB1: the list being read carried them
+        unsigned gb_u_marked = 0, gb_u_was = 0;   // GB4: unpack marks written (bit 0 = before depth, 1 = before MVec, 2 = before the field)
         ID3D12Resource *tsread = nullptr;      // READBACK, TS_MARKS * 8 bytes
         UINT64 ts_freq = 0;
         bool ts_ok = false;
@@ -9937,9 +10715,91 @@ namespace
         // BM1: the seal's hand-over time (qpc_submit) of the frame being consumed.
         unsigned long long cur_cap_qpc = 0;
         void *fsr_ctx = nullptr;               // ffxContext
+        // FD1: depth resampled to the vectors' size for AMD frame generation, which
+        // needs both at one size (RE Requiem: depth 2560x1440, vectors 1708x960).
+        ID3D12RootSignature  *fd_rs = nullptr;
+        ID3D12PipelineState  *fd_pso = nullptr;
+        ID3D12DescriptorHeap *fd_heap = nullptr;
+        UINT fd_inc = 0;
+        ID3D12Resource *fd_depth[2] = {};
+        ID3D12Resource *fd_src[2] = {};        // the tex_depth each SRV was written for
+        bool fd_on = false;
         bool fsr_up = false, fsr_failed = false;
         unsigned long long fsr_frame_id = 0, fsr_made = 0, fsr_errors = 0;
         LARGE_INTEGER fsr_last{};
+        // ---- AC1: AMD 4x by chaining a second context (FSRChain=1) ----
+        // Context A makes the 1/2 frame from the real pair as always. Context
+        // B is fed a stream twice as fast - the 1/2 frame, then the real one -
+        // with the game's vectors halved, so its own halfway frames are the
+        // 1/4 and 3/4. B keeps its own history, so it must be a separate context.
+        void *fsrb_ctx = nullptr;
+        bool fsrb_up = false, fsrb_failed = false;
+        unsigned long long fsrb_frame_id = 0, fsrb_errors = 0, ac_logged = 0;
+        mgpu::fsr_chain::state ac;             // AC3: B's history and the pair counts (fsr_chain.hpp)
+        float fsr_dt_ms = 16.6667f;            // A's last frame time, B gets half
+        unsigned long long fsr_prev_cap = 0;   // AC3: hand-over QPC of the frame A was last given
+        unsigned long long fsr_last_fid = 0;   // AC3: A's frame ID that went with it
+        // AC4: why AMD's frame time reused the last good value, by cause.
+        unsigned long long fsr_dt_missing = 0;   // a hand-over stamp was 0
+        unsigned long long fsr_dt_invalid = 0;   // stamps present, interval not increasing or outside 2-200 ms
+        unsigned long long fsr_dt_breaks = 0;    // A's frame sequence broke (incl. the first frame)
+        // AC3: B's two outputs, one each, so a 4x pair is composed only after
+        // both exist. UNORDERED_ACCESS at rest.
+        ID3D12Resource *fsrb_q = nullptr;      // the 1/4 frame
+        ID3D12Resource *fsrb_t = nullptr;      // the 3/4 frame
+        // SF1: the rebuilt AMD DLL (provider "...-mgpu1") makes all three frames of a
+        // 4x pair in ONE call from one optical flow, at 1/4, 1/2 and 3/4 between the
+        // two real frames, into fsrb_q / fsr_out / fsrb_t. Context B is not used then.
+        bool fsr_multi = false;                // the loaded provider accepts numGeneratedFrames 3
+        // SF2: AMD's own DLL makes 2x (context A); the rebuilt DLL, loaded beside it,
+        // gets its own context M used only for 4x. One frame counter feeds both; a
+        // context that missed the previous frame is told to reset.
+        int amd_mode = 0;                      // this frame: 0 = 2x, 1 = rebuilt (3x/4x), 2 = 4x chained
+        unsigned amd_gen = 1;                  // X3: in-between frames the rebuilt call makes (2 = 3x, 3 = 4x)
+        int amd_mode_logged = -1;
+        void *sfm_ctx = nullptr;               // context M (rebuilt DLL)
+        bool sfm_up = false, sfm_failed = false;
+        unsigned long long sfm_errors = 0;
+        int sfm_gen = 0, fsr_gen = 0;          // GV1: "-mgpu<N>" of contexts M and A (0 = not a rebuild)
+        int gv_q_m = -1, gv_t_m = -1, gv_q_a = -1, gv_t_a = -1;   // GV1: last values sent
+        bool fsr_a_prev = false, sfm_prev = false;   // used on the previous frame
+        bool sf_made = false;                  // this frame's call wrote all three
+        unsigned long long sf_pairs4 = 0, sf_pairs2 = 0, sf_logged = 0;
+        // AC3: GPU timestamps on the NR list - A, B 1/4, B 3/4, composition
+        // (begin/end each). Read only once the NR fence has passed the value
+        // signalled after the list that wrote them.
+        ID3D12QueryHeap *ac_tsheap = nullptr;
+        ID3D12Resource *ac_tsread = nullptr;   // READBACK, AC_RING x AC_TS x 8 bytes
+        bool ac_ts_tried = false, ac_ts_ok = false;
+        // AC4: stages - 0 A, 1 B 1/4, 2 B 3/4, 3 composition, 4 B prime -
+        // marks 2q (begin) and 2q+1 (end).
+        static const unsigned AC_TS = 10, AC_SEG = 5;
+        // AC4: a small fence-owned ring, so a list whose fence is late does not
+        // lose or mix its marks with the next list's. Each slot has its own
+        // region of the readback buffer.
+        static const unsigned AC_RING = 4;
+        unsigned ac_ts_mask = 0;               // marks written in the list being recorded
+        bool ac_ts_resolved = false;           // ... and resolved into slot ac_ts_res_slot
+        unsigned ac_ts_res_slot = 0, ac_ts_next_slot = 0;
+        unsigned long long ac_ts_pend_fv[AC_RING] = {};   // NR fence value after the list (0 = free)
+        unsigned ac_ts_pend_mask[AC_RING] = {};
+        unsigned long long ac_ts_lost = 0;     // records overwritten before their fence passed
+        unsigned long long ac_ts_win_res = 0, ac_ts_win_lost = 0;   // DR8: this SF1 window: resolved, lost
+        // AC4: the first samples of each stage include first-use setup on the
+        // GPU; they are kept apart from the steady-state averages.
+        static const unsigned AC_WARM = 8;
+        double ac_ts_sum[AC_SEG] = {}, ac_ts_max[AC_SEG] = {}, ac_ts_warm_max[AC_SEG] = {};
+        unsigned long long ac_ts_n[AC_SEG] = {}, ac_ts_seen[AC_SEG] = {};
+        bool ac_ts_warm_said = false;
+        // WT1: the slowest AMD calls of the SF1 window and a sample of ordinary
+        // ones, on the CPU's clock, to ask what else ran on the neural card then.
+        struct wt_call { double ms = 0.0; long long a = 0, b = 0; };
+        static const unsigned WT_TOP = 3, WT_SAMP = 40;
+        wt_call wt_top[WT_TOP];
+        wt_call wt_samp[WT_SAMP];
+        unsigned wt_nsamp = 0;
+        unsigned long long wt_seen = 0;
+        bool nq_high = false;                  // QP1: the neural-stage queue was created at HIGH priority
         float fsr_fov_h = 90.0f;               // ini FSRFov, horizontal degrees
         float fsr_near = 10.0f;                // ini FSRNear, game units
         float fsr_far = 100000.0f;             // ini FSRFar, game units
@@ -12099,6 +12959,26 @@ static PfnFfxConfigure      g_ffx_configure = nullptr;
 static PfnFfxQuery          g_ffx_query = nullptr;
 static PfnFfxDispatch       g_ffx_dispatch = nullptr;
 static std::atomic<int>     g_ffx_msgs{0};
+static char                 g_ffx_where[600] = {};   // SF2: where AMD's slot was loaded from
+
+// SF2: the rebuilt DLL (AMD's FSR 3.1.6 source + one optical flow for 4x). Loaded
+// BESIDE AMD's, never instead of it, and only used for 4x. It is recognised by its
+// provider version ("...-mgpu1"), not by its file name.
+struct ffx_fns
+{
+    PfnFfxCreateContext  create = nullptr;
+    PfnFfxDestroyContext destroy = nullptr;
+    PfnFfxConfigure      configure = nullptr;
+    PfnFfxQuery          query = nullptr;
+    PfnFfxDispatch       dispatch = nullptr;
+};
+static HMODULE           g_mg1_mod = nullptr;
+static ffx_fns           g_mg1{};
+static char              g_mg1_where[600] = {};
+// -1 not looked for yet, 0 absent / not the rebuilt build / failed, 1 file present, 2 loaded and verified
+static std::atomic<int>  g_mg1_state{-1};
+static std::atomic<int>  g_amd_rebuilt{0};   // AMD's slot itself holds the rebuilt build
+static const wchar_t    *kMg1Name = L"mgpu\\amd_fidelityfx_framegeneration_mgpu1_dx12.dll";
 
 static void ffx_message(uint32_t type, const wchar_t *message)
 {
@@ -12294,14 +13174,31 @@ bool dg_ensure(stream_state &s, ID3D12GraphicsCommandList *cl, ID3D12Resource *l
         // FL1: FGSource=1 tries mgpu\nvngx_dlssg.dll first (a newer DLL than
         // the driver's store, e.g. one with FG Lite); 0 = the store first.
         const bool mgpu_first = ini_read_sr_int("FGSource", 0, 0, 1) == 1;
+        if (ini_read_sr_int("FGSource", 0, 0, 2) == 2)   // AR1: was ANR FG
+            mgpu::diag::warn("[MGPU][AR1] FGSource=2 (ANR FG) is no longer supported - using NVIDIA's frame generation "
+                             "from the driver (FGSource=0). The mgpu\\anr folder can be deleted.");
         const char *src = mgpu_first ? "mgpu folder" : "driver model store";
         mods.snippet = mgpu_first ? load_private_snippet(L"nvngx_dlssg.dll", where, sizeof where)
                                   : dg_load_store_snippet(where, sizeof where);
+        // AR1: ANR FG (Apex Neural Rendering) ships a DLL with NVIDIA's file
+        // name. Support for it was removed (uneven pacing when panning, AR1);
+        // its startup differs from NVIDIA's and could crash if driven as
+        // NVIDIA's, so a file that carries ANR's own export is refused here.
+        auto refuse_anr = [&]() {
+            if (mods.snippet == nullptr || !mgpu::dllid::is_anr(mods.snippet)) return;
+            snprintf(line, sizeof line, "[MGPU][AR1] %s is ANR FG, not NVIDIA's frame generation - not used (ANR "
+                     "support was removed). Put NVIDIA's nvngx_dlssg.dll back, or set FGSource=0 for the driver's.", where);
+            mgpu::diag::warn(line);
+            FreeLibrary(mods.snippet);
+            mods.snippet = nullptr;
+        };
+        refuse_anr();
         if (mods.snippet == nullptr)
         {
             src = mgpu_first ? "driver model store" : "mgpu folder";
             mods.snippet = mgpu_first ? dg_load_store_snippet(where, sizeof where)
                                       : load_private_snippet(L"nvngx_dlssg.dll", where, sizeof where);
+            refuse_anr();
         }
         if (mods.snippet != nullptr)
         {
@@ -12598,7 +13495,20 @@ static int dyn_on_now()
 static int dyn_target_now()
 {
     int v = g_dyn_target.load(std::memory_order_relaxed);
-    if (v < 0) { v = ini_read_sr_int("FGDynTarget", 180, 60, 480); g_dyn_target.store(v); }
+    if (v < 0)
+    {
+#if defined(ATOMIC_COMMUNITY_20FPS)
+        v = ini_read_sr_int("FGDynTarget", 120, 60, 120);
+#else
+        v = ini_read_sr_int("FGDynTarget", 180, 60, 480);
+#endif
+    }
+#if defined(ATOMIC_COMMUNITY_20FPS)
+    // Community build: enforce the dynamic FG target cap even for stale INI
+    // values or internal changes that bypass the ImGui slider.
+    if (v > 120) v = 120;
+#endif
+    g_dyn_target.store(v, std::memory_order_relaxed);
     return v;
 }
 // Frames to show for this pair (2..cap+1), from the target and the real interval.
@@ -12951,19 +13861,26 @@ static bool fsr_load_dll(char *where, size_t where_n)
     wchar_t *slash = wcsrchr(dir, L'\\');
     if (slash == nullptr) return false;
     slash[1] = L'\0';
-    const wchar_t *names[2] = { L"mgpu\\amd_fidelityfx_framegeneration_dx12.dll",
-                                L"amd_fidelityfx_framegeneration_dx12.dll" };
+    // SF2: AMD's own DLL makes 2x. The rebuilt one (kMg1Name) is loaded separately
+    // for 4x (mg1_load); it stands in here only when AMD's is missing.
+    const wchar_t *names[3] = { L"mgpu\\amd_fidelityfx_framegeneration_dx12.dll",
+                                L"amd_fidelityfx_framegeneration_dx12.dll",
+                                kMg1Name };
     DWORD load_err = 0;
-    for (int i = 0; i < 2 && g_ffx_mod == nullptr; ++i)
+    for (int i = 0; i < 3 && g_ffx_mod == nullptr; ++i)
     {
         wchar_t full[MAX_PATH * 2] = {};
         _snwprintf_s(full, MAX_PATH * 2, _TRUNCATE, L"%s%s", dir, names[i]);
+        if (i == 2 && GetFileAttributesW(full) == INVALID_FILE_ATTRIBUTES) continue;
         g_ffx_mod = LoadLibraryExW(full, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (g_ffx_mod == nullptr && i == 0) load_err = GetLastError();
         if (g_ffx_mod != nullptr)
         {
             WideCharToMultiByte(CP_UTF8, 0, full, -1, where, (int)where_n, nullptr, nullptr);
             dv_record(3, g_ffx_mod, nullptr);   // DV1
+            if (i == 2)
+                mgpu::diag::warn("[MGPU][SF2] AMD's own amd_fidelityfx_framegeneration_dx12.dll was not found - "
+                                 "the rebuilt DLL makes 2x as well (its 2x is AMD's maths unchanged).");
         }
     }
     if (g_ffx_mod == nullptr)
@@ -12980,8 +13897,9 @@ static bool fsr_load_dll(char *where, size_t where_n)
         if (attr == INVALID_FILE_ATTRIBUTES)
             snprintf(line, sizeof line,
                      "[MGPU][FSR] AMD DLL NOT FOUND at %s (nor beside the add-on). Copy "
-                     "amd_fidelityfx_framegeneration_dx12.dll from the package's redist\\mgpu "
-                     "folder into the game's mgpu folder, next to nvngx_dlssnr.dll.", nf);
+                     "amd_fidelityfx_framegeneration_dx12.dll from AMD's FidelityFX SDK (GitHub, "
+                     "GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, Kits\\FidelityFX\\signedbin) into the "
+                     "game's mgpu folder, next to nvngx_dlssnr.dll.", nf);
         else
             snprintf(line, sizeof line,
                      "[MGPU][FSR] AMD DLL IS PRESENT at %s but Windows refused to load it "
@@ -13000,11 +13918,126 @@ static bool fsr_load_dll(char *where, size_t where_n)
         g_ffx_create = nullptr;
         return false;
     }
+    snprintf(g_ffx_where, sizeof g_ffx_where, "%s", where);
     return true;
+}
+
+static ffx_fns amd_fns()
+{
+    ffx_fns f;
+    f.create = g_ffx_create; f.destroy = g_ffx_destroy; f.configure = g_ffx_configure;
+    f.query = g_ffx_query; f.dispatch = g_ffx_dispatch;
+    return f;
+}
+
+// SF2: full path of the rebuilt DLL (mgpu folder beside the add-on).
+static bool mg1_path(wchar_t *full, size_t n)
+{
+    wchar_t dir[MAX_PATH * 2] = {};
+    const DWORD k = GetModuleFileNameW(mgpu::module_handle(), dir, MAX_PATH * 2);
+    if (k == 0 || k >= MAX_PATH * 2) return false;
+    wchar_t *slash = wcsrchr(dir, L'\\');
+    if (slash == nullptr) return false;
+    slash[1] = L'\0';
+    _snwprintf_s(full, n, _TRUNCATE, L"%s%s", dir, kMg1Name);
+    return true;
+}
+
+// SF2: is the rebuilt DLL usable for 4x? Looks for the file once; a failed load,
+// a provider that is not "-mgpu1" or a failed context sets the state to 0.
+static bool mg1_available()
+{
+    if (g_amd_rebuilt.load(std::memory_order_relaxed) != 0) return true;
+    int st = g_mg1_state.load(std::memory_order_relaxed);
+    if (st < 0)
+    {
+        wchar_t full[MAX_PATH * 2] = {};
+        st = (mg1_path(full, MAX_PATH * 2) && GetFileAttributesW(full) != INVALID_FILE_ATTRIBUTES) ? 1 : 0;
+        int expect = -1;
+        g_mg1_state.compare_exchange_strong(expect, st);
+        st = g_mg1_state.load(std::memory_order_relaxed);
+    }
+    return st > 0;
+}
+
+// SF2: loads the rebuilt DLL and checks, before any context, that its frame
+// generation provider is the rebuilt one ("-mgpu1"). NR thread only.
+static bool mg1_load(ID3D12Device *dev)
+{
+    if (g_mg1_state.load() == 2) return true;
+    if (!mg1_available()) return false;
+    char line[900];
+    wchar_t full[MAX_PATH * 2] = {};
+    if (!mg1_path(full, MAX_PATH * 2)) { g_mg1_state.store(0); return false; }
+    WideCharToMultiByte(CP_UTF8, 0, full, -1, g_mg1_where, (int)sizeof g_mg1_where, nullptr, nullptr);
+    g_mg1_mod = LoadLibraryExW(full, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (g_mg1_mod == nullptr)
+    {
+        snprintf(line, sizeof line, "[MGPU][SF2] %s is there but Windows would not load it (error %lu). "
+                 "4x needs it - staying at 2x.", g_mg1_where, (unsigned long)GetLastError());
+        mgpu::diag::warn(line);
+        g_mg1_state.store(0);
+        return false;
+    }
+    dv_record(4, g_mg1_mod, nullptr);   // DV1/DV2: its own slot
+    g_mg1.create    = (PfnFfxCreateContext)(void *)GetProcAddress(g_mg1_mod, "ffxCreateContext");
+    g_mg1.destroy   = (PfnFfxDestroyContext)(void *)GetProcAddress(g_mg1_mod, "ffxDestroyContext");
+    g_mg1.configure = (PfnFfxConfigure)(void *)GetProcAddress(g_mg1_mod, "ffxConfigure");
+    g_mg1.query     = (PfnFfxQuery)(void *)GetProcAddress(g_mg1_mod, "ffxQuery");
+    g_mg1.dispatch  = (PfnFfxDispatch)(void *)GetProcAddress(g_mg1_mod, "ffxDispatch");
+    if (!g_mg1.create || !g_mg1.destroy || !g_mg1.configure || !g_mg1.query || !g_mg1.dispatch)
+    {
+        snprintf(line, sizeof line, "[MGPU][SF2] %s does not export the FidelityFX API - not used.", g_mg1_where);
+        mgpu::diag::warn(line);
+        g_mg1_state.store(0);
+        return false;
+    }
+    uint64_t cnt = 8, ids[8] = {};
+    const char *vn[8] = {};
+    ffxQueryDescGetVersions q{};
+    q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+    q.device = dev;
+    q.outputCount = &cnt;
+    q.versionIds = ids;
+    q.versionNames = vn;
+    const ffxReturnCode_t rc = g_mg1.query(nullptr, &q.header);
+    const char *found = nullptr;
+    for (uint64_t i = 0; rc == FFX_API_RETURN_OK && i < cnt && i < 8; ++i)
+        if (is_mgpu_rebuild(vn[i])) found = vn[i];
+    if (found == nullptr)
+    {
+        snprintf(line, sizeof line, "[MGPU][SF2] %s is not the rebuilt AMD build (its frame generation is \"%s\", "
+                 "not \"...-mgpu1\") - 4x stays off. Use the file from the amd-fg-mgpu1 package.",
+                 g_mg1_where, (rc == FFX_API_RETURN_OK && cnt > 0 && vn[0] != nullptr) ? vn[0] : "unknown");
+        mgpu::diag::warn(line);
+        g_mg1_state.store(0);
+        return false;
+    }
+    dv_provider(1, found);   // DV2
+    snprintf(line, sizeof line, "[MGPU][SF2] rebuilt AMD frame generation found: %s, provider \"%s\". 4x uses it "
+             "(one optical flow for the 1/4, 1/2 and 3/4 frames); 2x stays on AMD's own DLL.", g_mg1_where, found);
+    mgpu::diag::info(line);
+    g_mg1_state.store(2);
+    return true;
+}
+
+static void fd_release(stream_state &s)   // FD1
+{
+    for (int i = 0; i < 2; ++i)
+    {
+        if (s.fd_depth[i] != nullptr) { s.fd_depth[i]->Release(); s.fd_depth[i] = nullptr; }
+        s.fd_src[i] = nullptr;
+    }
+    if (s.fd_heap != nullptr) { s.fd_heap->Release(); s.fd_heap = nullptr; }
+    if (s.fd_pso != nullptr)  { s.fd_pso->Release();  s.fd_pso = nullptr; }
+    if (s.fd_rs != nullptr)   { s.fd_rs->Release();   s.fd_rs = nullptr; }
+    s.fd_on = false;
 }
 
 static void fsr_destroy(stream_state &s)
 {
+    fd_release(s);
     if (s.fsr_ctx != nullptr && g_ffx_destroy != nullptr)
     {
         ffxContext c = (ffxContext)s.fsr_ctx;
@@ -13012,16 +14045,192 @@ static void fsr_destroy(stream_state &s)
     }
     s.fsr_ctx = nullptr;
     s.fsr_up = false;
+    if (s.fsrb_ctx != nullptr && g_ffx_destroy != nullptr)   // AC1
+    {
+        ffxContext c = (ffxContext)s.fsrb_ctx;
+        (void)g_ffx_destroy(&c, nullptr);
+    }
+    s.fsrb_ctx = nullptr;
+    s.fsrb_up = false;
+    if (s.sfm_ctx != nullptr && g_mg1.destroy != nullptr)   // SF2
+    {
+        ffxContext c = (ffxContext)s.sfm_ctx;
+        (void)g_mg1.destroy(&c, nullptr);
+    }
+    s.sfm_ctx = nullptr;
+    s.sfm_up = false;
+}
+
+// FD1: nearest-sample the depth down (or up) to the vectors' extent. Nearest,
+// never blended: a depth edge averaged across an object boundary is a depth
+// that exists nowhere in the scene.
+static const char *kFdHLSL =
+    "Texture2D<float> gD : register(t0);\n"
+    "RWTexture2D<float> oD : register(u0);\n"
+    "cbuffer C : register(b0) { uint2 gSrc; uint2 gDst; };\n"
+    "[numthreads(8,8,1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID)\n"
+    "{\n"
+    "  if (id.x >= gDst.x || id.y >= gDst.y) return;\n"
+    "  float2 uv = (float2(id.xy) + 0.5f) / float2(gDst);\n"
+    "  int2 sp = clamp(int2(uv * float2(gSrc)), int2(0,0), int2(gSrc) - int2(1,1));\n"
+    "  oD[id.xy] = gD.Load(int3(sp, 0));\n"
+    "}\n";
+
+static DXGI_FORMAT fd_srv_format(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    default: return f;
+    }
+}
+
+static void fd_write_srv(stream_state &s, ID3D12Device *dev, unsigned i)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h = s.fd_heap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += (SIZE_T)(i * 2u) * s.fd_inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = fd_srv_format(s.tex_depth[i]->GetDesc().Format);
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    dev->CreateShaderResourceView(s.tex_depth[i], &sv, h);
+    s.fd_src[i] = s.tex_depth[i];
+}
+
+static bool fd_build(stream_state &s, ID3D12Device *dev)
+{
+    if (s.fd_on) return true;
+    fd_release(s);
+    char line[600];
+    if (s.tex_depth[0] == nullptr || s.tex_depth[1] == nullptr) return false;
+    pfn_d3dcompile_t cmp = mgpu::d3dcompile();
+    if (cmp == nullptr) { mgpu::diag::error("[MGPU][FD1] d3dcompiler_47.dll not available."); return false; }
+    ID3DBlob *cs = nullptr, *err = nullptr;
+    HRESULT hr = cmp(kFdHLSL, strlen(kFdHLSL), "fd1", nullptr, nullptr, "main", "cs_5_1", 0, 0, &cs, &err);
+    if (FAILED(hr) || cs == nullptr)
+    {
+        snprintf(line, sizeof line, "[MGPU][FD1] depth resample shader failed to compile: 0x%08X %s", (unsigned)hr,
+                 err != nullptr ? (const char *)err->GetBufferPointer() : "");
+        mgpu::diag::error(line);
+        if (err != nullptr) err->Release();
+        return false;
+    }
+    if (err != nullptr) { err->Release(); err = nullptr; }
+
+    D3D12_DESCRIPTOR_RANGE rng[2] = {};
+    rng[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rng[0].NumDescriptors = 1; rng[0].OffsetInDescriptorsFromTableStart = 0;
+    rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; rng[1].NumDescriptors = 1; rng[1].OffsetInDescriptorsFromTableStart = 1;
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable.NumDescriptorRanges = 2; rp[0].DescriptorTable.pDescriptorRanges = rng;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants.ShaderRegister = 0; rp[1].Constants.Num32BitValues = 4;
+    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    rsd.NumParameters = 2; rsd.pParameters = rp;
+    ID3DBlob *sig = nullptr;
+    hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+    if (err != nullptr) { err->Release(); err = nullptr; }
+    if (SUCCEEDED(hr)) hr = dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&s.fd_rs));
+    if (sig != nullptr) sig->Release();
+    if (SUCCEEDED(hr))
+    {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = s.fd_rs;
+        pd.CS.pShaderBytecode = cs->GetBufferPointer();
+        pd.CS.BytecodeLength = cs->GetBufferSize();
+        hr = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&s.fd_pso));
+    }
+    cs->Release();
+    if (SUCCEEDED(hr))
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 4;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.fd_heap));
+    }
+    for (unsigned i = 0; i < 2 && SUCCEEDED(hr); ++i)
+        hr = make_tex(dev, s.mvec_w, s.mvec_h, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &s.fd_depth[i]);
+    if (FAILED(hr))
+    {
+        snprintf(line, sizeof line, "[MGPU][FD1] the depth resample could not be set up (0x%08X).", (unsigned)hr);
+        mgpu::diag::error(line);
+        fd_release(s);
+        return false;
+    }
+    s.fd_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        fd_write_srv(s, dev, i);
+        D3D12_CPU_DESCRIPTOR_HANDLE h = s.fd_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)(i * 2u + 1u) * s.fd_inc;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+        uv.Format = DXGI_FORMAT_R32_FLOAT;
+        uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        dev->CreateUnorderedAccessView(s.fd_depth[i], nullptr, &uv, h);
+    }
+    s.fd_on = true;
+    snprintf(line, sizeof line, "[MGPU][FD1] depth %ux%u is resampled to the motion vectors' %ux%u for AMD frame "
+             "generation, which needs both at one size.", s.depth_w, s.depth_h, s.mvec_w, s.mvec_h);
+    mgpu::diag::warn(line);
+    return true;
+}
+
+// FD1: record the resample into `cl` (depth in NON_PIXEL_SHADER_RESOURCE, as FG
+// records it) and return the texture AMD reads; tex_depth itself without FD1.
+static ID3D12Resource *fd_depth_for(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii)
+{
+    if (!s.fd_on || ii > 1u || s.tex_depth[ii] == nullptr || s.fd_depth[ii] == nullptr) return s.tex_depth[ii];
+    if (s.tex_depth[ii] != s.fd_src[ii])
+    {
+        ID3D12Device *dev = nullptr;
+        if (FAILED(s.fd_heap->GetDevice(IID_PPV_ARGS(&dev))) || dev == nullptr) return s.tex_depth[ii];
+        fd_write_srv(s, dev, ii);
+        dev->Release();
+    }
+    barrier(cl, s.fd_depth[ii], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap *heaps[1] = { s.fd_heap };
+    cl->SetDescriptorHeaps(1, heaps);
+    cl->SetComputeRootSignature(s.fd_rs);
+    cl->SetPipelineState(s.fd_pso);
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = s.fd_heap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += (UINT64)(ii * 2u) * s.fd_inc;
+    cl->SetComputeRootDescriptorTable(0, gh);
+    const UINT c[4] = { s.depth_w, s.depth_h, s.mvec_w, s.mvec_h };
+    cl->SetComputeRoot32BitConstants(1, 4, c, 0);
+    cl->Dispatch((s.mvec_w + 7u) / 8u, (s.mvec_h + 7u) / 8u, 1u);
+    barrier(cl, s.fd_depth[ii], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    return s.fd_depth[ii];
 }
 
 // Creates the frame generation context on GPU 1. Display size = the NR output;
 // render size = the motion vector / depth extent (the game's, at whatever
 // resolution it hands them over). Depth is reverse-Z infinite on Unreal.
-static bool fsr_create(stream_state &s, ID3D12Device *dev, const D3D12_RESOURCE_DESC &out_desc)
+// role: 0 = context A (AMD's DLL, 2x), 1 = B (AC1 chain), 2 = M (SF2, rebuilt DLL, 4x).
+static bool fsr_create(stream_state &s, ID3D12Device *dev, const D3D12_RESOURCE_DESC &out_desc,
+                       int role = 0)
 {
+    const bool second = role == 1;
     char where[600] = {};
     char line[900];
-    if (!fsr_load_dll(where, sizeof where))
+    if (role == 2)   // SF2: the rebuilt DLL, loaded and checked beside AMD's
+    {
+        if (!mg1_load(dev)) return false;
+        snprintf(where, sizeof where, "%s", g_mg1_where);
+    }
+    else if (fsr_load_dll(where, sizeof where))
+    {
+        if (where[0] == '\0') snprintf(where, sizeof where, "%s", g_ffx_where);
+    }
+    else
     {
         mgpu::diag::error("[MGPU][FSR] FrameGen=3 needs AMD's amd_fidelityfx_framegeneration_dx12.dll "
                           "in the mgpu folder next to the add-on (or next to the add-on). It was not "
@@ -13030,12 +14239,12 @@ static bool fsr_create(stream_state &s, ID3D12Device *dev, const D3D12_RESOURCE_
         return false;
     }
 
-    if (s.depth_w != s.mvec_w || s.depth_h != s.mvec_h)
+    if ((s.depth_w != s.mvec_w || s.depth_h != s.mvec_h) && !fd_build(s, dev))   // FD1
     {
         snprintf(line, sizeof line,
                  "[MGPU][FSR] depth is %ux%u but the motion vectors are %ux%u. AMD frame "
-                 "generation needs both at one size. Falling back to BUILT-IN frame "
-                 "generation (FrameGen=1) for this run.",
+                 "generation needs both at one size, and the depth could not be resampled. "
+                 "Falling back to BUILT-IN frame generation (FrameGen=1) for this run.",
                  s.depth_w, s.depth_h, s.mvec_w, s.mvec_h);
         mgpu::diag::error(line);
         return false;
@@ -13075,22 +14284,80 @@ static bool fsr_create(stream_state &s, ID3D12Device *dev, const D3D12_RESOURCE_
     // if this DLL does not know it.
     cd.header.pNext = &be.header;
     be.header.pNext = &ver.header;
+    const ffx_fns f = (role == 2) ? g_mg1 : amd_fns();   // SF2
     ffxContext ctx = nullptr;
-    ffxReturnCode_t rc = g_ffx_create(&ctx, &cd.header, nullptr);
+    ffxReturnCode_t rc = f.create(&ctx, &cd.header, nullptr);
     if (rc != FFX_API_RETURN_OK)
     {
         be.header.pNext = nullptr;
         ctx = nullptr;
-        rc = g_ffx_create(&ctx, &cd.header, nullptr);
+        rc = f.create(&ctx, &cd.header, nullptr);
     }
     if (rc != FFX_API_RETURN_OK || ctx == nullptr)
     {
-        snprintf(line, sizeof line,
-                 "[MGPU][FSR] ffxCreateContext(frame generation) failed, code %u, from %s. "
-                 "Falling back to BUILT-IN frame generation (FrameGen=1) for this run.",
-                 (unsigned)rc, where);
+        if (role == 2)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][SF2] the rebuilt DLL's frame generation context could not be made, code %u, from %s. "
+                     "4x is off for this run (2x stays on AMD's own DLL).", (unsigned)rc, where);
+            g_mg1_state.store(0);
+        }
+        else if (second)
+            snprintf(line, sizeof line,
+                     "[MGPU][AC1] the second AMD frame generation context could not be made, code %u, from %s. "
+                     "AMD stays at 2x for this run.", (unsigned)rc, where);
+        else
+            snprintf(line, sizeof line,
+                     "[MGPU][FSR] ffxCreateContext(frame generation) failed, code %u, from %s. "
+                     "Falling back to BUILT-IN frame generation (FrameGen=1) for this run.",
+                     (unsigned)rc, where);
         mgpu::diag::error(line);
         return false;
+    }
+    if (second)   // AC1
+    {
+        s.fsrb_ctx = ctx;
+        ffxConfigureDescGlobalDebug1 dbg2{};
+        dbg2.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
+        dbg2.fpMessage = &ffx_message;
+        dbg2.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_ERRORS | FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS;
+        (void)f.configure(&ctx, &dbg2.header);
+        snprintf(line, sizeof line,
+                 "[MGPU][AC1] second AMD frame generation context up (from %s): AMD 4x by chaining - context A "
+                 "makes the 1/2 frame, context B the 1/4 and 3/4 from the 1/2 frame and the real ones, with the "
+                 "game's vectors halved. FSRChain=0 or the panel turns it off.", where);
+        mgpu::diag::info(line);
+        s.fsrb_up = true;
+        return true;
+    }
+    if (role == 2)   // SF2: context M
+    {
+        ffxConfigureDescGlobalDebug1 dbg3{};
+        dbg3.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
+        dbg3.fpMessage = &ffx_message;
+        dbg3.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_ERRORS | FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS;
+        (void)f.configure(&ctx, &dbg3.header);
+        ffxQueryGetProviderVersion pm{};
+        pm.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+        (void)f.query(&ctx, &pm.header);
+        if (!is_mgpu_rebuild(pm.versionName))
+        {
+            snprintf(line, sizeof line, "[MGPU][SF2] the context from %s runs provider \"%s\", not the rebuilt one - "
+                     "4x is off for this run.", where, pm.versionName ? pm.versionName : "unknown");
+            mgpu::diag::warn(line);
+            (void)f.destroy(&ctx, nullptr);
+            g_mg1_state.store(0);
+            return false;
+        }
+        s.sfm_ctx = ctx;
+        s.sfm_up = true;
+        s.sfm_gen = mgpu_rebuild_gen(pm.versionName);   // GV1
+        s.gv_q_m = s.gv_t_m = -1;
+        g_amd_q_support.store(s.sfm_gen >= 2 ? 1 : 0);
+        snprintf(line, sizeof line, "[MGPU][SF2] 4x context up (provider \"%s\" from %s): the 1/4, 1/2 and 3/4 "
+                 "frames from ONE optical flow, in one call.", pm.versionName, where);
+        mgpu::diag::info(line);
+        return true;
     }
     s.fsr_ctx = ctx;
 
@@ -13098,11 +14365,18 @@ static bool fsr_create(stream_state &s, ID3D12Device *dev, const D3D12_RESOURCE_
     dbg.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
     dbg.fpMessage = &ffx_message;
     dbg.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_ERRORS | FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS;
-    (void)g_ffx_configure(&ctx, &dbg.header);
+    (void)f.configure(&ctx, &dbg.header);
 
     ffxQueryGetProviderVersion pv{};
     pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-    (void)g_ffx_query(&ctx, &pv.header);
+    (void)f.query(&ctx, &pv.header);
+    // SF1/SF2: only the rebuilt provider names itself "...-mgpu1" (AMD's ignores
+    // outputs past [0]). Then context A itself makes 4x and no context M is needed.
+    s.fsr_multi = is_mgpu_rebuild(pv.versionName);
+    s.fsr_gen = mgpu_rebuild_gen(pv.versionName);   // GV1
+    s.gv_q_a = s.gv_t_a = -1;
+    if (s.fsr_multi) { g_amd_rebuilt.store(1); g_amd_q_support.store(s.fsr_gen >= 2 ? 1 : 0); }
+    if (pv.versionName != nullptr) dv_provider(s.fsr_multi ? 1 : 0, pv.versionName);   // DV2
 
     snprintf(line, sizeof line,
              "[MGPU][FSR] AMD FSR FRAME GENERATION UP: provider \"%s\" from %s | display %llux%u, "
@@ -13124,27 +14398,148 @@ static bool fsr_create(stream_state &s, ID3D12Device *dev, const D3D12_RESOURCE_
 // prepare (depth + motion vectors), dispatch (writes fsr_out). `real` is this
 // frame's copy of the NR output, in NON_PIXEL_SHADER_RESOURCE. Returns false
 // on any failure; after three, FSR is switched off for the run.
-static bool fsr_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
-                       ID3D12Resource *real, float mv_el)
+// AC3: GPU timestamps of the AMD work on the NR list. Marks 0/1 context A,
+// 2/3 B's 1/4 step, 4/5 B's 3/4 step, 6/7 the composition passes. The heap is
+// made the first time a mark is asked for; failure only turns the timing off.
+static void ac_ts_mark(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned idx)
 {
-    char line[600];
-    if (!s.fsr_up)
+    if (!s.ac_ts_tried)
     {
-        if (!fsr_create(s, s.ndev_b, real->GetDesc())) { s.fsr_failed = true; return false; }
+        s.ac_ts_tried = true;
+        if (s.ts_ok && s.ts_freq != 0 && s.ndev_b != nullptr)
+        {
+            D3D12_QUERY_HEAP_DESC qh{};
+            qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+            qh.Count = stream_state::AC_TS;
+            HRESULT hr = s.ndev_b->CreateQueryHeap(&qh, IID_PPV_ARGS(&s.ac_tsheap));
+            if (SUCCEEDED(hr))
+            {
+                D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+                D3D12_RESOURCE_DESC bd{};
+                bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                bd.Width = (UINT64)stream_state::AC_RING * stream_state::AC_TS * 8u;   // AC4: one region per slot
+                bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+                bd.SampleDesc.Count = 1;
+                bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                hr = s.ndev_b->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&s.ac_tsread));
+            }
+            s.ac_ts_ok = SUCCEEDED(hr);
+            if (!s.ac_ts_ok)
+            {
+                if (s.ac_tsheap != nullptr) { s.ac_tsheap->Release(); s.ac_tsheap = nullptr; }
+                if (s.ac_tsread != nullptr) { s.ac_tsread->Release(); s.ac_tsread = nullptr; }
+            }
+        }
     }
-    ffxContext ctx = (ffxContext)s.fsr_ctx;
+    if (!s.ac_ts_ok || idx >= stream_state::AC_TS) return;
+    cl->EndQuery(s.ac_tsheap, D3D12_QUERY_TYPE_TIMESTAMP, idx);
+    s.ac_ts_mask |= 1u << idx;
+}
 
-    LARGE_INTEGER now{}, fq{};
-    QueryPerformanceCounter(&now);
-    QueryPerformanceFrequency(&fq);
-    float dt_ms = 16.0f;
-    if (s.fsr_last.QuadPart != 0 && fq.QuadPart != 0)
-        dt_ms = (float)((double)(now.QuadPart - s.fsr_last.QuadPart) * 1000.0 / (double)fq.QuadPart);
-    if (dt_ms < 1.0f || dt_ms > 200.0f) dt_ms = 16.0f;
-    s.fsr_last = now;
+// AC3/AC4: after the last mark of the list, into the next ring slot's region.
+// Unwritten marks are resolved too but never read: the mask travels with the
+// fence value. A slot still waiting for its fence is given up (counted).
+static void ac_ts_resolve(stream_state &s, ID3D12GraphicsCommandList *cl)
+{
+    if (!s.ac_ts_ok || s.ac_ts_mask == 0u) return;
+    const unsigned slot = s.ac_ts_next_slot;
+    s.ac_ts_next_slot = (slot + 1u) % stream_state::AC_RING;
+    ++s.ac_ts_win_res;   // DR8
+    if (s.ac_ts_pend_fv[slot] != 0ull) { ++s.ac_ts_lost; ++s.ac_ts_win_lost; s.ac_ts_pend_fv[slot] = 0ull; s.ac_ts_pend_mask[slot] = 0u; }
+    cl->ResolveQueryData(s.ac_tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0, stream_state::AC_TS, s.ac_tsread,
+                         (UINT64)slot * stream_state::AC_TS * 8u);
+    s.ac_ts_res_slot = slot;
+    s.ac_ts_resolved = true;
+}
 
-    const uint64_t fid = ++s.fsr_frame_id;
-    const D3D12_RESOURCE_DESC rd = real->GetDesc();
+// AC3/AC4: reads every ring slot whose NR fence value has passed - never
+// earlier. GetCompletedValue returns UINT64_MAX once the device is removed:
+// that is not completion, so the timing stops there and nothing is mapped.
+static void ac_ts_collect(stream_state &s)
+{
+    if (!s.ac_ts_ok || s.nf == nullptr) return;
+    bool any = false;
+    for (unsigned q = 0; q < stream_state::AC_RING; ++q) any = any || s.ac_ts_pend_fv[q] != 0ull;
+    if (!any) return;
+    const UINT64 done = s.nf->GetCompletedValue();
+    const bool removed = done == UINT64_MAX ||
+                         (s.ndev_b != nullptr && s.ndev_b->GetDeviceRemovedReason() != S_OK);
+    if (removed)
+    {
+        s.ac_ts_ok = false;
+        for (unsigned q = 0; q < stream_state::AC_RING; ++q) { s.ac_ts_pend_fv[q] = 0ull; s.ac_ts_pend_mask[q] = 0u; }
+        mgpu::diag::warn("[MGPU][AC4] the neural card's device was removed - AMD GPU timing stops (no timing "
+                         "buffer is read after removal).");
+        return;
+    }
+    for (unsigned slot = 0; slot < stream_state::AC_RING; ++slot)
+    {
+        const unsigned long long fv = s.ac_ts_pend_fv[slot];
+        if (fv == 0ull || done < fv) continue;
+        const SIZE_T base = (SIZE_T)slot * stream_state::AC_TS * 8u;
+        const UINT64 *tv = nullptr;
+        D3D12_RANGE rr{ base, base + (SIZE_T)stream_state::AC_TS * 8u };
+        if (SUCCEEDED(s.ac_tsread->Map(0, &rr, (void **)&tv)) && tv != nullptr)
+        {
+            const UINT64 *m = (const UINT64 *)((const unsigned char *)tv + base);
+            for (unsigned q = 0; q < stream_state::AC_SEG; ++q)
+            {
+                const unsigned need = 3u << (2u * q);
+                if ((s.ac_ts_pend_mask[slot] & need) != need || m[2u * q + 1u] < m[2u * q]) continue;
+                const double ms = (double)(m[2u * q + 1u] - m[2u * q]) * 1000.0 / (double)s.ts_freq;
+                if (ms > 1000.0) continue;   // a wrapped or stale mark, not a measurement
+                if (s.ac_ts_seen[q]++ < stream_state::AC_WARM)
+                {   // AC4: first uses carry setup costs - kept out of the averages
+                    if (ms > s.ac_ts_warm_max[q]) s.ac_ts_warm_max[q] = ms;
+                    continue;
+                }
+                s.ac_ts_sum[q] += ms; ++s.ac_ts_n[q];
+                if (ms > s.ac_ts_max[q]) s.ac_ts_max[q] = ms;
+                long long qa = 0, qb = 0;   // WT1
+                if (q == 0u && s.nq != nullptr && mgpu::gputime::to_qpc(s.nq, m[0], &qa) &&
+                    mgpu::gputime::to_qpc(s.nq, m[1], &qb) && qb > qa)
+                {
+                    const stream_state::wt_call c{ ms, qa, qb };
+                    for (unsigned i = 0; i < stream_state::WT_TOP; ++i)
+                        if (ms > s.wt_top[i].ms)
+                        {
+                            for (unsigned j = stream_state::WT_TOP - 1u; j > i; --j) s.wt_top[j] = s.wt_top[j - 1u];
+                            s.wt_top[i] = c;
+                            break;
+                        }
+                    if ((s.wt_seen++ % 25ull) == 0ull && s.wt_nsamp < stream_state::WT_SAMP) s.wt_samp[s.wt_nsamp++] = c;
+                }
+                if (q == 0u || q == 3u)   // DR8: smoothed, for DR's decision lines
+                {
+                    std::atomic<double> &e = (q == 0u) ? g_ac_ms_call : g_ac_ms_comp;
+                    const double o = e.load(std::memory_order_relaxed);
+                    e.store(o < 0.0 ? ms : o * 0.8 + ms * 0.2, std::memory_order_relaxed);
+                }
+            }
+            D3D12_RANGE wn{ 0, 0 };
+            s.ac_tsread->Unmap(0, &wn);
+        }
+        s.ac_ts_pend_fv[slot] = 0ull; s.ac_ts_pend_mask[slot] = 0u;
+    }
+}
+
+// AC1: AMD's three steps on one context - configure (no swapchain), prepare
+// (depth + motion vectors, scaled by mv_mul), dispatch into `out`. Shared by
+// context A (the real pair) and context B (the chained half-steps).
+// SF1: with out_q and out_t (the rebuilt provider only), one call writes three
+// frames - out_q at 1/4, out at 1/2, out_t at 3/4. X3: with out_q alone, two -
+// out_q at 1/3, out at 2/3.
+static ffxReturnCode_t fsr_run(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii, void *vctx,
+                               uint64_t fid, ID3D12Resource *present, ID3D12Resource *out,
+                               float mv_mul, float dt_ms, bool reset,
+                               ID3D12Resource *out_q = nullptr, ID3D12Resource *out_t = nullptr,
+                               const ffx_fns *api = nullptr)   // SF2: nullptr = AMD's DLL
+{
+    const ffx_fns f = api ? *api : amd_fns();
+    ffxContext ctx = (ffxContext)vctx;
+    const D3D12_RESOURCE_DESC rd = present->GetDesc();
 
     ffxConfigureDescFrameGeneration cfg{};
     cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
@@ -13159,7 +14554,7 @@ static bool fsr_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned 
     cfg.generationRect.left = 0; cfg.generationRect.top = 0;
     cfg.generationRect.width = (int32_t)rd.Width; cfg.generationRect.height = (int32_t)rd.Height;
     cfg.frameID = fid;
-    ffxReturnCode_t rc = g_ffx_configure(&ctx, &cfg.header);
+    ffxReturnCode_t rc = f.configure(&ctx, &cfg.header);
 
     if (rc == FFX_API_RETURN_OK)
     {
@@ -13178,28 +14573,45 @@ static bool fsr_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned 
         pr.renderSize.height = s.mvec_h;
         pr.jitterOffset.x = 0.0f; pr.jitterOffset.y = 0.0f;   // the game's vectors are unjittered
         // Same contract as DLSS: pixels, current -> previous. Scaled by the
-        // game frames between this NR frame and the last one, as NR is.
-        pr.motionVectorScale.x = sgn * s.mvec_scale_x * mv_el;
-        pr.motionVectorScale.y = sgn * s.mvec_scale_y * mv_el;
+        // game frames between this NR frame and the last one, as NR is
+        // (and by 1/2 for context B: AC1).
+        pr.motionVectorScale.x = sgn * s.mvec_scale_x * mv_mul;
+        pr.motionVectorScale.y = sgn * s.mvec_scale_y * mv_mul;
         pr.frameTimeDelta = dt_ms;
-        pr.reset = false;
+        pr.reset = reset;
         pr.cameraNear = s.fsr_near;
         pr.cameraFar = s.fsr_far;
         pr.cameraFovAngleVertical = vfov;
         pr.viewSpaceToMetersFactor = s.fsr_units_m;
-        pr.depth = ffxApiGetResourceDX12(s.tex_depth[ii], FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        pr.depth = ffxApiGetResourceDX12(fd_depth_for(s, cl, ii), FFX_API_RESOURCE_STATE_COMPUTE_READ);   // FD1
         pr.motionVectors = ffxApiGetResourceDX12(s.tex_mvec_r[ii], FFX_API_RESOURCE_STATE_COMPUTE_READ);
-        rc = g_ffx_dispatch(&ctx, &pr.header);
+        rc = f.dispatch(&ctx, &pr.header);
     }
     if (rc == FFX_API_RETURN_OK)
     {
         ffxDispatchDescFrameGeneration dg{};
         dg.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
         dg.commandList = cl;
-        dg.presentColor = ffxApiGetResourceDX12(real, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-        dg.outputs[0] = ffxApiGetResourceDX12(s.fsr_out, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
-        dg.numGeneratedFrames = 1;
-        dg.reset = false;
+        dg.presentColor = ffxApiGetResourceDX12(present, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        if (out_q != nullptr && out_t != nullptr)   // SF1: display order
+        {
+            dg.outputs[0] = ffxApiGetResourceDX12(out_q, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+            dg.outputs[1] = ffxApiGetResourceDX12(out, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+            dg.outputs[2] = ffxApiGetResourceDX12(out_t, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+            dg.numGeneratedFrames = 3;
+        }
+        else if (out_q != nullptr)   // X3: 3x - out_q at 1/3, out at 2/3
+        {
+            dg.outputs[0] = ffxApiGetResourceDX12(out_q, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+            dg.outputs[1] = ffxApiGetResourceDX12(out, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+            dg.numGeneratedFrames = 2;
+        }
+        else
+        {
+            dg.outputs[0] = ffxApiGetResourceDX12(out, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+            dg.numGeneratedFrames = 1;
+        }
+        dg.reset = reset;
         dg.backbufferTransferFunction =
             (s.fsr_transfer == 1u) ? FFX_API_BACKBUFFER_TRANSFER_FUNCTION_PQ
           : (s.fsr_transfer == 2u) ? FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SCRGB
@@ -13209,7 +14621,202 @@ static bool fsr_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned 
         dg.generationRect.left = 0; dg.generationRect.top = 0;
         dg.generationRect.width = (int32_t)rd.Width; dg.generationRect.height = (int32_t)rd.Height;
         dg.frameID = fid;
-        rc = g_ffx_dispatch(&ctx, &dg.header);
+        rc = f.dispatch(&ctx, &dg.header);
+    }
+    return rc;
+}
+
+// SF2: what AMD makes this frame. 4x needs the rebuilt DLL; without it the run is
+// 2x unless the chained fallback (FSRChainFallback, "not optimal") is allowed.
+static std::atomic<int> g_ac_fb{-1};
+static int ac_fb_now()
+{
+    int v = g_ac_fb.load(std::memory_order_relaxed);
+    if (v < 0) { v = ini_read_sr_int("FSRChainFallback", 0, 0, 1); g_ac_fb.store(v); }
+    return v;
+}
+// X3: 1 = the rebuilt DLL makes amd_mult_now() - 1 frames (3x or 4x).
+static int amd4x_mode(const stream_state &s)
+{
+    const int m = amd_mult_now();
+    if (s.fg_on != 3u || m <= 2) return 0;
+    if (s.fsrb_failed) return 0;   // DR8: the extra frames' textures could not be made - 2x for this stream
+    if (s.fsr_multi || (mg1_available() && !s.sfm_failed)) return 1;
+    return (m == 4 && ac_fb_now() != 0) ? 2 : 0;
+}
+
+// AC3/SF1: B's two output textures (the 1/4 and 3/4 frames), made the first time
+// 4x runs - by fsr_place for the chain, by fsr_record for the rebuilt provider.
+static bool ac_outputs(stream_state &s)
+{
+    if (s.fsrb_q != nullptr && s.fsrb_t != nullptr) return true;
+    // DR8: one failed attempt is final for this stream (fsrb_failed is cleared when
+    // the stream is set up again) - no new allocation and no new warning per frame.
+    if (s.fsrb_failed) return false;
+    if (s.fsr_out == nullptr || s.ndev_b == nullptr) return false;
+    D3D12_RESOURCE_DESC rd = s.fsr_out->GetDesc();
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    HRESULT hr = S_OK;
+    if (s.fsrb_q == nullptr)
+        hr = s.ndev_b->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                               nullptr, IID_PPV_ARGS(&s.fsrb_q));
+    if (SUCCEEDED(hr) && s.fsrb_t == nullptr)
+        hr = s.ndev_b->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                               nullptr, IID_PPV_ARGS(&s.fsrb_t));
+    if (FAILED(hr))
+    {
+        if (s.fsrb_q != nullptr) { s.fsrb_q->Release(); s.fsrb_q = nullptr; }
+        if (s.fsrb_t != nullptr) { s.fsrb_t->Release(); s.fsrb_t = nullptr; }
+        char l[200];
+        snprintf(l, sizeof l, "[MGPU][AC3] the 1/4 and 3/4 frame textures could not be made (0x%08X) - AMD "
+                 "stays at 2x until the stream is set up again.", (unsigned)hr);
+        mgpu::diag::warn(l);
+        s.fsrb_failed = true;
+        return false;
+    }
+    return true;
+}
+
+// Records AMD's three steps for NR frame f into `cl` on context A: the
+// in-between frame of the previous and current real frames into fsr_out.
+// `real` is this frame's copy of the NR output, in NON_PIXEL_SHADER_RESOURCE.
+// Returns false on any failure; after three, FSR is switched off for the run.
+static bool fsr_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
+                       ID3D12Resource *real, float mv_el)
+{
+    char line[600];
+    if (!s.fsr_up)
+    {
+        if (!fsr_create(s, s.ndev_b, real->GetDesc())) { s.fsr_failed = true; return false; }
+    }
+    ac_ts_collect(s);   // AC3: the previous list's AMD timings, if its fence has passed
+
+    // AC3: frame time from the game's own hand-over stamps (qpc_submit of the
+    // frame A was last given and of this one), not from when the bridge got
+    // round to it. A break in A's sequence, a missing stamp or an interval
+    // outside 2-200 ms keeps the last good value.
+    LARGE_INTEGER fq{};
+    QueryPerformanceFrequency(&fq);
+    const uint64_t next_fid = s.fsr_frame_id + 1ull;
+    const bool contiguous = s.fsr_made != 0 && next_fid == s.fsr_last_fid + 1ull;
+    bool dt_valid = false;
+    const float dt_ms = mgpu::fsr_chain::frame_dt_ms(contiguous ? s.fsr_prev_cap : 0ull, s.cur_cap_qpc,
+                                                    (uint64_t)fq.QuadPart, s.fsr_dt_ms, &dt_valid);
+    // AC4: every reuse of the last good value is counted, by cause (fsr_chain.hpp).
+    switch (mgpu::fsr_chain::classify_dt(contiguous, s.fsr_prev_cap, s.cur_cap_qpc, dt_valid))
+    {
+    case mgpu::fsr_chain::dt_reuse::sequence_break:   ++s.fsr_dt_breaks;  break;
+    case mgpu::fsr_chain::dt_reuse::missing_stamp:    ++s.fsr_dt_missing; break;
+    case mgpu::fsr_chain::dt_reuse::invalid_interval: ++s.fsr_dt_invalid; break;
+    case mgpu::fsr_chain::dt_reuse::none:             break;
+    }
+    s.fsr_prev_cap = s.cur_cap_qpc;
+    s.fsr_dt_ms = dt_ms;
+
+    const uint64_t fid = ++s.fsr_frame_id;
+    s.fsr_last_fid = fid;
+    // SF1/SF2: with the rebuilt DLL the whole 4x pair is made here, into B's two
+    // textures and fsr_out; fsr_place then only composes. Context A (AMD's DLL)
+    // makes 2x and the chain's 1/2 frame. Frame ids come from one counter, so a
+    // context that sat out frames sees a gap - and is told to reset as well.
+    s.sf_made = false;
+    int mode = amd4x_mode(s);
+    bool use_m = false;
+    if (mode == 1 && !s.fsr_multi)
+    {
+        if (!s.sfm_up && !s.sfm_failed && !fsr_create(s, s.ndev_b, real->GetDesc(), 2)) s.sfm_failed = true;
+        use_m = s.sfm_up && ac_outputs(s);
+        if (!use_m) mode = amd4x_mode(s);   // fell back: 2x, or the chain if allowed
+    }
+    const bool multi = mode == 1 && (use_m || (s.fsr_multi && ac_outputs(s)));
+    if (mode == 1 && !multi) mode = 0;
+    const int want_mult = amd_mult_now();
+    s.amd_gen = (mode == 1 && want_mult == 3) ? 2u : 3u;   // X3: 3x = 1/3 and 2/3
+    s.amd_mode = mode;
+    g_amd_mode_now.store(mode == 1 ? (int)s.amd_gen + 9 : mode, std::memory_order_relaxed);   // DV2/X3: 11 = 3x, 12 = 4x
+    const int logged_as = mode == 1 ? (int)s.amd_gen + 9 : mode;
+    if (logged_as != s.amd_mode_logged)
+    {
+        s.amd_mode_logged = logged_as;
+        const char *m = (mode == 1) ? (s.amd_gen == 2u ? "3x from the rebuilt DLL (1/3 and 2/3 from one optical flow)"
+                                                       : "4x from the rebuilt DLL (one optical flow)")
+                      : (mode == 2) ? "4x chained - NOT OPTIMAL (two AMD instances; the rebuilt DLL is missing)"
+                      : (want_mult > 2) ? "2x - 3x/4x need amd_fidelityfx_framegeneration_mgpu1_dx12.dll in the mgpu "
+                                          "folder (4x can fall back to the chain if allowed)"
+                                        : "2x";
+        snprintf(line, sizeof line, "[MGPU][SF2] AMD frame generation now: %s.", m);
+        mgpu::diag::info(line);
+    }
+    // GV1: hand the rebuilt DLL the quality preset and the timing switch when
+    // they change (live; the DLL applies them from its next frame).
+    {
+        auto send = [&](void *ctx, const ffx_fns &api, int gen, int &q_sent, int &t_sent) {
+            if (ctx == nullptr || gen < 2 || api.configure == nullptr) return;
+            const int q = amd_quality_now(), t = amd_timing_now();
+            ffxContext c = reinterpret_cast<ffxContext>(ctx);
+            if (q != q_sent)
+            {
+                ffxConfigureDescFrameGenerationKeyValue kv{};
+                kv.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION_KEYVALUE;
+                kv.key = 0x4D47505500000001ull;   // MGPU_FG_KEY_QUALITY
+                kv.u64 = (uint64_t)q;
+                const ffxReturnCode_t kr = api.configure(&c, &kv.header);
+                q_sent = q;
+                snprintf(line, sizeof line, "[MGPU][GV1] AMD quality now %s on the rebuilt DLL (code %u).",
+                         q == 2 ? "Fast" : q == 1 ? "Balanced" : "Quality", (unsigned)kr);
+                mgpu::diag::info(line);
+            }
+            if (t != t_sent)
+            {
+                ffxConfigureDescFrameGenerationKeyValue kv{};
+                kv.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION_KEYVALUE;
+                kv.key = 0x4D47505500000002ull;   // MGPU_FG_KEY_TIMING
+                kv.u64 = (uint64_t)t;
+                const ffxReturnCode_t kr = api.configure(&c, &kv.header);
+                t_sent = t;
+                if (t != 0 || kr != FFX_API_RETURN_OK)
+                {
+                    snprintf(line, sizeof line, "[MGPU][GV1] rebuilt DLL timing log %s (FSRTiming=%d, code %u): "
+                             "amd_fidelityfx_framegeneration_mgpu1_timing.log in the mgpu folder. The timestamps "
+                             "cost GPU time - for diagnosis only.", t ? "ON" : "off", t, (unsigned)kr);
+                    mgpu::diag::info(line);
+                }
+            }
+        };
+        if (use_m) send(s.sfm_ctx, g_mg1, s.sfm_gen, s.gv_q_m, s.gv_t_m);
+        else if (s.fsr_multi) send(s.fsr_ctx, amd_fns(), s.fsr_gen, s.gv_q_a, s.gv_t_a);
+    }
+    ac_ts_mark(s, cl, 0u);   // AC3
+    ffxReturnCode_t rc;
+    if (use_m)
+    {
+        rc = fsr_run(s, cl, ii, s.sfm_ctx, fid, real, s.fsr_out, mv_el, dt_ms, !s.sfm_prev,
+                     s.fsrb_q, s.amd_gen == 3u ? s.fsrb_t : nullptr, &g_mg1);   // X3: 3x = 2 outputs
+        s.sfm_prev = true; s.fsr_a_prev = false;
+    }
+    else
+    {
+        rc = multi
+            ? fsr_run(s, cl, ii, s.fsr_ctx, fid, real, s.fsr_out, mv_el, dt_ms, !s.fsr_a_prev, s.fsrb_q,
+                      s.amd_gen == 3u ? s.fsrb_t : nullptr)
+            : fsr_run(s, cl, ii, s.fsr_ctx, fid, real, s.fsr_out, mv_el, dt_ms, !s.fsr_a_prev);
+        s.fsr_a_prev = true; s.sfm_prev = false;
+    }
+    ac_ts_mark(s, cl, 1u);
+    if (rc == FFX_API_RETURN_OK && multi) s.sf_made = true;
+    if (rc != FFX_API_RETURN_OK && use_m)   // SF2: the rebuilt DLL's own failures
+    {
+        ++s.sfm_errors;
+        snprintf(line, sizeof line, "[MGPU][SF2] frame %llu: the rebuilt DLL's call failed, code %u (%llu so far). %s",
+                 (unsigned long long)fid, (unsigned)rc, s.sfm_errors,
+                 (s.sfm_errors >= 3) ? "4x is off for this run (2x stays on AMD's own DLL)."
+                                     : "This frame shows no in-between frame.");
+        mgpu::diag::error(line);
+        if (s.sfm_errors >= 3) { s.sfm_failed = true; g_mg1_state.store(0); }
+        s.sfm_prev = false;
+        return false;
     }
     if (rc != FFX_API_RETURN_OK)
     {
@@ -13224,6 +14831,35 @@ static bool fsr_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned 
         return false;
     }
     ++s.fsr_made;
+    return true;
+}
+
+// AC1: one step of context B - `present` is the next frame of B's stream (the
+// 1/2 frame or the real one), the output is the halfway frame between it and
+// B's previous input. Vectors and frame time are halved. Three failures turn
+// the chain off for the run (AMD stays at 2x).
+static bool fsrb_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
+                        ID3D12Resource *present, ID3D12Resource *out, float mv_el, bool reset)
+{
+    if (s.fsrb_failed || out == nullptr) return false;
+    if (!s.fsrb_up)
+    {
+        if (!fsr_create(s, s.ndev_b, present->GetDesc(), 1)) { s.fsrb_failed = true; return false; }
+    }
+    const uint64_t fid = ++s.fsrb_frame_id;
+    const ffxReturnCode_t rc = fsr_run(s, cl, ii, s.fsrb_ctx, fid, present, out,
+                                       mv_el * 0.5f, s.fsr_dt_ms * 0.5f, reset);
+    if (rc != FFX_API_RETURN_OK)
+    {
+        ++s.fsrb_errors;
+        char l[260];
+        snprintf(l, sizeof l, "[MGPU][AC1] chained step %llu failed, code %u (%llu so far). %s",
+                 (unsigned long long)fid, (unsigned)rc, s.fsrb_errors,
+                 (s.fsrb_errors >= 3) ? "AMD stays at 2x for this run." : "This pair shows 2x.");
+        mgpu::diag::error(l);
+        if (s.fsrb_errors >= 3) s.fsrb_failed = true;
+        return false;
+    }
     return true;
 }
 
@@ -13405,13 +15041,20 @@ static void g0_stage_release(stream_state &s)
         fsr_destroy(s);   // FSR1: the AMD context goes before the resources it saw
         dgp_release();    // DGP1: the probe's feature and textures, same point
         if (s.fsr_out != nullptr) { s.fsr_out->Release(); s.fsr_out = nullptr; }
+        if (s.fsrb_q != nullptr) { s.fsrb_q->Release(); s.fsrb_q = nullptr; }   // AC3
+        if (s.fsrb_t != nullptr) { s.fsrb_t->Release(); s.fsrb_t = nullptr; }
+        if (s.ac_tsheap != nullptr) { s.ac_tsheap->Release(); s.ac_tsheap = nullptr; }
+        if (s.ac_tsread != nullptr) { s.ac_tsread->Release(); s.ac_tsread = nullptr; }
+        s.ac_ts_tried = false; s.ac_ts_ok = false; s.ac_ts_mask = 0; s.ac_ts_resolved = false;
+        s.ac_ts_next_slot = 0; s.ac_ts_res_slot = 0;
+        for (unsigned q = 0; q < stream_state::AC_RING; ++q) { s.ac_ts_pend_fv[q] = 0; s.ac_ts_pend_mask[q] = 0; }
         for (unsigned q = 0; q < 2u; ++q)
             if (s.fg_mask[q] != nullptr) { s.fg_mask[q]->Release(); s.fg_mask[q] = nullptr; }
         s.fg_mask_valid = false;
         if (s.fg_pso  != nullptr) { s.fg_pso->Release();  s.fg_pso  = nullptr; }
         if (s.fg_rs   != nullptr) { s.fg_rs->Release();   s.fg_rs   = nullptr; }
         if (s.fg_heap != nullptr) { s.fg_heap->Release(); s.fg_heap = nullptr; }
-        s.fg_built = false; s.fg_prev_valid = false;
+        s.fg_built = false; s.fg_prev_valid = false; g_fd2_break = FD2_BROKEN_OTHER;   // FD2
         // P8.0, before the textures it describes.
         if (s.mvec_up != nullptr && s.mvec_cpu != nullptr) { s.mvec_up->Unmap(0, nullptr); }
         s.mvec_cpu = nullptr;
@@ -13472,7 +15115,7 @@ static void g0_stage_release(stream_state &s)
             if (s.cql[ci] != nullptr) { s.cql[ci]->Release(); s.cql[ci] = nullptr; }
             if (s.cqa[ci] != nullptr) { s.cqa[ci]->Release(); s.cqa[ci] = nullptr; }
         }
-        if (s.cq  != nullptr) { s.cq->Release();  s.cq = nullptr; }
+        if (s.cq  != nullptr) { mgpu::gputime::forget(s.cq); s.cq->Release();  s.cq = nullptr; }   // WT1
         s.cqf_value = 0;
         s.cq_gated = false;
         s.cqa_value[0] = 0;
@@ -13486,6 +15129,8 @@ static void g0_stage_release(stream_state &s)
         if (s.gate_ev != nullptr) { CloseHandle(s.gate_ev); s.gate_ev = nullptr; }
         if (s.tsread != nullptr) { s.tsread->Release(); s.tsread = nullptr; }
         if (s.tsheap != nullptr) { s.tsheap->Release(); s.tsheap = nullptr; }
+        if (s.gb_heap != nullptr) { s.gb_heap->Release(); s.gb_heap = nullptr; }   // GB1
+        if (s.gb_read != nullptr) { s.gb_read->Release(); s.gb_read = nullptr; }
         if (s.nseal != nullptr) { s.nseal->Release(); s.nseal = nullptr; }
         for (int i = 0; i < 2; ++i) if (s.cp_rb[i] != nullptr) { s.cp_rb[i]->Release(); s.cp_rb[i] = nullptr; }   // R258
         s.cp_stage = 0; s.cp_n = 0; s.cp_written = false; s.cp_worse = 0; s.learn_on = false; s.learn_decided = false; s.learn_t0 = 0; s.cp_win_n = 0;   // R278
@@ -14947,6 +16592,174 @@ namespace
         return n;
     }
 
+    // AC3: B's two output textures, made the first time the chain runs.
+    // SF1: body moved to ac_outputs (file scope, also used by fsr_record).
+    static bool fsrb_outputs(stream_state &s) { return ac_outputs(s); }
+
+    // AC1/AC3: after context A has written the 1/2 frame into fsr_out
+    // (UNORDERED_ACCESS), places this pair's in-between frames and returns how
+    // many. Transactional (AC3): every AMD step of B runs first, into B's own
+    // two textures; the set's frame buffers and the HUD mask are touched only
+    // after the outcome is known - three composition passes for a complete 4x
+    // pair (1/4, 1/2, 3/4), else exactly one for the 1/2 frame (2x). The
+    // decisions are in fsr_chain.hpp and tested in tests/fsr_chain_test.cpp.
+    static unsigned fsr_place(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned k, unsigned ii,
+                              ID3D12Resource *prevp, ID3D12Resource *currp, bool depth_ok, float mv_el)
+    {
+        namespace fc = mgpu::fsr_chain;
+        ID3D12Resource *const outk = s.fg_out[k];
+        barrier(cl, s.fsr_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        // SF2: fsr_record chose this frame's mode. 1: the rebuilt DLL already made all
+        // three frames - no context B, no priming, only the composition below runs.
+        // 2: the chained fallback (A + B). 0: 2x.
+        const bool enabled = s.fg_on == 3u && s.amd_mode != 0;
+        const bool shared = s.amd_mode == 1;
+        const bool chain_on = s.amd_mode == 2;
+        const bool usable = (shared || !s.fsrb_failed) && s.fg_outx[k][0] != nullptr && s.fg_outx[k][1] != nullptr &&
+                            (!enabled || fsrb_outputs(s));
+        const fc::plan p = shared ? fc::plan::off : fc::begin(s.ac, s.fsr_frame_id, chain_on, usable);
+        bool prime_ok = false, q_ok = false, t_ok = false;
+        if (p == fc::plan::prime)
+        {
+            // B's history becomes this real frame. The output is not used.
+            ac_ts_mark(s, cl, 8u);   // AC4: priming is its own stage
+            prime_ok = fsrb_record(s, cl, ii, currp, s.fsrb_t, mv_el, true);
+            ac_ts_mark(s, cl, 9u);
+        }
+        else if (p == fc::plan::chain)
+        {
+            ac_ts_mark(s, cl, 2u);
+            q_ok = fsrb_record(s, cl, ii, s.fsr_out, s.fsrb_q, mv_el, false);   // 1/4: real(prev) -> 1/2
+            ac_ts_mark(s, cl, 3u);
+            if (q_ok)
+            {
+                ac_ts_mark(s, cl, 4u);
+                t_ok = fsrb_record(s, cl, ii, currp, s.fsrb_t, mv_el, false);   // 3/4: 1/2 -> real(curr)
+                ac_ts_mark(s, cl, 5u);
+            }
+        }
+        const unsigned n = shared ? ((s.sf_made && usable) ? s.amd_gen : 1u)   // X3: 2 at 3x, 3 at 4x
+                                  : fc::finish(s.ac, p, s.fsr_frame_id, prime_ok, q_ok, t_ok);
+        if (shared) { if (n > 1u) ++s.sf_pairs4; else ++s.sf_pairs2; }   // SF1: pairs at the full multiplier / at 2x
+        g_ac_live.store(shared ? (int)s.amd_gen + 1 : ((chain_on && !s.fsrb_failed) ? 4 : 0),
+                        std::memory_order_relaxed);   // DR6/SF2/X3: 3 or 4, 0 = 2x
+
+        // ---- composition: only now, once the outcome is known ----
+        ac_ts_mark(s, cl, 6u);
+        if (n == 3u)
+        {
+            barrier(cl, s.fsrb_q, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            barrier(cl, s.fsrb_t, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            fg_dispatch_pass(s, cl, prevp, currp, ii, depth_ok, s.fsrb_q, outk, mv_el, 16u, 0u);
+            fg_dispatch_pass(s, cl, prevp, currp, ii, depth_ok, s.fsr_out, s.fg_outx[k][0], mv_el, 16u, 1u);
+            fg_dispatch_pass(s, cl, prevp, currp, ii, depth_ok, s.fsrb_t, s.fg_outx[k][1], mv_el, 16u, 2u);
+            barrier(cl, s.fsrb_q, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            barrier(cl, s.fsrb_t, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        else if (n == 2u)   // X3: 3x - 1/3 from fsrb_q, 2/3 from fsr_out
+        {
+            barrier(cl, s.fsrb_q, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            fg_dispatch_pass(s, cl, prevp, currp, ii, depth_ok, s.fsrb_q, outk, mv_el, 16u, 0u);
+            fg_dispatch_pass(s, cl, prevp, currp, ii, depth_ok, s.fsr_out, s.fg_outx[k][0], mv_el, 16u, 1u);
+            barrier(cl, s.fsrb_q, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        else
+            fg_dispatch_pass(s, cl, prevp, currp, ii, depth_ok, s.fsr_out, outk, mv_el, 16u, 0u);
+        ac_ts_mark(s, cl, 7u);
+        ac_ts_resolve(s, cl);
+        barrier(cl, s.fsr_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        // SF1: a line every ~30 s at 40 fps in shared mode.
+        const unsigned long long sft = s.sf_pairs4 + s.sf_pairs2;
+        if (shared && sft >= s.sf_logged + 1200ull)
+        {
+            s.sf_logged = sft;
+            auto avg = [&](unsigned q) { return s.ac_ts_n[q] ? s.ac_ts_sum[q] / (double)s.ac_ts_n[q] : -1.0; };
+            char l[600];
+            // DR7: per window (since the last line), not a running average - a jump
+            // shows at once. Frame-time stamps reused are cumulative.
+            const unsigned xm = s.amd_gen + 1u;   // X3
+            snprintf(l, sizeof l, "[MGPU][SF1] AMD %ux from one optical flow: %llu pair(s) at %ux, %llu at 2x | frame time "
+                     "%.2f ms; last value reused: %llu stamp(s) missing, %llu interval(s) invalid, %llu sequence "
+                     "break(s) | GPU ms avg/max, last ~30 s: AMD call (all %u frames) %.2f/%.2f, composition "
+                     "%.2f/%.2f | timing records lost %llu of %llu this window (%.1f%%), %llu in all%s.",
+                     xm, s.sf_pairs4, xm, s.sf_pairs2, s.fsr_dt_ms, s.fsr_dt_missing, s.fsr_dt_invalid, s.fsr_dt_breaks,
+                     s.amd_gen, avg(0), s.ac_ts_max[0], avg(3), s.ac_ts_max[3],
+                     s.ac_ts_win_lost, s.ac_ts_win_res,
+                     s.ac_ts_win_res ? 100.0 * (double)s.ac_ts_win_lost / (double)s.ac_ts_win_res : 0.0,
+                     s.ac_ts_lost, s.ac_ts_ok ? "" : " (GPU timing unavailable: -1)");
+            mgpu::diag::info(l);
+            s.ac_ts_win_res = 0; s.ac_ts_win_lost = 0;
+            for (unsigned q = 0; q < stream_state::AC_SEG; ++q) { s.ac_ts_sum[q] = 0.0; s.ac_ts_max[q] = 0.0; s.ac_ts_n[q] = 0; }
+
+            // WT1: during the slowest AMD calls, and during ordinary ones, how much
+            // of the time did the mod's other work run on the neural card - the
+            // present path (scaler, HUD, generated-frame presents) and the copies
+            // of the game's frames arriving? "alone" = none of it: AMD by itself,
+            // or work from outside the mod (Windows' desktop, other programs).
+            if (s.wt_top[0].ms > 0.0)
+            {
+                mgpu::gputime::overlap o{};
+                double tl = 0, tp = 0, tc = 0, ta = 0; unsigned tn = 0;
+                for (unsigned i = 0; i < s.wt_nsamp; ++i)
+                    if (mgpu::gputime::around(s.wt_samp[i].a, s.wt_samp[i].b, s.nq, &o))
+                    { tl += o.len_ms; tp += o.present_ms; tc += o.copy_ms; ta += o.any_ms; ++tn; }
+                char w[900];
+                int n = snprintf(w, sizeof w, "[MGPU][WT1] AMD call vs the mod's other work on the neural card (queue "
+                                 "priority %s) | typical (%u sampled): %.2f ms, present path %.2f, frame copies %.2f, "
+                                 "alone %.2f | slowest:", s.nq_high ? "HIGH" : "normal",
+                                 tn, tn ? tl / tn : 0.0, tn ? tp / tn : 0.0, tn ? tc / tn : 0.0,
+                                 tn ? (tl - ta) / tn : 0.0);
+                for (unsigned i = 0; i < stream_state::WT_TOP && n > 0 && n < (int)sizeof w; ++i)
+                {
+                    if (s.wt_top[i].ms <= 0.0) break;
+                    if (!mgpu::gputime::around(s.wt_top[i].a, s.wt_top[i].b, s.nq, &o)) continue;
+                    n += snprintf(w + n, sizeof w - (size_t)n, "%s %.1f ms (present %.1f in %d list(s), copies %.1f "
+                                  "in %d, alone %.1f)", i ? ";" : "", o.len_ms, o.present_ms, o.present_n,
+                                  o.copy_ms, o.copy_n, o.len_ms - o.any_ms);
+                }
+                mgpu::diag::info(w);
+            }
+            for (auto &c : s.wt_top) c = stream_state::wt_call{};
+            s.wt_nsamp = 0;
+        }
+
+        // AC1/AC3: a line every ~30 s at 40 fps while the chain is on.
+        const unsigned long long tot = s.ac.pairs4 + s.ac.pairs2;
+        if (enabled && tot >= s.ac_logged + 1200ull)
+        {
+            s.ac_logged = tot;
+            auto avg = [&](unsigned q) { return s.ac_ts_n[q] ? s.ac_ts_sum[q] / (double)s.ac_ts_n[q] : -1.0; };
+            char l[900];
+            snprintf(l, sizeof l, "[MGPU][AC4] AMD chained 4x: %llu pair(s) at 4x, %llu at 2x | B primed %llu time(s) "
+                     "(%llu failed), 1/4 made but 3/4 failed %llu, B step errors %llu%s | frame time %.2f ms from the "
+                     "game's hand-over stamps; last value reused: %llu stamp(s) missing, %llu interval(s) invalid, "
+                     "%llu sequence break(s) | GPU ms avg/max (steady state): A %.2f/%.2f, B 1/4 %.2f/%.2f, "
+                     "B 3/4 %.2f/%.2f, B prime %.2f/%.2f, composition %.2f/%.2f | timing records lost %llu%s.",
+                     s.ac.pairs4, s.ac.pairs2, s.ac.primes, s.ac.prime_fails, s.ac.partials, s.fsrb_errors,
+                     s.fsrb_failed ? " - chain OFF for this run" : "", s.fsr_dt_ms,
+                     s.fsr_dt_missing, s.fsr_dt_invalid, s.fsr_dt_breaks,
+                     avg(0), s.ac_ts_max[0], avg(1), s.ac_ts_max[1], avg(2), s.ac_ts_max[2],
+                     avg(4), s.ac_ts_max[4], avg(3), s.ac_ts_max[3], s.ac_ts_lost,
+                     s.ac_ts_ok ? "" : " (GPU timing unavailable: -1)");
+            mgpu::diag::info(l);
+            if (!s.ac_ts_warm_said && s.ac_ts_ok)   // AC4: once - first uses, setup included
+            {
+                s.ac_ts_warm_said = true;
+                snprintf(l, sizeof l, "[MGPU][AC4] first %u uses per stage (first-use setup included, not in the "
+                         "averages) - max GPU ms: A %.2f, B 1/4 %.2f, B 3/4 %.2f, B prime %.2f, composition %.2f.",
+                         stream_state::AC_WARM, s.ac_ts_warm_max[0], s.ac_ts_warm_max[1], s.ac_ts_warm_max[2],
+                         s.ac_ts_warm_max[4], s.ac_ts_warm_max[3]);
+                mgpu::diag::info(l);
+            }
+            for (unsigned q = 0; q < stream_state::AC_SEG; ++q) { s.ac_ts_sum[q] = 0.0; s.ac_ts_max[q] = 0.0; s.ac_ts_n[q] = 0; }
+        }
+        return n;
+    }
+
     // Returns true when it has put the HUD back onto nr_final itself (HL1),
     // so the caller must not do it a second time.
     static bool fg_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii,
@@ -14954,19 +16767,20 @@ namespace
                           bool hud)
     {
         ID3D12Resource *cur = s.nr_final;
-        if (cur == nullptr || cl == nullptr) return false;
+        if (cur == nullptr || cl == nullptr) { fd2_count(FD2_EARLY); return false; }
         if (!s.fg_built)
         {
             s.fg_built = fg_build(s, s.ndev_b, cur);
-            if (!s.fg_built) { s.fg_failed = true; return false; }
+            if (!s.fg_built) { s.fg_failed = true; fd2_count(FD2_EARLY); return false; }
         }
+        const bool fd2_prev_valid = s.fg_prev_valid;   // FD2: before this frame changes it
         const unsigned k = (s.fg_k + 1u) % stream_state::FG_SETS;   // the set this frame writes
         ID3D12Resource *const prev = s.fg_real[s.fg_k];               // the previous real frame
         ID3D12Resource *const real = s.fg_real[k];
         ID3D12Resource *const outk = s.fg_out[k];
         const D3D12_RESOURCE_DESC cd = cur->GetDesc();
         const D3D12_RESOURCE_DESC pd = real->GetDesc();
-        if (cd.Width != pd.Width || cd.Height != pd.Height || cd.Format != pd.Format) return false;
+        if (cd.Width != pd.Width || cd.Height != pd.Height || cd.Format != pd.Format) { fd2_count(FD2_EARLY); return false; }
         static_assert(stream_state::FG_SETS == 3, "FIX7 tracks three sets");
 
         // FIX7: set k may still be read by the present queue. Skip this frame
@@ -14975,6 +16789,7 @@ namespace
         if (!fg_set_writable(k))
         {
             g_fg_set_skips.fetch_add(1, std::memory_order_relaxed);
+            fd2_count(FD2_SET_BUSY); g_fd2_break = FD2_BROKEN_SET_BUSY;   // FD2
             s.fg_prev_valid = false;
             if (ext_up(s)) s.fsr_frame_id += 2ull;
             return false;
@@ -15013,7 +16828,9 @@ namespace
                 const bool want = prev_ok && mv_ok && depth_ok && s.fsr_out != nullptr;
                 gen = want && ext_record(s, cl, ii, hlk, mv_el);
                 if (!want && ext_up(s)) ++s.fsr_frame_id;
-                if (gen)
+                if (gen && s.fg_on == 3u)   // AC1: AMD, 2x or chained 4x
+                    gen_n = fsr_place(s, cl, k, ii, hlp, hlk, depth_ok, mv_el);
+                else if (gen)
                 {
                     barrier(cl, s.fsr_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -15043,6 +16860,14 @@ namespace
             barrier(cl, real, D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             barrier(cl, cur, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            // FD2: why no in-between frame, checked in the order the code checks.
+            if (gen) fd2_count(FD2_MADE);
+            else if (!fd2_prev_valid) fd2_count(g_fd2_break);
+            else if (!s.fg_hl_k[s.fg_k]) fd2_count(FD2_PREV_ORDINARY);
+            else if (!mv_ok) fd2_count(FD2_NO_MV);
+            else if (use_fsr && !depth_ok) fd2_count(FD2_NO_DEPTH);
+            else if (use_fsr && s.fsr_out == nullptr) fd2_count(FD2_NO_BUFFER);
+            else fd2_count(FD2_FG_CALL);
             s.fg_hl_k[k] = true;
             s.fg_prev_valid = true;
             s.fg_k = k;
@@ -15058,7 +16883,8 @@ namespace
         bool ui_done = false;
         if (hud) ui_done = ui_apply(s, cl, cur, ii, 0u);
         // A previous HUD-less set must not pair with this ordinary frame.
-        if (s.fg_hl_k[s.fg_k]) { s.fg_prev_valid = false; if (ext_up(s)) ++s.fsr_frame_id; }
+        const bool fd2_switch = s.fg_hl_k[s.fg_k] && fd2_prev_valid;   // FD2
+        if (s.fg_hl_k[s.fg_k]) { s.fg_prev_valid = false; if (ext_up(s)) ++s.fsr_frame_id; g_fd2_break = FD2_BROKEN_ORDINARY; }
         s.fg_hl_k[k] = false;
 
         // FIX7: the generators read the previous frame from fg_hl (NR-queue
@@ -15100,7 +16926,9 @@ namespace
             // next in-between frame would be built from a real frame two or
             // more presents back. Skipping an ID makes AMD reset its history.
             if (!want && ext_up(s)) ++s.fsr_frame_id;
-            if (gen)
+            if (gen && s.fg_on == 3u)   // AC1: AMD, 2x or chained 4x
+                gen_n = fsr_place(s, cl, k, ii, hprev, real, depth_ok, mv_el);
+            else if (gen)
             {
                 barrier(cl, s.fsr_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -15142,6 +16970,14 @@ namespace
             barrier(cl, cur, D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
+        // FD2: why no in-between frame on a frame without a HUD-less copy.
+        if (gen) fd2_count(FD2_MADE);
+        else if (fd2_switch) fd2_count(FD2_THIS_ORDINARY);
+        else if (!fd2_prev_valid) fd2_count(g_fd2_break);
+        else if (!mv_ok) fd2_count(FD2_NO_MV);
+        else if (use_fsr && !depth_ok) fd2_count(FD2_NO_DEPTH);
+        else if (!prev_readable || (use_fsr && s.fsr_out == nullptr)) fd2_count(FD2_NO_BUFFER);
+        else fd2_count(FD2_FG_CALL);
         s.fg_prev_valid = true;
         s.fg_k = k;
         s.fg_ready = f; s.fg_ready_k = k; s.fg_ready_gen = gen;
@@ -15397,7 +17233,7 @@ namespace
                          "and would have turned SRUpscale off on a title that is upscaling - "
                          "the defect measured on The Blood of Dawnwalker on 2026-09-17 - DLSS "
                          "Quality, declared render 1708x961, vectors allocated at 2560x1440 - "
-                         "and present since at least 0.2.1. If the buffer and the declaration "
+                         "and present in every build. If the buffer and the declaration "
                          "agree this line changes nothing and you will not see it. IT IS NOT A "
                          "FAULT: it means the declaration was available and was used.",
                          decl_src, decl_w, decl_h, s.width, s.height,
@@ -16433,8 +18269,19 @@ namespace
             // extra coverage - any death in any iteration is the same event
             // as far as the next launch is concerned.
             arm_sentinel_set();
+            // NM2: the network of the 2nd and later passes (NRModel2): 0 = as pass 1,
+            // 1 = A (original, big), 2 = B (fast, small). The hint is read at
+            // CreateFeature, so it is set on the shared parameter block just before
+            // handle 2 is made; handle 1 has already taken NRModel's.
+            const int nm2 = ini_read_sr_int("NRModel2", 0, 0, 2);
+            {
+                snprintf(line, sizeof line, "[MGPU][NM2] 2nd and later passes: %s (NRModel2=%d). Used at x2 and up.",
+                         nm2 == 1 ? "A, original (big)" : nm2 == 2 ? "B, fast (small)" : "same network as pass 1", nm2);
+                mgpu::diag::info(line);
+            }
             for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
             {
+                if (i == 1 && nm2 > 0) s.nr_params->Set("DLSSNR.Hint.Render.Preset", (unsigned int)nm2);   // NM2
                 const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
                 {
                     char am[200];
@@ -16590,9 +18437,22 @@ static bool sc_make_cover(HWND hwnd, int x, int y, UINT w, UINT h)
     IDCompositionDevice *dcomp = (IDCompositionDevice *)g_dcomp_device;
 
     SetWindowLongPtrW(hwnd, GWL_STYLE, (LONG_PTR)WS_POPUP);
+    // DF1 (experiment): CoverLayered=0 makes the cover an ordinary window.
+    // Windows composes a layered window every refresh, which keeps the
+    // picture off direct flip; but WS_EX_LAYERED is also what lets mouse
+    // clicks through to the game, so with 0 clicks may land on the cover
+    // (raw-input camera movement is unaffected). For a PresentMon test.
+    const bool cover_layered = ui_ini_read("CoverLayered", 1) != 0;
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (LONG_PTR)(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW |
-                                                    WS_EX_LAYERED | WS_EX_TRANSPARENT));
-    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+                                                    (cover_layered ? WS_EX_LAYERED : 0) | WS_EX_TRANSPARENT));
+    if (cover_layered) SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+    {
+        char dl[360];
+        snprintf(dl, sizeof dl, "[MGPU][DF1] cover window: %s (CoverLayered=%d)%s", cover_layered ? "layered, click-through" :
+                 "NOT layered - Windows may flip it directly; mouse clicks may stop reaching the game", cover_layered ? 1 : 0,
+                 cover_layered ? "" : ". Experiment: set CoverLayered=1 to go back.");
+        if (cover_layered) mgpu::diag::info(dl); else mgpu::diag::warn(dl);
+    }
     SetWindowPos(hwnd, HWND_TOPMOST, x, y, (int)w, (int)h, SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_HIDEWINDOW);
 
     IDCompositionTarget *t2 = nullptr;
@@ -16796,7 +18656,7 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
 
     {
         std::lock_guard<std::mutex> lk(S.cs);
-        for (int i = 0; i < 2; ++i)
+        for (unsigned i = 0; i < MAX_BB; ++i)   // PB1
             if (S.backbuffer[i] != nullptr) { S.backbuffer[i]->Release(); S.backbuffer[i] = nullptr; }
     }
 
@@ -16818,8 +18678,9 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
 
     // want_fmt, not a constant. This is DEFECT H's actual repair.
     UINT rflags = 0;
-    { std::lock_guard<std::mutex> lk(st().cs); rflags = st().chain_flags; }   // LP1: same flags as at creation
-    const HRESULT rb = sc->ResizeBuffers(2, buf_w, buf_h, want_fmt, rflags);
+    unsigned rbb = 2;   // PB1: the count the chain was created with
+    { std::lock_guard<std::mutex> lk(st().cs); rflags = st().chain_flags; rbb = st().bb_count; }   // LP1: same flags as at creation
+    const HRESULT rb = sc->ResizeBuffers(rbb, buf_w, buf_h, want_fmt, rflags);
 
     // ---- V69: A COMPOSITION SWAPCHAIN NEEDS A COMMIT AFTER A RESIZE ----
     //
@@ -16855,19 +18716,20 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
     // Re-acquire the backbuffers and rebuild the two RTVs.
     if (ok)
     {
-        ID3D12Resource *b0 = nullptr, *b1 = nullptr;
-        HRESULT h0 = sc->GetBuffer(0, IID_PPV_ARGS(&b0));
-        HRESULT h1 = SUCCEEDED(h0) ? sc->GetBuffer(1, IID_PPV_ARGS(&b1)) : h0;
-        if (SUCCEEDED(h1) && heap != nullptr)
+        ID3D12Resource *bn[MAX_BB] = {};   // PB1
+        HRESULT hn = S_OK;
+        for (unsigned i = 0; i < rbb && SUCCEEDED(hn); ++i) hn = sc->GetBuffer(i, IID_PPV_ARGS(&bn[i]));
+        if (SUCCEEDED(hn) && heap != nullptr)
         {
             const UINT rs = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-            D3D12_CPU_DESCRIPTOR_HANDLE d0 = heap->GetCPUDescriptorHandleForHeapStart();
-            D3D12_CPU_DESCRIPTOR_HANDLE d1 = d0; d1.ptr += rs;
-            dev->CreateRenderTargetView(b0, nullptr, d0);
-            dev->CreateRenderTargetView(b1, nullptr, d1);
+            for (unsigned i = 0; i < rbb; ++i)
+            {
+                D3D12_CPU_DESCRIPTOR_HANDLE d = heap->GetCPUDescriptorHandleForHeapStart();
+                d.ptr += (SIZE_T)i * rs;
+                dev->CreateRenderTargetView(bn[i], nullptr, d);
+            }
             std::lock_guard<std::mutex> lk(S.cs);
-            S.backbuffer[0] = b0;
-            S.backbuffer[1] = b1;
+            for (unsigned i = 0; i < MAX_BB; ++i) S.backbuffer[i] = bn[i];
             S.chain_w = buf_w;
             S.chain_h = buf_h;
             S.chain_fmt = want_fmt;
@@ -16875,8 +18737,7 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
         }
         else
         {
-            if (b0 != nullptr) b0->Release();
-            if (b1 != nullptr) b1->Release();
+            for (unsigned i = 0; i < MAX_BB; ++i) if (bn[i] != nullptr) bn[i]->Release();   // PB1
             ok = false;
         }
     }
@@ -17432,9 +19293,9 @@ namespace dispcfg
             dxgi_game_outputs, dxgi_bridge_outputs,
             ((on_game != 0) != (dxgi_game_outputs != 0) ||
              (on_bridge != 0) != (dxgi_bridge_outputs != 0))
-                ? "  <- CCD AND DXGI DISAGREE. Trust the DXGI count: it is what "
-                  "[P7.10] and the window placement already act on. A mismatch "
-                  "here is a LUID-namespace difference, not a second display."
+                ? "  <- CCD AND DXGI DISAGREE. When DXGI names no monitor on the "
+                  "bridge card, [P7.10] window placement asks CCD (AM1); a "
+                  "mismatch is not a second display."
                 : "");
 
         // The CCD adapterId is a LUID but it is the DISPLAY adapter's, which is
@@ -17929,7 +19790,7 @@ bool ngx_probe_scene_hold_decide(char *why, size_t n)   // R282/R287: once, brid
     const bool keyed = ini_has_key("NgxProbeAfterScene");
     if (keyed && !ini_read_flag("NgxProbeAfterScene"))
     {
-        snprintf(why, n, "[MGPU][R282] scene hold OFF (NgxProbeAfterScene is not 1): the probe runs as in 0.3.0.");
+        snprintf(why, n, "[MGPU][R282] scene hold OFF (NgxProbeAfterScene is not 1): the probe runs as in older builds.");
         return false;
     }
     const bool d3d12 = g_game_d3d12.load(std::memory_order_acquire);
@@ -17938,7 +19799,7 @@ bool ngx_probe_scene_hold_decide(char *why, size_t n)   // R282/R287: once, brid
     snprintf(why, n, "[MGPU][R287] scene hold APPLIED (%s): our first NGX Init waits for the game's first DLSS evaluate; "
                      "on a title without DLSS the probe never runs and the first NGX Init is the arm's. Game chain "
                      "D3D12=%s, NGX core loaded=%s, Streamline=%s.",
-             keyed ? "NgxProbeAfterScene=1" : "default since 0.3.1",
+             keyed ? "NgxProbeAfterScene=1" : "the default",
              d3d12 ? "yes" : "no", core ? "yes" : "no", sl ? "yes" : "no");
     return true;
 }
@@ -18554,9 +20415,30 @@ void ui_dll_versions(char *out, unsigned n)
 {
     if (out == nullptr || n == 0) return;
     std::lock_guard<std::mutex> lk(g_dv_mx);
-    snprintf(out, n, "NR %s | SR %s | FG %s | FSR %s",
-             g_dv[0][0] ? g_dv[0] : "-", g_dv[1][0] ? g_dv[1] : "-", g_dv[2][0] ? g_dv[2] : "-",
-             g_dv[3][0] ? g_dv[3] : "-");
+    // DV2: AMD as "FSR 3.1.6 (4.0.1.2740 local)" and, when loaded, "FSR 4x 3.1.6-mgpu1 (local)".
+    char amd[96] = "-", reb[96] = "";
+    if (g_dv[3][0])   // AMD's slot (holds the rebuilt build when AMD's own file is missing)
+        snprintf(amd, sizeof amd, "%s (%s)", g_dv_prov[0][0] ? g_dv_prov[0] : (g_dv_prov[1][0] ? g_dv_prov[1] : "?"), g_dv[3]);
+    if (g_dv[4][0] || g_dv_prov[1][0])
+        snprintf(reb, sizeof reb, " | FSR 4x %s (rebuilt)", g_dv_prov[1][0] ? g_dv_prov[1] : "?");
+    snprintf(out, n, "NR %s | SR %s | FG %s | FSR %s%s",
+             g_dv[0][0] ? g_dv[0] : "-", g_dv[1][0] ? g_dv[1] : "-", g_dv[2][0] ? g_dv[2] : "-", amd, reb);
+}
+
+// DV2: which AMD DLL makes the frames right now, for the AMD panel block.
+void ui_fsr_in_use(char *out, unsigned n)
+{
+    if (out == nullptr || n == 0) return;
+    out[0] = '\0';
+    const int m = g_amd_mode_now.load(std::memory_order_relaxed);
+    if (m < 0) return;
+    std::lock_guard<std::mutex> lk(g_dv_mx);
+    const char *a = g_dv_prov[0][0] ? g_dv_prov[0] : (g_dv_prov[1][0] ? g_dv_prov[1] : "?");
+    if (m == 11 || m == 12)   // X3: 11 = 3x, 12 = 4x
+        snprintf(out, n, "In use: %dx - rebuilt AMD DLL (%s)", m - 8, g_dv_prov[1][0] ? g_dv_prov[1] : "?");
+    else if (m == 2) snprintf(out, n, "In use: 4x chained - AMD's DLL (%s), not optimal", a);
+    else             snprintf(out, n, "In use: 2x - %s (%s)",
+                              (g_dv_prov[0][0] && !is_mgpu_rebuild(g_dv_prov[0])) ? "AMD's DLL" : "rebuilt AMD DLL", a);
 }
 
 // SC1: scaler filter and sharpness (live once the window is monitor-sized).
@@ -18680,6 +20562,15 @@ void ui_set_nr_model(int m)
     (void)ui_ini_write("NRModel", m);
 }
 
+// NM2: the 2nd and later passes' network, applied when NR is created (next launch).
+int  ui_nr_model2()     { return ini_read_sr_int("NRModel2", 0, 0, 2); }
+void ui_set_nr_model2(int m)
+{
+    if (m < 0) m = 0;
+    if (m > 2) m = 2;
+    (void)ui_ini_write("NRModel2", m);
+}
+
 // CK1: clock and stopwatch.
 static std::atomic<int> g_clock_show{-1};
 static std::atomic<bool> g_sw_show{false};
@@ -18727,6 +20618,31 @@ static std::atomic<double> g_bus_game_gbs{0.0};
 static std::atomic<double> g_nv_out{-1.0}, g_nv_in{-1.0};
 static std::atomic<bool> g_nv_started{false}, g_nv_stop{false}, g_nv_running{false};
 static std::atomic<unsigned long long> g_nv_want{0};   // last time a reader asked (no sampling 5 s after)
+// DR8: each card's SM clock, power against its limit, temperature, clock limiters
+// and the driver's own utilisation, from the same thread about once a second.
+// PF1 prints and resets them every window. [0] render card, [1] neural card.
+struct nvx_acc
+{
+    double clk = 0.0, pw = 0.0, pw_max = 0.0, util = 0.0;
+    unsigned clk_min = ~0u, clk_rated = 0, pw_lim = 0, temp_max = 0, n = 0;
+    unsigned long long reasons = 0;
+};
+static std::mutex g_nvx_mx;
+static nvx_acc g_nvx[2];
+static nvx_acc g_nvx_bs;   // BM3: the neural card, reset per sweep step (PF1 does not touch it)
+static std::atomic<int> g_nvx_util_in{-1};   // last neural-card utilisation %, -1 = none
+static void nvx_text(const nvx_acc &a, char *out, size_t n)
+{
+    if (a.n == 0) { snprintf(out, n, "-"); return; }
+    char lim[64] = "";
+    const unsigned long long r = a.reasons;
+    if (r & 0x4ull)            strcat(lim, " power");
+    if (r & (0x40ull | 0x80ull)) strcat(lim, " thermal");
+    if (r & (0x8ull | 0x100ull)) strcat(lim, " hw-slowdown");
+    snprintf(out, n, "SM %.0f MHz avg (min %u, rated %u), power %.0f%% avg / %.0f%% max of %u W, %u C, driver-busy %.0f%%, "
+             "clock limited by:%s", a.clk / a.n, a.clk_min == ~0u ? 0u : a.clk_min, a.clk_rated, a.pw / a.n, a.pw_max,
+             a.pw_lim / 1000u, a.temp_max, a.util / a.n, lim[0] ? lim : " none");
+}
 static void nvml_thread()
 {
     typedef int (*pf_init)();
@@ -18741,6 +20657,20 @@ static void nvml_thread()
     pf_handle hnd = m ? (pf_handle)GetProcAddress(m, "nvmlDeviceGetHandleByIndex_v2") : nullptr;
     pf_name nm = m ? (pf_name)GetProcAddress(m, "nvmlDeviceGetName") : nullptr;
     pf_pcie pc = m ? (pf_pcie)GetProcAddress(m, "nvmlDeviceGetPcieThroughput") : nullptr;
+    // DR8: optional - each missing one just leaves its figure out.
+    typedef int (*pf_u)(void *, int, unsigned *);
+    typedef int (*pf_p)(void *, unsigned *);
+    typedef int (*pf_r)(void *, unsigned long long *);
+    struct nv_util { unsigned gpu, memory; };
+    typedef int (*pf_ut)(void *, nv_util *);
+    pf_u clk_now = m ? (pf_u)GetProcAddress(m, "nvmlDeviceGetClockInfo") : nullptr;
+    pf_u clk_max = m ? (pf_u)GetProcAddress(m, "nvmlDeviceGetMaxClockInfo") : nullptr;
+    pf_u temp = m ? (pf_u)GetProcAddress(m, "nvmlDeviceGetTemperature") : nullptr;
+    pf_p pw_now = m ? (pf_p)GetProcAddress(m, "nvmlDeviceGetPowerUsage") : nullptr;
+    pf_p pw_lim = m ? (pf_p)GetProcAddress(m, "nvmlDeviceGetEnforcedPowerLimit") : nullptr;
+    pf_r why = m ? (pf_r)GetProcAddress(m, "nvmlDeviceGetCurrentClocksEventReasons") : nullptr;
+    if (why == nullptr && m) why = (pf_r)GetProcAddress(m, "nvmlDeviceGetCurrentClocksThrottleReasons");
+    pf_ut util = m ? (pf_ut)GetProcAddress(m, "nvmlDeviceGetUtilizationRates") : nullptr;
     void *dev_out = nullptr, *dev_in = nullptr;
     char n_out[96] = "?", n_in[96] = "?";
     if (init && cnt && hnd && nm && pc && init() == 0)
@@ -18765,6 +20695,35 @@ static void nvml_thread()
     if (dev_out == nullptr && dev_in == nullptr) { g_nv_running.store(false); return; }
     double so = 0.0, si = 0.0; unsigned k = 0;
     ULONGLONG t0 = GetTickCount64();
+    ULONGLONG t_nvx = 0;
+    auto nvx_sample = [&](void *d, int i)   // DR8
+    {
+        if (d == nullptr) return;
+        unsigned c = 0, cm = 0, t = 0, p = 0, pl = 0; unsigned long long rs = 0; nv_util u{};
+        const bool hc = clk_now && clk_now(d, 1, &c) == 0;             // NVML_CLOCK_SM
+        const bool hm = clk_max && clk_max(d, 1, &cm) == 0;
+        const bool ht = temp && temp(d, 0, &t) == 0;                   // NVML_TEMPERATURE_GPU
+        const bool hp = pw_now && pw_now(d, &p) == 0;
+        const bool hl = pw_lim && pw_lim(d, &pl) == 0 && pl > 0;
+        const bool hr = why && why(d, &rs) == 0;
+        const bool hu = util && util(d, &u) == 0;
+        if (!hc && !hp && !hu) return;
+        std::lock_guard<std::mutex> lk(g_nvx_mx);
+        if (hu && i == 1) g_nvx_util_in.store((int)u.gpu, std::memory_order_relaxed);
+        nvx_acc *const tg[2] = { &g_nvx[i], i == 1 ? &g_nvx_bs : nullptr };   // BM3: the sweep's copy
+        for (nvx_acc *ap : tg)
+        {
+            if (ap == nullptr) continue;
+            nvx_acc &a = *ap;
+            ++a.n;
+            if (hc) { a.clk += c; if (c < a.clk_min) a.clk_min = c; }
+            if (hm) a.clk_rated = cm;
+            if (ht && t > a.temp_max) a.temp_max = t;
+            if (hp && hl) { const double pct = 100.0 * p / pl; a.pw += pct; if (pct > a.pw_max) a.pw_max = pct; a.pw_lim = pl; }
+            if (hr) a.reasons |= rs;
+            if (hu) a.util += u.gpu;
+        }
+    };
     while (!g_nv_stop.load(std::memory_order_relaxed))
     {
         if (GetTickCount64() - g_nv_want.load(std::memory_order_relaxed) > 5000ull)
@@ -18779,6 +20738,12 @@ static void nvml_thread()
         if (dev_in && pc(dev_in, 1, &v) == 0) si += (double)v * 1024.0;     // RX, KB/s
         ++k;
         const ULONGLONG now = GetTickCount64();
+        if (now - t_nvx >= 1000)   // DR8: about once a second
+        {
+            t_nvx = now;
+            nvx_sample(dev_out, 0);
+            nvx_sample(dev_in, 1);
+        }
         if (now - t0 >= 1000 && k > 0)
         {
             g_nv_out.store(dev_out ? so / k / 1e9 : -1.0, std::memory_order_relaxed);
@@ -18789,6 +20754,38 @@ static void nvml_thread()
     }
     g_nv_running.store(false);
 }
+static void pf_nvx_append(char *out, size_t n)
+{
+    if (out == nullptr || n < 16) return;
+    char a[300], b[300];
+    {
+        std::lock_guard<std::mutex> lk(g_nvx_mx);
+        if (g_nvx[0].n == 0 && g_nvx[1].n == 0) { out[0] = '\0'; return; }
+        nvx_text(g_nvx[1], a, sizeof a);
+        nvx_text(g_nvx[0], b, sizeof b);
+        g_nvx[0] = nvx_acc{}; g_nvx[1] = nvx_acc{};
+    }
+    snprintf(out, n, " | neural card: %s | render card: %s", a, b);
+}
+// BM3: the sweep's own window on the neural card's NVML figures.
+void ui_bs_nvx_reset()
+{
+    std::lock_guard<std::mutex> lk(g_nvx_mx);
+    g_nvx_bs = nvx_acc{};
+}
+bool ui_bs_nvx_take(float *power_pct, float *busy_pct, float *clk_mhz, int *temp_max)
+{
+    std::lock_guard<std::mutex> lk(g_nvx_mx);
+    const nvx_acc a = g_nvx_bs;
+    g_nvx_bs = nvx_acc{};
+    if (a.n == 0) return false;
+    if (power_pct) *power_pct = a.pw_lim ? (float)(a.pw / a.n) : -1.0f;
+    if (busy_pct)  *busy_pct  = (float)(a.util / a.n);
+    if (clk_mhz)   *clk_mhz   = (float)(a.clk / a.n);
+    if (temp_max)  *temp_max  = (int)a.temp_max;
+    return true;
+}
+void ui_nvml_keepalive() { nvml_start(); }
 static void nvml_start()
 {
     g_nv_want.store(GetTickCount64(), std::memory_order_relaxed);
@@ -18919,6 +20916,9 @@ static bool screensaver_tick()
     static bool xtried = false;
     static ULONGLONG last_pad = 0, polled = 0, said_at = 0;
     static WORD last_buttons[4] = {};
+    static bool any_pad_seen = false, no_pad_said = false;   // SV5
+    static ULONGLONG last_held = 0, held_polled = 0;          // SV6
+    static POINT last_cur{ LONG_MIN, LONG_MIN };              // SV6: the pointer, on any screen
     static unsigned said_n = 0;
     const ULONGLONG now = GetTickCount64();
     const int mins = ui_screensaver_minutes();
@@ -18930,6 +20930,12 @@ static bool screensaver_tick()
     static ULONGLONG panel_at = 0;
     const bool panel = mgpu::live_panel::live() || ui_panel_is_open();   // either window, any mode
     if (panel) panel_at = now;
+    // SV5: the wait starts when the saver first looks, not at "never". Before,
+    // no key, mouse or controller input since the hooks started counted as idle
+    // for ever, so the saver came up the moment the picture first showed
+    // (2026-11-10 20:30:22, 40 s after launch).
+    static ULONGLONG watch_at = 0;
+    if (watch_at == 0) watch_at = now;
     if (mins > 0 && !panel)
     {
         if (!xtried)
@@ -18946,12 +20952,48 @@ static bool screensaver_tick()
             {
                 xstate st{};
                 if (xget(i, &st) != 0) continue;   // no pad in that slot
+                static bool pad_said[4] = {};   // SV5: say once which slots answer
+                if (!pad_said[i])
+                {
+                    pad_said[i] = true;
+                    char pl[160];
+                    snprintf(pl, sizeof pl, "[MGPU][SV5] screen saver: an XInput controller answers in slot %lu - "
+                             "its buttons and sticks count as input.", (unsigned long)i);
+                    mgpu::diag::info(pl);
+                }
                 auto past = [](SHORT v, int dz) { return v > dz || v < -dz; };
                 const bool moved = st.pad.buttons != last_buttons[i] || st.pad.lt > 30 || st.pad.rt > 30 ||
                                    past(st.pad.lx, 7849) || past(st.pad.ly, 7849) ||
                                    past(st.pad.rx, 8689) || past(st.pad.ry, 8689);
                 last_buttons[i] = st.pad.buttons;
                 if (moved) last_pad = now;
+                any_pad_seen = true;   // SV5
+            }
+            if (!any_pad_seen && !no_pad_said && now - watch_at > 60000ull)   // SV5
+            {
+                no_pad_said = true;
+                mgpu::diag::info("[MGPU][SV5] screen saver: no XInput controller answers, so controller input is not "
+                                 "counted (keyboard and mouse are). A controller that is not XInput, such as a "
+                                 "PlayStation pad used directly, is not seen.");
+            }
+        }
+        // SV6: keys held right now, read directly every 250 ms. The keyboard
+        // hook has seen no key in any session since SV3 ('key never' in every
+        // SV3 line), so walking with the keyboard alone counted as idle and the
+        // saver came on in play (2026-11-09 20:34:51, Windows' own timer 5 s).
+        if (now - held_polled >= 250)
+        {
+            held_polled = now;
+            for (int vk = 0x01; vk <= 0xFE; ++vk)
+                if (GetAsyncKeyState(vk) & 0x8000) { last_held = now; break; }
+            // The pointer moving on any monitor counts too: the mouse hook only
+            // counts while the game is in front, and a player using another
+            // program on the second screen during loading is not idle.
+            POINT cp{};
+            if (GetCursorPos(&cp))
+            {
+                if (last_cur.x != LONG_MIN && (cp.x != last_cur.x || cp.y != last_cur.y)) last_held = now;
+                last_cur = cp;
             }
         }
         LASTINPUTINFO li{ sizeof li, 0 };
@@ -18963,7 +21005,9 @@ static bool screensaver_tick()
         const bool hooks = mgpu::hotkeys::real_input_ages(key_ms, mouse_ms);
         ULONGLONG idle_ms = hooks ? (key_ms < mouse_ms ? key_ms : mouse_ms) : win_ms;
         if (pad_ms < idle_ms) idle_ms = pad_ms;
+        if (last_held != 0 && now - last_held < idle_ms) idle_ms = now - last_held;   // SV6
         if (panel_at != 0 && now - panel_at < idle_ms) idle_ms = now - panel_at;   // SV4
+        if (now - watch_at < idle_ms) idle_ms = now - watch_at;                    // SV5
         idle = idle_ms >= (ULONGLONG)mins * 60000ull;
         if (!idle && said_n < 10u && (said_at == 0 || now - said_at >= 30000ull))
         {
@@ -18975,8 +21019,12 @@ static bool screensaver_tick()
             char l[260], kl[24], ml[24], pl[24];
             age(key_ms, kl, sizeof kl); age(mouse_ms, ml, sizeof ml); age(pad_ms, pl, sizeof pl);
             if (hooks)
-                snprintf(l, sizeof l, "[MGPU][SV3] screen saver waiting (%d min): key %s, mouse %s, controller %s "
-                         "(Windows' own idle timer: %llu s - not used).", mins, kl, ml, pl, win_ms / 1000ull);
+            {
+                char hl[24];
+                age(last_held != 0 ? now - last_held : ~0ull, hl, sizeof hl);
+                snprintf(l, sizeof l, "[MGPU][SV3] screen saver waiting (%d min): key %s (held: %s), mouse %s, controller %s "
+                         "(Windows' own idle timer: %llu s - not used).", mins, kl, hl, ml, pl, win_ms / 1000ull);
+            }
             else
                 snprintf(l, sizeof l, "[MGPU][SV3] screen saver waiting (%d min): Windows' idle timer %llu s, controller %s "
                          "(the mod's input hooks are not running).", mins, win_ms / 1000ull, pl);
@@ -19916,6 +21964,42 @@ static unsigned long long s_fw_prev_cap = 0;   // FW1: the previous real frame's
 
 // ---- FC1: the even frame clock (FGClock=1; dynamic multiplier, NVIDIA FG) ----
 // See fg_clock.hpp. Off by default; live from the panel.
+static std::atomic<int> g_ac_on{-1};   // AC1: FSRChain, AMD 4x by a second context
+static int ac_on_now()
+{
+    int v = g_ac_on.load(std::memory_order_relaxed);
+    if (v < 0) { v = ini_read_sr_int("FSRChain", 0, 0, 1); g_ac_on.store(v); }
+    return v;
+}
+// X3: AMD's multiplier. FSRMult 2/3/4; without it, FSRChain=1 means 4 (as before).
+// 3x and the rebuilt 4x need the rebuilt DLL; the chained fallback is 4x only.
+static std::atomic<int> g_amd_mult{-1};
+static int amd_mult_now()
+{
+    int v = g_amd_mult.load(std::memory_order_relaxed);
+    if (v < 0)
+    {
+        v = ini_read_sr_int("FSRMult", 0, 0, 4);
+        if (v < 2) v = ac_on_now() != 0 ? 4 : 2;
+        g_amd_mult.store(v);
+    }
+    return v;
+}
+// GV1: the rebuilt DLL's quality preset and its timing log (the DLL is told
+// through a private key; AMD's own DLL never sees them).
+static std::atomic<int> g_amd_q{-1}, g_amd_tm{-1};
+static int amd_quality_now()
+{
+    int v = g_amd_q.load(std::memory_order_relaxed);
+    if (v < 0) { v = ini_read_sr_int("FSRQuality", 0, 0, 2); g_amd_q.store(v); }
+    return v;
+}
+static int amd_timing_now()
+{
+    int v = g_amd_tm.load(std::memory_order_relaxed);
+    if (v < 0) { v = ini_read_sr_int("FSRTiming", 0, 0, 1); g_amd_tm.store(v); }
+    return v;
+}
 static std::atomic<int> g_fc_on{-1};
 static int fc_on_now()
 {
@@ -19954,6 +22038,144 @@ static void fc_wait_until(double qpc)
     }
 }
 
+
+// ---- FD1: why shown frames go missing (read-only, present thread only) ----
+// The 2026-11-08 13:27 gunfight showed 165 of 180 fps with ~35 gaps of one
+// real frame (25 ms) per 10 s while the game held 40 fps and NR took ~5 ms,
+// and Frame Warp had paused itself at the same moment. PF1/FC1 count the
+// gaps; this sorts each one by what the present thread was doing, so the
+// cause is known before anything is changed. A gap is a hitch when it is
+// over twice the target frame time (PF1 uses twice its running average).
+struct fd_stats
+{
+    long long last_present = 0;       // QPC at the end of the last shown frame
+    long long last_arrive = 0;        // QPC when the previous pair arrived
+    bool first = false;               // the next present is the first of a pair
+    bool real_only = false;           // this pair carries no in-between frame
+    double wait_ms = 0.0;             // how long the thread waited for this pair
+    unsigned hits = 0, h_wait = 0, h_nogen = 0, h_slow = 0, h_inside = 0;
+    double h_max = 0.0, slow_max = 0.0;
+    unsigned pairs = 0, p_nogen = 0, p_fallback = 0, p_late = 0;
+    double arrive_max = 0.0;
+    unsigned shown = 0, fw_on = 0;
+    unsigned long long jobs_dropped0 = 0;
+};
+static fd_stats g_fd;
+// DR5: running totals the resolution controller reads from its own thread -
+// pairs handed to the present thread, those without in-between frames, and
+// hitches where the present thread was waiting for the next pair (FD1's
+// "waited for the next pair"). Measured 2026-11-14 on Black Myth at 40 x 3/4:
+// 0-21 per 10 s at 65% neural resolution (smooth), 36-122 at 77% (uneven).
+static std::atomic<unsigned long long> g_fd_tot_pairs{0}, g_fd_tot_nogen{0}, g_fd_tot_wait{0};
+static unsigned long long g_fd_log_at = 0;
+static double fd_ms(long long a, long long b)
+{
+    LARGE_INTEGER f{}; QueryPerformanceFrequency(&f);
+    return f.QuadPart > 0 ? (double)(a - b) * 1000.0 / (double)f.QuadPart : 0.0;
+}
+static long long fd_qpc() { LARGE_INTEGER q{}; QueryPerformanceCounter(&q); return q.QuadPart; }
+static void fd_pair(double wait_ms, const fg_job &job)
+{
+    const long long now = fd_qpc();
+    g_fd.first = true;
+    g_fd.wait_ms = wait_ms;
+    g_fd.real_only = (job.gen == nullptr && job.real != nullptr);
+    ++g_fd.pairs;
+    if (g_fd.real_only) ++g_fd.p_nogen;
+    g_fd_tot_pairs.fetch_add(1, std::memory_order_relaxed);                       // DR5
+    if (g_fd.real_only) g_fd_tot_nogen.fetch_add(1, std::memory_order_relaxed);
+    if (g_fd.last_arrive != 0)
+    {
+        const double d = fd_ms(now, g_fd.last_arrive);
+        if (d < 200.0)
+        {
+            if (d > g_fd.arrive_max) g_fd.arrive_max = d;
+            if (g_fg_ema_ms > 0.0 && d > g_fg_ema_ms * 1.5) ++g_fd.p_late;
+        }
+    }
+    g_fd.last_arrive = now;
+}
+// After a shown frame: t0 = QPC just before present_frame was called.
+static void fd_shown(long long t0)
+{
+    const long long now = fd_qpc();
+    ++g_fd.shown;
+    if (mgpu::framewarp::enabled() && mgpu::framewarp::camera_live()) ++g_fd.fw_on;
+    const int target = dyn_target_now();
+    if (g_fd.last_present != 0 && target > 0)
+    {
+        const double gap = fd_ms(now, g_fd.last_present);
+        const double call = fd_ms(now, t0);
+        if (gap < 200.0 && gap > 2.0 * 1000.0 / (double)target)
+        {
+            ++g_fd.hits;
+            if (gap > g_fd.h_max) g_fd.h_max = gap;
+            if (call > gap * 0.5) { ++g_fd.h_slow; if (call > g_fd.slow_max) g_fd.slow_max = call; }
+            else if (g_fd.first && g_fd.wait_ms > gap * 0.5)
+            { ++g_fd.h_wait; g_fd_tot_wait.fetch_add(1, std::memory_order_relaxed); }   // DR5
+            else if (g_fd.first && g_fd.real_only) ++g_fd.h_nogen;
+            else ++g_fd.h_inside;
+        }
+    }
+    g_fd.last_present = now;
+    g_fd.first = false;
+}
+static void fd_report()
+{
+    const unsigned long long t = GetTickCount64();
+    if (g_fd_log_at == 0) { g_fd_log_at = t; g_fd.jobs_dropped0 = g_fgp_dropped_jobs.load(); return; }
+    if (t - g_fd_log_at < 10000ull) return;
+    g_fd_log_at = t;
+    const unsigned long long dj = g_fgp_dropped_jobs.load();
+    if (g_fd.pairs > 0)
+    {
+        char fw[64];
+        if (!mgpu::framewarp::enabled()) snprintf(fw, sizeof fw, "Frame Warp off");
+        else snprintf(fw, sizeof fw, "Frame Warp running for %.0f%% of shown frames",
+                      g_fd.shown ? 100.0 * g_fd.fw_on / g_fd.shown : 0.0);
+        char l[520];
+        snprintf(l, sizeof l,
+                 "[MGPU][FD1] last 10 s: %u hitch(es), longest %.1f ms - waited for the next pair %u, pair came without "
+                 "in-between frames %u, slow Present %u (longest call %.1f ms), inside a pair %u | pairs %u: without "
+                 "in-between frames %u, not on the even clock %u, arrived over 1.5x the real-frame time %u (longest "
+                 "%.1f ms), dropped at hand-off %llu | %s.",
+                 g_fd.hits, g_fd.h_max, g_fd.h_wait, g_fd.h_nogen, g_fd.h_slow, g_fd.slow_max, g_fd.h_inside,
+                 g_fd.pairs, g_fd.p_nogen, g_fd.p_fallback, g_fd.p_late, g_fd.arrive_max,
+                 dj - g_fd.jobs_dropped0, fw);
+        mgpu::diag::info(l);
+    }
+    // FD2: why real frames got no in-between frames, over the same 10 s.
+    {
+        static unsigned long long prev[FD2_N] = {};
+        unsigned long long d[FD2_N];
+        unsigned long long missed = 0;
+        for (unsigned i = 0; i < FD2_N; ++i)
+        {
+            const unsigned long long v = g_fd2[i].load(std::memory_order_relaxed);
+            d[i] = v - prev[i]; prev[i] = v;
+            if (i != FD2_MADE) missed += d[i];
+        }
+        if (g_fd.pairs > 0 || missed > 0)
+        {
+            char l[800];
+            snprintf(l, sizeof l,
+                     "[MGPU][FD2] last 10 s: %llu real frame(s) with in-between frames generated (not necessarily shown; see FC1/PF1), %llu without - set still being "
+                     "shown %llu, no HUD-less copy %llu, the frame before had none %llu | pair broken the frame before by: "
+                     "a busy set %llu, a frame without HUD-less copy %llu, a frame generation skipped %llu, a start or "
+                     "change %llu | generation skipped (failed NR pass, menu) %llu | no motion vectors %llu, no depth %llu, "
+                     "no buffer %llu, generator made nothing %llu, nothing to work from %llu.",
+                     d[FD2_MADE], missed, d[FD2_SET_BUSY], d[FD2_THIS_ORDINARY], d[FD2_PREV_ORDINARY],
+                     d[FD2_BROKEN_SET_BUSY], d[FD2_BROKEN_ORDINARY], d[FD2_BROKEN_NOT_RUN], d[FD2_BROKEN_OTHER],
+                     d[FD2_NOT_RUN], d[FD2_NO_MV], d[FD2_NO_DEPTH], d[FD2_NO_BUFFER], d[FD2_FG_CALL], d[FD2_EARLY]);
+            mgpu::diag::info(l);
+        }
+    }
+    const long long lp = g_fd.last_present, la = g_fd.last_arrive;
+    g_fd = fd_stats{};
+    g_fd.last_present = lp; g_fd.last_arrive = la;
+    g_fd.jobs_dropped0 = dj;
+}
+
 static void fg_present_thread_main()
 {
     // DMF5: the FGGlobalPace experiment (PERF1, one fixed output clock across
@@ -19966,11 +22188,14 @@ static void fg_present_thread_main()
         fg_job job;
         {
             std::unique_lock<std::mutex> lk(g_fgp_mx);
+            const long long fd_w0 = fd_qpc();   // FD1
             g_fgp_cv.wait(lk, [] { return g_fgp_has || g_fgp_stop; });
             if (g_fgp_stop) return;   // a pending job is dropped by fg_present_stop
             job = g_fgp_job;
             g_fgp_has = false;
+            fd_pair(fd_ms(fd_qpc(), fd_w0), job);   // FD1
         }
+        fd_report();   // FD1
         fg_retire_completed();
         // PERF1: pending work lost at the hand-off, every 30 s.
         const unsigned long long perf1_now = GetTickCount64();
@@ -20047,7 +22272,9 @@ static void fg_present_thread_main()
                         t_fg_is_gen = !real;
                         t_fg_cap = real ? job.cap_qpc : 0ull;
                         t_fg_content = real ? job.cap_qpc : (unsigned long long)c[j];   // FW1: the scene time of this frame
+                        const long long fd_t0 = fd_qpc();   // FD1
                         const bool pok = present_frame(job.r, job.g, job.b);
+                        if (pok) fd_shown(fd_t0);
                         t_fg_content = 0; t_fg_cap = 0; t_fg_is_gen = false; t_fg_src = nullptr;
                         if (t_present_fv > fv) fv = t_present_fv;
                         if (pok)
@@ -20066,6 +22293,7 @@ static void fg_present_thread_main()
             }
         }
         if (!clock_done) g_fc.reset();   // the next clocked pair starts a fresh grid
+        if (!clock_done && job.gen != nullptr) ++g_fd.p_fallback;   // FD1
         if (!clock_done && job.gen != nullptr)
         {
             // DLSSG2: N in-between frames, evenly spaced across the NR interval:
@@ -20093,7 +22321,9 @@ static void fg_present_thread_main()
                 t_fg_content = (span == 0ull) ? cap
                              : (job.frac[i] > 0.0f) ? cap - span + (unsigned long long)((double)span * (double)job.frac[i])   // DMF5
                              : cap - span + span * (unsigned long long)(i + 1u) / (unsigned long long)(ng + 1u);
+                const long long fd_t0 = fd_qpc();   // FD1
                 ok = present_frame(job.r, job.g, job.b);
+                if (ok) fd_shown(fd_t0);
                 t_fg_content = 0;
                 t_fg_is_gen = false;
                 t_fg_src = nullptr;
@@ -20113,8 +22343,9 @@ static void fg_present_thread_main()
             t_fg_src = job.real; t_fg_rest = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             t_fg_cap = job.cap_qpc;
             t_fg_content = job.cap_qpc;   // FW1
+            const long long fd_t0 = fd_qpc();   // FD1
             ok = present_frame(job.r, job.g, job.b);
-            if (ok) fc_note_present();
+            if (ok) { fc_note_present(); fd_shown(fd_t0); }
             t_fg_content = 0;
             t_fg_cap = 0;
             if (job.cap_qpc != 0ull) s_fw_prev_cap = job.cap_qpc;   // FW1
@@ -20463,6 +22694,32 @@ void ui_set_fg_dyn_on(bool on)
     (void)ui_ini_write("FGDynamic", on ? 1 : 0);
 }
 int  ui_fg_dyn_target()        { return dyn_target_now(); }
+// AC1: panel side. Takes effect on the next pair; B starts with a reset.
+bool ui_fsr_chain()            { return ac_on_now() != 0; }
+// SF2: 1 = the rebuilt DLL is there (or AMD's slot holds it) and has not failed.
+bool ui_fsr_rebuilt()          { return mg1_available(); }
+bool ui_fsr_chain_fallback()   { return ac_fb_now() != 0; }
+// GV1: AMD quality preset (rebuilt DLL, 3x/4x).
+int  ui_fsr_quality()          { return amd_quality_now(); }
+void ui_set_fsr_quality(int q) { if (q < 0 || q > 2) q = 0; g_amd_q.store(q); (void)ui_ini_write("FSRQuality", q); }
+int  ui_fsr_quality_support()  { return g_amd_q_support.load(); }
+void ui_set_fsr_chain_fallback(bool on) { g_ac_fb.store(on ? 1 : 0); (void)ui_ini_write("FSRChainFallback", on ? 1 : 0); }
+void ui_set_fsr_chain(bool on)
+{
+    g_ac_on.store(on ? 1 : 0);
+    (void)ui_ini_write("FSRChain", on ? 1 : 0);
+}
+// X3: panel side. FSRChain follows (1 at 4x) for builds that only know it.
+int  ui_fsr_mult()             { return amd_mult_now(); }
+void ui_set_fsr_mult(int m)
+{
+    if (m < 2) m = 2;
+    if (m > 4) m = 4;
+    g_amd_mult.store(m);
+    (void)ui_ini_write("FSRMult", m);
+    g_ac_on.store(m == 4 ? 1 : 0);
+    (void)ui_ini_write("FSRChain", m == 4 ? 1 : 0);
+}
 // FC1: panel side.
 bool ui_fg_clock()             { return fc_on_now() != 0; }
 void ui_set_fg_clock(bool on)
@@ -20473,7 +22730,11 @@ void ui_set_fg_clock(bool on)
 void ui_set_fg_dyn_target(int v)
 {
     if (v < 60) v = 60;
+#if defined(ATOMIC_COMMUNITY_20FPS)
+    if (v > 120) v = 120;
+#else
     if (v > 480) v = 480;
+#endif
     g_dyn_target.store(v);
     g_dyn_reset_seq.fetch_add(1u, std::memory_order_release);
     (void)ui_ini_write("FGDynTarget", v);
@@ -20554,14 +22815,15 @@ int ui_dlssg_state()
     return g_dg.up ? 1 : 0;
 }
 
-void ui_set_frame_gen(int mode)
+// BM3: the mode switch itself, without the ini write (the sweep uses it).
+static void fg_mode_set(int mode)
 {
     if (mode < 0) mode = 0;
     if (mode > 4) mode = 4;
     {
         stream_state &s = str();
         std::lock_guard<std::mutex> lk(s.cs);
-        if (s.fg_on == 0u && mode != 0) { s.fg_prev_valid = false; s.fg_mask_valid = false; }   // fresh pair, fresh mask
+        if (s.fg_on == 0u && mode != 0) { s.fg_prev_valid = false; s.fg_mask_valid = false; g_fd2_break = FD2_BROKEN_OTHER; }   // fresh pair, fresh mask
         if (mode == 3 && s.fg_on != 3u)
         {
             s.fsr_failed = false;        // FSR1: allow a retry
@@ -20578,6 +22840,12 @@ void ui_set_frame_gen(int mode)
         s.fg_on = (unsigned)mode;
         if (mode != 0) s.fg_last_mode = (unsigned)mode;
     }
+}
+void ui_set_frame_gen(int mode)
+{
+    if (mode < 0) mode = 0;
+    if (mode > 4) mode = 4;
+    fg_mode_set(mode);
     (void)ui_ini_write("FrameGen", mode);
 }
 
@@ -20607,6 +22875,13 @@ int ui_ini_read_dcomp()
 bool ui_ini_write_text(const char *key, const char *value)
 {
     return ini_write_text(key, value);
+}
+void ui_ini_read_word(const char *key, char *out, unsigned n)
+{
+    if (out == nullptr || n == 0) return;
+    out[0] = 0;
+    if (key == nullptr) return;
+    ini_read_word(key, out, (size_t)n);
 }
 
 void ui_set_neural(bool on)
@@ -20879,10 +23154,20 @@ void stream_request()
                 s.fsr_units_m = (fm > 0.0f) ? fm : 0.01f;
                 s.fsr_transfer = (unsigned)ini_read_sr_int("FSRTransfer", 0, 0, 2);
                 s.fsr_failed = false; s.fsr_frame_id = 0; s.fsr_made = 0; s.fsr_errors = 0;
+                s.fsrb_failed = false; s.fsrb_frame_id = 0; s.fsrb_errors = 0;   // AC1
+                s.sf_made = false; s.sf_pairs4 = 0; s.sf_pairs2 = 0; s.sf_logged = 0;   // SF1
+                s.amd_mode = 0; s.amd_mode_logged = -1; s.sfm_failed = false; s.sfm_errors = 0;   // SF2
+                s.fsr_a_prev = false; s.sfm_prev = false;
+                s.ac = mgpu::fsr_chain::state{}; s.ac_logged = 0;                  // AC3
+                s.fsr_prev_cap = 0; s.fsr_last_fid = 0; s.fsr_dt_ms = 16.6667f;
+                s.fsr_dt_missing = 0; s.fsr_dt_invalid = 0; s.fsr_dt_breaks = 0;   // AC4
+                for (unsigned q = 0; q < stream_state::AC_SEG; ++q)
+                { s.ac_ts_sum[q] = 0.0; s.ac_ts_max[q] = 0.0; s.ac_ts_n[q] = 0; s.ac_ts_seen[q] = 0; s.ac_ts_warm_max[q] = 0.0; }
+                s.ac_ts_warm_said = false; s.ac_ts_lost = 0; s.ac_ts_win_res = 0; s.ac_ts_win_lost = 0;
                 g_dg.fg_failed = false; g_dg.errors = 0; g_dg.made = 0; g_dg.evals = 0;   // DLSSG1
                 s.fsr_last.QuadPart = 0;
             }
-            s.fg_prev_valid = false; s.fg_ready = 0; s.fg_shown = 0;
+            s.fg_prev_valid = false; s.fg_ready = 0; s.fg_shown = 0; g_fd2_break = FD2_BROKEN_OTHER;   // FD2
             s.fg_made = 0; s.fg_nomv = 0; s.fg_presented = 0; s.fg_failed = false;
             g_fg_presented.store(0); g_fg_set_skips.store(0);   // FIX7
             s.stage_last = 0; s.stage_submits = 0; s.stage_fail = 0;
@@ -20939,6 +23224,8 @@ void stream_request()
             g_dr_min.store(ini_read_sr_int("SRDynMin", 50, 33, 90));
             g_dr_max.store(ini_read_sr_int("SRDynMax", 80, 33, 90));
             g_sm_sens.store(ini_read_sr_int("SRDynSmooth", 2, 0, 3));          // SM1
+            g_dr_aggr.store(ini_read_sr_int("SRDynAggressive", 0, 0, 1));      // DR6
+            g_dr_late.store(ini_read_sr_int("SRDynLatePairs", 1, 0, 1));      // DR5
             g_dr_pct_x10.store((int)s.sr_scale_pct * 10);                  // starts at SRScale
             g_rs_recon.store(ini_read_sr_int("SRRecon", 1, 0, 1));          // RS1
             g_rs_down.store(ini_read_sr_int("SRDownFilter", 0, 0, 2));
@@ -21527,6 +23814,46 @@ void stream_on_present(void *cmd_queue_v)
     if (gq == nullptr) return;
 
     g0_signal(s, gq, s.produced);   // OPT5: routed; identical when StageCopy=0 (R275: records gsignaled)
+}
+
+// GP2: the brake for a skipped game Present. A real Present stops the game
+// running more than a few frames ahead of the render card; a skipped one does
+// not, and GP1 (2026-11-14 13:26) let the game race the six-slot hand-over
+// until a device was lost (the consumer read the produced-count fence as
+// 2^64-1, which is what a fence reads after device removal) and Unreal
+// reported a GPU crash. Here: wait until the render card has finished the
+// game's frame from `latency` frames ago (gfence is signalled after each
+// frame's copies), as DXGI's own frame latency would.
+// 0 waited or no wait needed, 1 timed out, 2 a device is gone, 3 not streaming.
+int gp_brake(unsigned latency, unsigned timeout_ms, unsigned long long *overruns)
+{
+    stream_state &s = str();
+    ID3D12Fence *f = nullptr;
+    unsigned long long target = 0;
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        if (overruns) *overruns = s.overrun;
+        if (!s.armed || s.finished || s.gfence == nullptr || s.produced == 0) return 3;
+        f = s.gfence;
+        f->AddRef();
+        target = (s.gsignaled > (unsigned long long)latency) ? s.gsignaled - latency : 0ull;
+    }
+    int r = 0;
+    UINT64 v = f->GetCompletedValue();
+    if (v == UINT64_MAX) r = 2;
+    else if (target > 0 && v < (UINT64)target)
+    {
+        static thread_local HANDLE ev = nullptr;
+        if (ev == nullptr) ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (ev != nullptr && SUCCEEDED(f->SetEventOnCompletion((UINT64)target, ev)))
+        {
+            if (WaitForSingleObject(ev, timeout_ms) != WAIT_OBJECT_0) r = 1;
+        }
+        else r = 1;
+        if (f->GetCompletedValue() == UINT64_MAX) r = 2;
+    }
+    f->Release();
+    return r;
 }
 
 // ================= REFLEX: FORCE LOW LATENCY ON GPU 0 =====================
@@ -22182,6 +24509,7 @@ static std::atomic<int>   g_tf_retry_s{0};        // seconds until the ceiling l
 static std::atomic<int>  g_at_req{0};        // UI -> game thread: 1 start, 2 cancel
 static std::atomic<int>  g_at_state{0};      // 0 idle, 1 waiting, 2 testing, 3 done, 4 failed, 5 cancelled
 static std::atomic<int>  g_at_cap{0};        // the Limiter rate under test (overrides FGCap)
+static std::atomic<int>  g_bs_cap{0};        // BM3: the sweep's Limiter rate (overrides FGCap; 0 = none)
 static std::atomic<int>  g_at_mult{0};       // the multiplier under test
 static std::atomic<int>  g_at_idx{0}, g_at_tested{0};
 static std::atomic<int>  g_at_target{0};     // this round's target output
@@ -22253,6 +24581,96 @@ int  ui_tf_ceiling()           { return g_tf_ceiling.load(); }
 int  ui_tf_retry_s()           { return g_tf_retry_s.load(); }
 int  ui_tf_pick()              { return g_tf_pick.load(); }
 
+// ---- BM3: benchmark sweep - one configuration at a time, mgpu.ini untouched ----
+static std::atomic<int> g_bs_on{0};
+bool ui_bs_active() { return g_bs_on.load() != 0; }
+void ui_bs_apply(int gen, int cap, int mult)
+{
+    tf_load();
+    if (gen != 3) gen = 4;
+    if (cap < 20) cap = 20;
+    if (cap > 240) cap = 240;
+    g_bs_on.store(1);
+    g_tf_on.store(0); g_tf_pick.store(0);                   // target frame rate off for the sweep
+    g_dyn_on.store(0);                                      // dynamic multiplier off
+    g_dyn_reset_seq.fetch_add(1u, std::memory_order_release);
+    g_bs_cap.store(cap);
+    if (gen == 3)
+    {
+        if (mult < 2) mult = 2;
+        if (mult > 4) mult = 4;
+        g_amd_mult.store(mult);
+        g_ac_on.store(mult == 4 ? 1 : 0);
+    }
+    else
+    {
+        if (mult < 2) mult = 2;
+        if (mult > 6) mult = 6;
+        tf_apply_mult((unsigned)mult);
+    }
+    fg_mode_set(gen);
+    char l[200];
+    snprintf(l, sizeof l, "[MGPU][BM3] sweep step: %s, Limiter %d fps x %dx (mgpu.ini not changed)",
+             gen == 3 ? "AMD FSR 3" : "NVIDIA DLSS FG", cap, mult);
+    mgpu::diag::info(l);
+}
+// BM5: hold dynamic resolution at pct for a sweep (0 = let go, back to where
+// it was). Returns the % held, 0 when nothing is held (dynamic resolution off:
+// the fixed SRScale already applies). Clamped to 33 and to the size the
+// textures were made at.
+int ui_bs_hold_nr(int pct)
+{
+    if (pct <= 0)
+    {
+        if (g_bs_nr.exchange(0) > 0 && g_bs_nr_saved > 0) g_dr_pct_x10.store(g_bs_nr_saved);
+        g_bs_nr_saved = 0;
+        return 0;
+    }
+    if (g_dr_on.load() == 0 || g_dr_pct_x10.load() <= 0) return 0;
+    int v = pct * 10;
+    const int al = g_dr_alloc.load() * 10;
+    const int hi = al > 0 ? al : g_dr_max.load() * 10;
+    if (v > hi) v = hi;
+    if (v < 330) v = 330;
+    if (g_bs_nr.load() == 0) g_bs_nr_saved = g_dr_pct_x10.load();
+    g_bs_nr.store(v);
+    g_dr_pct_x10.store(v);
+    return v / 10;
+}
+// BM6: start dynamic resolution at pct for this sweep step and forget the
+// controller's history; it then moves freely. Returns the % set, 0 = nothing
+// (held by BenchSweepNR, or dynamic resolution off).
+int ui_bs_dr_start(int pct)
+{
+    if (pct <= 0 || g_bs_nr.load() > 0) return 0;
+    if (g_dr_on.load() == 0 || g_dr_pct_x10.load() <= 0) return 0;
+    int v = pct * 10;
+    const int al = g_dr_alloc.load() * 10;
+    int hi = g_dr_max.load() * 10;
+    if (al > 0 && hi > al) hi = al;
+    const int lo = g_dr_min.load() * 10;
+    if (v > hi) v = hi;
+    if (v < lo) v = lo;
+    g_dr_pct_x10.store(v);
+    g_dr_reset_seq.fetch_add(1u, std::memory_order_release);
+    return v / 10;
+}
+void ui_bs_end()
+{
+    (void)ui_bs_hold_nr(0);   // BM5
+    if (g_bs_on.exchange(0) == 0) return;
+    g_bs_cap.store(0);
+    // -1 = read again from mgpu.ini on next use; the sweep never wrote these.
+    g_amd_mult.store(-1);
+    g_ac_on.store(-1);
+    g_dyn_on.store(-1);
+    g_dyn_reset_seq.fetch_add(1u, std::memory_order_release);
+    g_tf_on.store(ini_read_sr_int("FGAuto", 0, 0, 1)); g_tf_pick.store(0);
+    tf_apply_mult((unsigned)ini_read_sr_int("FGMultiplier", 2, 2, 6));
+    fg_mode_set(ini_read_sr_int("FrameGen", 0, 0, 4));
+    mgpu::diag::info("[MGPU][BM3] sweep over - the saved settings are back (FrameGen, multipliers, Limiter, target frame rate).");
+}
+
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
@@ -22318,6 +24736,8 @@ void ui_set_dr_min(int v) { if (v < 33) v = 33; if (v > 90) v = 90; g_dr_min.sto
 int  ui_dr_max()          { return g_dr_max.load(); }
 void ui_set_dr_max(int v) { if (v < 33) v = 33; if (v > 90) v = 90; g_dr_max.store(v); (void)ui_ini_write("SRDynMax", v); }
 float ui_dr_now()         { return (float)g_dr_pct_x10.load() / 10.0f; }
+bool ui_dr_aggr()         { return g_dr_aggr.load() != 0; }   // DR6
+void ui_set_dr_aggr(bool on) { g_dr_aggr.store(on ? 1 : 0); (void)ui_ini_write("SRDynAggressive", on ? 1 : 0); }
 int  ui_dr_alloc()        { return g_dr_alloc.load(); }
 static bool dr_at_min()   { return g_dr_pct_x10.load() <= g_dr_min.load() * 10; }
 
@@ -22353,10 +24773,83 @@ static void sm_thresholds(int sens, double *rel, int *hits)
     }
 }
 
+// DR8: the parts behind a decision, since the previous window: the neural
+// stage's queue and the present path's queues as ms of executed GPU time per
+// shown frame (not merged - overlapping queues both count), AMD's call and the
+// composition per real frame, and the driver's utilisation (sees all work on
+// the card, including queues the mod does not time).
+static void dr_parts(LONGLONG now, LONGLONG freq, double out, bool amd, char *buf, size_t n)
+{
+    static LONGLONG t_last = 0;
+    static double nr_last = -1.0, pr_last = -1.0;
+    buf[0] = '\0';
+    double nr_s = 0.0, pr_s = 0.0;
+    const bool have = mgpu::gputime::queue_seconds(g_gt_nrq.load(std::memory_order_relaxed), &nr_s, &pr_s);
+    char q[120] = "";
+    if (have && t_last != 0 && nr_last >= 0.0 && now > t_last && out > 1.0 && nr_s >= nr_last && pr_s >= pr_last)
+    {
+        const double dt = (double)(now - t_last) / (double)freq;
+        snprintf(q, sizeof q, "neural-stage queue %.2f ms, present queues %.2f ms per shown frame",
+                 (nr_s - nr_last) * 1000.0 / (dt * out), (pr_s - pr_last) * 1000.0 / (dt * out));
+    }
+    if (have) { t_last = now; nr_last = nr_s; pr_last = pr_s; }
+    char a[100] = "";
+    const double c = g_ac_ms_call.load(std::memory_order_relaxed), m = g_ac_ms_comp.load(std::memory_order_relaxed);
+    if (amd && c >= 0.0) snprintf(a, sizeof a, "%sAMD call %.2f ms, composition %.2f ms per real frame", q[0] ? "; " : "", c, m);
+    char u[48] = "";
+    const int ut = g_nvx_util_in.load(std::memory_order_relaxed);
+    if (ut >= 0) snprintf(u, sizeof u, "%sdriver-busy %d%%", (q[0] || a[0]) ? "; " : "", ut);
+    if (q[0] || a[0] || u[0]) snprintf(buf, n, " | parts: %s%s%s", q, a, u);
+}
+
+// DR5: late frame pairs. The present thread counts the hitches where it sat
+// waiting for the next pair (FD1); that pair is the neural card's output, so a
+// pile of them means the card finishes each real frame too late - whatever the
+// card's busy figure says. Measured 2026-11-14 (Black Myth, 40 x 3 and 40 x 4,
+// copy queue working): 0-21 per 10 s at 65% neural resolution, all smooth;
+// 36-122 per 10 s at 77%, jitter 2 ms and slot spread 18-37%. The controller
+// held 77% there because the card read 46-64% busy (SM2) and AMD spacing never
+// counted (DR6), after climbing to 82% in an easier scene.
+// Read over chunks of at least 4 s; a chunk where over a tenth of the pairs
+// had no in-between frames (scene cut, menu, loading) gives no reading.
+static const double DR5_DOWN = 0.075;   // share of pairs: step down (30 per 10 s at 40 fps)
+static const double DR5_UP   = 0.03;    // share of pairs: below this a step up is allowed (12 per 10 s)
+static double   g_dr5_frac = -1.0;      // last chunk's share of pairs that came late, -1 = none
+static double   g_dr5_per10 = -1.0;     // the same as hitches per 10 s, for the log
+static unsigned g_dr5_seq = 0;          // bumps with every new reading
+static bool     g_dr5_active = false;   // pairs flowed in the last chunk (frame generation on)
+static void dr5_tick(LONGLONG now, LONGLONG freq, bool restart)
+{
+    static LONGLONG t0 = 0;
+    static unsigned long long p0 = 0, n0 = 0, w0 = 0;
+    const unsigned long long p = g_fd_tot_pairs.load(std::memory_order_relaxed);
+    const unsigned long long n = g_fd_tot_nogen.load(std::memory_order_relaxed);
+    const unsigned long long w = g_fd_tot_wait.load(std::memory_order_relaxed);
+    const double dt = t0 != 0 ? (double)(now - t0) / (double)freq : 0.0;
+    if (restart || t0 == 0 || dt > 20.0)
+    {
+        t0 = now; p0 = p; n0 = n; w0 = w;
+        g_dr5_frac = -1.0; g_dr5_per10 = -1.0;
+        return;
+    }
+    if (dt < 4.0) return;
+    const unsigned long long dp = p - p0, dn = n - n0, dw = w - w0;
+    g_dr5_active = dp > 0;
+    if (dp >= 40 && dn * 10 <= dp)
+    {
+        g_dr5_frac = (double)dw / (double)dp;
+        g_dr5_per10 = (double)dw * 10.0 / dt;
+        ++g_dr5_seq;
+    }
+    else { g_dr5_frac = -1.0; g_dr5_per10 = -1.0; }
+    t0 = now; p0 = p; n0 = n; w0 = w;
+}
+
 static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, int mult, int cap,
-                         double sd_rel, int hits)
+                         double sd_rel, int hits, bool amd)
 {
     if (g_dr_on.load() == 0 || expct <= 0.0 || g_dr_pct_x10.load() <= 0) return false;
+    if (g_bs_nr.load() > 0) return false;        // BM5: a sweep holds the scale - the controller waits
     static LONGLONG up_at = 0, last_up = 0, last_down = 0, ineff_until = 0;
     static int up_hold_s = 8;
     static int streak = 0, streak_start = 0, no_effect = 0, hot = 0;
@@ -22364,6 +24857,17 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
     static double expct_before = -1.0;           // DR4: the target the last verdict was taken at
     static double sd_before = -1.0;              // SM1: spacing before a smoothness-led reduction
     static int hits_before = 0;
+    // DR7: neural card time per shown frame (busy x 1000 / shown fps) when a
+    // streak of reductions began, and how many "not NR" verdicts this target has
+    // had (1st: hold 60 s, 2nd: 5 min, 3rd: until the multiplier or Limiter changes).
+    static double cost_start = -1.0;
+    static int strikes = 0;
+    // DR5: the late-pair share before a late-led reduction, and the reading it used.
+    static double late_before = -1.0;
+    static unsigned late_seq_step = 0, late_seq_used = 0;
+    static LONGLONG late_said_at = 0;
+    const bool dr5_on = g_dr_late.load() != 0;
+    dr5_tick(now, freq, false);
     // SM1: is the spacing uneven by the user's chosen standard?
     const int sens = g_sm_sens.load();
     double thr_rel = 0.25; int thr_hits = 3;
@@ -22391,24 +24895,66 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
     // Measured (4004ed3a): 80% -> 70% in five spacing/short steps at 3.2x with
     // the card 76-78% busy, spread unchanged at 29-35%. In that mode spacing
     // never lowers NR; missing frames with the card loaded still do.
-    const bool sp_counts = nr_loaded && dyn_on_now() == 0;
+    // DR6: in AMD mode the target is delivery only - spacing never lowers NR there
+    // (AMD's 4x is paced by the present path, not measured against NR yet).
+    const bool sp_counts = nr_loaded && dyn_on_now() == 0 && !amd;
+    // DR6: Aggressive keeps more room: down below 98.5% delivered (not 96%), a
+    // step bigger, early warning at 92% busy in one window (not 98% in two), up
+    // only at 99.5% delivered with the card under 80% busy (not 98.5% / 90%).
+    // AMD mode steps a notch bigger too: NR is about a quarter of that card's
+    // work there, so a 2% step moves delivery by ~1 point - it is also judged
+    // as helped from +1 point (not +2).
+    const bool aggr = g_dr_aggr.load() != 0;
+    const double short_at = aggr ? 0.985 : 0.96;
+    const int step_s = 20 + (amd ? 20 : 0) + (aggr ? 20 : 0);
+    const int step_b = step_s + 20;
+    const double hot_busy = aggr ? 0.92 : 0.98;
+    const int hot_n = aggr ? 1 : 2;
+    // DR7: AMD's work stretches when the card is nearly full (AC call 5.3 ms at
+    // 56-85% busy, 11-13.6 ms at 82-94%: 1eeecc49), so it only tries up below 80%.
+    const double up_ratio = aggr ? 0.995 : 0.985;
+    const double up_busy = amd ? (aggr ? 0.75 : 0.80) : (aggr ? 0.80 : 0.90);
+    const double helped_by = amd ? 0.01 : 0.02;
+    const char *mode = amd ? (aggr ? " [AMD, aggressive]" : " [AMD]") : (aggr ? " [aggressive]" : "");
     static LONGLONG sm_said_at = 0;
-    char l[320];
+    char l[900];
+    char parts[400];
+    dr_parts(now, freq, out, amd, parts, sizeof parts);   // DR8: every window, so the deltas stay per window
 
     // A new multiplier or Limiter is a new situation: forget the verdict.
     if (mult != last_mult || cap != last_cap)
     {
         last_mult = mult; last_cap = cap;
         streak = 0; no_effect = 0; ratio_before = -1.0; sd_before = -1.0; hot = 0;
+        cost_start = -1.0; strikes = 0;   // DR7
+        late_before = -1.0; dr5_tick(now, freq, true);   // DR5
         if (g_dr_ineff.exchange(0) != 0)
             mgpu::diag::info("[MGPU][DR3] multiplier or Limiter changed - NR scaling allowed again.");
         ineff_until = 0;
+    }
+    // BM6: a sweep step starts the controller afresh from the common scale -
+    // no verdict, hold or streak carried over from the configuration before.
+    {
+        static unsigned seen_reset = 0;
+        const unsigned rs = g_dr_reset_seq.load(std::memory_order_acquire);
+        if (rs != seen_reset)
+        {
+            seen_reset = rs;
+            up_at = 0; last_up = 0; last_down = 0; ineff_until = 0; up_hold_s = 8;
+            streak = 0; streak_start = 0; no_effect = 0; hot = 0;
+            ratio_before = -1.0; expct_before = -1.0; sd_before = -1.0; hits_before = 0;
+            cost_start = -1.0; strikes = 0;
+            late_before = -1.0; dr5_tick(now, freq, true);   // DR5
+            g_dr_ineff.store(0);
+        }
     }
     if (g_dr_ineff.load() != 0 && now >= ineff_until) g_dr_ineff.store(0);
 
     // Did the last reduction help? Judged by what triggered it: delivery for a
     // short window, spacing (SM1) for an uneven one.
-    if (ratio_before >= 0.0 || sd_before >= 0.0)
+    // DR5: a late-led step is judged once a fresh reading has come in after it.
+    const bool late_ready = late_before >= 0.0 && g_dr5_frac >= 0.0 && g_dr5_seq != late_seq_step;
+    if (ratio_before >= 0.0 || sd_before >= 0.0 || late_ready)
     {
         // DR4: when the target itself moved (the game fell below the Limiter),
         // the ratio moves with it and says nothing about the step: no verdict
@@ -22417,33 +24963,61 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
         if (same_target)
         {
             bool helped;
-            if (ratio_before >= 0.0) helped = ratio - ratio_before >= 0.02;
+            if (late_ready) helped = g_dr5_frac <= late_before * 0.7 || g_dr5_frac < DR5_DOWN;   // DR5
+            else if (ratio_before >= 0.0) helped = ratio - ratio_before >= helped_by;
             else helped = sd_rel >= 0.0 && (sd_rel <= sd_before * 0.85 || steady ||
                                             (hits_before >= 4 && hits * 2 <= hits_before));
             if (!helped) ++no_effect; else no_effect = 0;
         }
         ratio_before = -1.0; sd_before = -1.0; expct_before = -1.0;
-        if (no_effect >= 2)
+        if (late_ready) late_before = -1.0;
+        // DR7: delivery is noisy when every window has hitches (1eeecc49: 79% -> 50%
+        // with shown 145-169 of 176, single steps looking like gains by chance).
+        // What a working NR step must change is the card's time per shown frame.
+        // After 10 points of reductions, under 2.5% less is a verdict on its own.
+        // (At 176 there: 92% / 168 fps at 79% = 5.5 ms, 93% / 167 fps at 50% = 5.6.)
+        bool cost_flat = false;
+        double cost_drop = 0.0;
+        if (cost_start > 0.0 && busy >= 0.0 && out > 1.0 && streak_start - cur >= 100)
         {
+            const double cost_now = busy * 1000.0 / out;
+            cost_drop = 1.0 - cost_now / cost_start;
+            cost_flat = cost_drop < 0.025;
+        }
+        if (no_effect >= 2 || cost_flat)
+        {
+            ++strikes;
+            const int hold_s = strikes == 1 ? 60 : (strikes == 2 ? 300 : 0);   // 0: until the target changes
             char bb[24] = "unknown";
             if (busy >= 0.0) snprintf(bb, sizeof bb, "%.0f%%", busy * 100.0);
+            char hb[48];
+            if (hold_s > 0) snprintf(hb, sizeof hb, "held for %d s", hold_s);
+            else snprintf(hb, sizeof hb, "held until the multiplier or Limiter changes");
+            char cb[64] = "";
+            if (cost_start > 0.0 && busy >= 0.0 && out > 1.0)
+                snprintf(cb, sizeof cb, ", card time per shown frame %+.1f%%", -cost_drop * 100.0);
             snprintf(l, sizeof l, "[MGPU][DR3] FG/PRESENT BOTTLENECK SUSPECTED - NR SCALING INEFFECTIVE: %d "
-                     "reductions (%.1f%% -> %.1f%%) left shown at %.0f of %.0f fps (neural card busy %s). Scale "
-                     "restored to %.1f%%; held for 60 s. Lower the multiplier or the Limiter (the overload brake "
-                     "may now do it).", streak, streak_start / 10.0, cur / 10.0, out, expct, bb, streak_start / 10.0);
+                     "reductions (%.1f%% -> %.1f%%) left shown at %.0f of %.0f fps (neural card busy %s%s). Scale "
+                     "restored to %.1f%%; %s (verdict %d for this target). Lower the multiplier or the Limiter.%s",
+                     streak, streak_start / 10.0, cur / 10.0, out, expct, bb, cb, streak_start / 10.0, hb, strikes, parts);
             mgpu::diag::warn(l);
             g_dr_pct_x10.store(streak_start > 0 ? streak_start : cur);
+            late_before = -1.0; dr5_tick(now, freq, true);   // DR5
             g_dr_ineff.store(1);
-            ineff_until = now + freq * 60;
-            streak = 0; no_effect = 0;
+            ineff_until = now + freq * (hold_s > 0 ? (LONGLONG)hold_s : 86400LL);   // 0: a day = until the target changes
+            streak = 0; no_effect = 0; cost_start = -1.0;
             return true;
         }
     }
 
     int next = cur;
-    bool reduction = false, by_spacing = false;
+    bool reduction = false, by_spacing = false, by_late = false;
     const char *why = "";
-    if (ratio < 0.96 && !nr_loaded)
+    char why_buf[120];
+    // DR5: late pairs - fresh reading, not used yet, delivery otherwise fine.
+    const bool late_bad = dr5_on && g_dr5_frac >= DR5_DOWN && g_dr5_seq != late_seq_used;
+    const bool late_ok = !dr5_on || !g_dr5_active || (g_dr5_frac >= 0.0 && g_dr5_frac < DR5_UP);
+    if (ratio < short_at && !nr_loaded)
     {
         // DR4: frames are missing but the neural card has room - the shortfall
         // is in frame generation / presentation, which a lower NR does not
@@ -22459,11 +25033,23 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
         }
         return false;
     }
-    else if (ratio < 0.96)
+    else if (ratio < short_at)
     {
         if (g_dr_ineff.load() != 0) return false;  // known: not NR - hold
-        next = cur - (ratio < 0.92 ? 40 : 20);
+        next = cur - (ratio < 0.92 ? step_b : step_s);
         reduction = true; why = "short";
+        hot = 0;
+    }
+    else if (late_bad && g_dr_ineff.load() == 0)
+    {
+        // DR5: the screen keeps waiting for the neural card's pairs - NR's doing
+        // however busy the card reads, and for AMD as much as NVIDIA.
+        late_seq_used = g_dr5_seq;
+        next = cur - (g_dr5_frac >= 0.20 ? 40 : 20);
+        reduction = true; by_late = true;
+        snprintf(why_buf, sizeof why_buf, "late frame pairs: the screen waited %.0f times per 10 s, %.1f%% of pairs",
+                 g_dr5_per10, g_dr5_frac * 100.0);
+        why = why_buf;
         hot = 0;
     }
     else if (uneven && !sp_counts)
@@ -22476,6 +25062,9 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
                 snprintf(l, sizeof l, "[MGPU][DR3] uneven spacing (sd %.0f%% of the gap, %d hitch(es)) with the neural "
                          "card only %.0f%% busy - not NR, resolution kept at %.1f%%.",
                          sd_rel * 100.0, hits, busy * 100.0, cur / 10.0);
+            else if (amd)   // DV2: AMD has no dynamic multiplier; its spacing is never NR's call
+                snprintf(l, sizeof l, "[MGPU][DR3] uneven spacing (sd %.0f%% of the gap) with AMD frame generation - "
+                         "judged on delivery only, resolution kept at %.1f%%.", sd_rel * 100.0, cur / 10.0);
             else
                 snprintf(l, sizeof l, "[MGPU][DR3] uneven spacing (sd %.0f%% of the gap) from the dynamic multiplier's "
                          "mixed counts - not NR, resolution kept at %.1f%%.", sd_rel * 100.0, cur / 10.0);
@@ -22496,14 +25085,29 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
         // SM2: a window that is merely not uneven does not end a streak - only a
         // steady one does. Before, the in-between windows reset the count, so
         // the effectiveness check never saw two failed steps in a row.
-        if (steady) { streak = 0; no_effect = 0; }
-        if (busy >= 0.98) ++hot; else hot = 0;
-        if (hot >= 2 && g_dr_ineff.load() == 0)
+        if (steady) { streak = 0; no_effect = 0; cost_start = -1.0; }
+        if (busy >= hot_busy) ++hot; else hot = 0;
+        if (hot >= hot_n && g_dr_ineff.load() == 0)
         {
-            next = cur - 20; why = "early warning: neural card nearly full"; hot = 0;
+            next = cur - step_s; why = "early warning: neural card nearly full"; hot = 0;
         }
-        else if (ratio >= 0.985 && (steady || !sp_counts) && now >= up_at && (busy < 0.0 || busy < 0.90))
-            next = cur + 20;
+        else if (ratio >= up_ratio && (steady || !sp_counts) && now >= up_at && (busy < 0.0 || busy < up_busy))
+        {
+            if (late_ok) next = cur + 20;
+            else if (cur < hi && (late_said_at == 0 || now - late_said_at > freq * 60))
+            {
+                // DR5: room by every other measure, but pairs still come late.
+                late_said_at = now;
+                if (g_dr5_frac >= 0.0)
+                    snprintf(l, sizeof l, "[MGPU][DR5] staying at %.1f%%: the screen waited for late frame pairs %.0f "
+                             "times per 10 s (%.1f%% of pairs); steps up only under %.0f%%.",
+                             cur / 10.0, g_dr5_per10, g_dr5_frac * 100.0, DR5_UP * 100.0);
+                else
+                    snprintf(l, sizeof l, "[MGPU][DR5] staying at %.1f%%: no clean late-pair reading yet (scene cut, "
+                             "menu or a change just made).", cur / 10.0);
+                mgpu::diag::info(l);
+            }
+        }
     }
     if (last_down != 0 && now - last_down > freq * 120) up_hold_s = 8;   // settled: probe sooner again
     if (next < lo) next = lo;
@@ -22520,26 +25124,34 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
         up_at = now + freq * up_hold_s;
         if (reduction)
         {
-            if (streak == 0) streak_start = cur;
+            if (streak == 0)
+            {
+                streak_start = cur;
+                cost_start = (busy >= 0.0 && out > 1.0) ? busy * 1000.0 / out : -1.0;   // DR7
+            }
             ++streak;
             if (by_spacing) { sd_before = sd_rel; hits_before = hits; }
+            else if (by_late) { late_before = g_dr5_frac; late_seq_step = g_dr5_seq; }   // DR5
             else ratio_before = ratio;
             expct_before = expct;
         }
-        snprintf(l, sizeof l, "[MGPU][DR3] neural resolution %.1f%% -> %.1f%% (%s): shown %.0f of %.0f fps, "
-                 "spacing sd %.0f%% of the gap, %d hitch(es), neural card busy %s. Next try up in %d s.",
-                 cur / 10.0, next / 10.0, why, out, expct, sd_rel >= 0.0 ? sd_rel * 100.0 : -1.0, hits, bs, up_hold_s);
+        snprintf(l, sizeof l, "[MGPU][DR3] neural resolution %.1f%% -> %.1f%% (%s)%s: shown %.0f of %.0f fps, "
+                 "spacing sd %.0f%% of the gap, %d hitch(es), neural card busy %s. Next try up in %d s.%s",
+                 cur / 10.0, next / 10.0, why, mode, out, expct, sd_rel >= 0.0 ? sd_rel * 100.0 : -1.0, hits, bs, up_hold_s, parts);
     }
     else
     {
         last_up = now;
         const int wait_s = (busy >= 0.0 && busy < 0.80) ? 8 : up_hold_s;
         up_at = now + freq * wait_s;
-        snprintf(l, sizeof l, "[MGPU][DR3] neural resolution %.1f%% -> %.1f%%: headroom (shown %.0f of %.0f fps, "
-                 "spacing sd %.0f%% of the gap, neural card busy %s).", cur / 10.0, next / 10.0, out, expct,
-                 sd_rel >= 0.0 ? sd_rel * 100.0 : -1.0, bs);
+        char lp[64] = "";
+        if (dr5_on && g_dr5_per10 >= 0.0) snprintf(lp, sizeof lp, ", late pairs %.0f per 10 s", g_dr5_per10);
+        snprintf(l, sizeof l, "[MGPU][DR3] neural resolution %.1f%% -> %.1f%%: headroom%s (shown %.0f of %.0f fps, "
+                 "spacing sd %.0f%% of the gap, neural card busy %s%s).%s", cur / 10.0, next / 10.0, mode, out, expct,
+                 sd_rel >= 0.0 ? sd_rel * 100.0 : -1.0, bs, lp, parts);
     }
     g_dr_pct_x10.store(next);
+    dr5_tick(now, freq, true);   // DR5: the next reading is taken at the new scale only
     mgpu::diag::info(l);
     return true;
 }
@@ -22733,9 +25345,11 @@ static void tf_game_frame()
     // ---- the cap ----
     static LONGLONG next = 0;
     const bool at_on = at_active() && g_at_cap.load(std::memory_order_relaxed) > 0;   // AT1
-    if (at_on || g_tf_cap_on.load(std::memory_order_relaxed) != 0)   // TF3: independent of FGAuto
+    const int bs_cap = g_bs_cap.load(std::memory_order_relaxed);                       // BM3
+    if (at_on || bs_cap > 0 || g_tf_cap_on.load(std::memory_order_relaxed) != 0)   // TF3: independent of FGAuto
     {
-        const int cap = at_on ? g_at_cap.load(std::memory_order_relaxed) : g_tf_cap.load(std::memory_order_relaxed);
+        const int cap = at_on ? g_at_cap.load(std::memory_order_relaxed)
+                      : bs_cap > 0 ? bs_cap : g_tf_cap.load(std::memory_order_relaxed);
         const LONGLONG interval = freq / (cap > 0 ? cap : 1);
         if (next == 0 || now > next + interval) next = now;    // first frame, or late: re-anchor, no wait
         else if (now < next) { tf_wait_until(next, freq); QueryPerformanceCounter(&q); now = q.QuadPart; }
@@ -22821,15 +25435,27 @@ static void tf_game_frame()
     static unsigned smp_n = 0, smp_i = 0;
     static LONGLONG trip_last = 0;
     static int hold_s = 30;
-    const bool dyn_m = dyn_on_now() != 0;   // DMF1
-    const int mrun_real = ui_fg_mult_running();
+    // DR6: AMD frame generation is judged too, by the same yardstick. The AC4
+    // run (6cbc591b) shows why it works there: the game held the Limiter's 40
+    // (hand-over stamps 25.0 ms) while the bridge showed 37.9-39.9 real fps
+    // (PF1) - real frames are dropped on the neural card, the game is not
+    // slowed, so game frames x 4 reads the shortfall (about 152 of 160).
+    // Its multiplier is 4 while the chain is making 4x, else 2 - read here,
+    // not from ui_fg_mult_running(), which holds NVIDIA's last value (DR2).
+    const int fgm_now = ui_frame_gen();
+    const bool amd_m = fgm_now == 3;
+    const bool dyn_m = !amd_m && dyn_on_now() != 0;   // DMF1
+    const int amd_live = g_ac_live.load(std::memory_order_relaxed);   // X3: 3 or 4, 0 = 2x
+    const int mrun_real = amd_m ? (amd_live >= 3 ? amd_live : 2)
+                                : ui_fg_mult_running();
     // DMF1: the per-pair count moves by design; a fixed marker keeps the
     // window "steady", and expected comes from the frames actually planned.
     const int mrun = (dyn_m && mrun_real >= 2) ? 100 : mrun_real;
     // DR2: NVIDIA FG must be the generator NOW. ui_fg_mult_running() keeps its
     // last value after frame generation is switched off or to AMD, and a
     // window judged against it read "shown 40 of 160" as an overload.
-    bool valid_now = (mrun >= 2) && ui_frame_gen() == 4;
+    // DR6: or AMD's (dynamic resolution only - the brake below stays NVIDIA's).
+    bool valid_now = (mrun >= 2) && (fgm_now == 4 || (amd_m && g_dr_on.load() != 0));
     {
         HWND fg = GetForegroundWindow();
         DWORD pid = 0;
@@ -22854,7 +25480,7 @@ static void tf_game_frame()
         const bool gen_moved = gen != prev_gen;
         prev_gen = gen;
         const int cap_now = at_on ? g_at_cap.load() : (g_tf_cap_on.load() != 0 ? g_tf_cap.load() : 0);
-        if (!valid_now) why = "not in front, panel open or NVIDIA FG not running";
+        if (!valid_now) why = "not in front, panel open or frame generation not running";
         else if (g_ui_menu.load(std::memory_order_relaxed)) why = "menu";
         else if (g_sc_cover != nullptr && !g_sc_cover_shown.load()) why = "picture hidden";
         else if (game_ms > 100.0 && game_ms > ema_ms * 4.0) why = "game hitch (loading / shader compile)";
@@ -22932,7 +25558,7 @@ static void tf_game_frame()
                     g_sm_hits.store(hits);
                 }
             }
-            if (!at_active() && dr_on_window(now, freq, out, expct, smp_m[newest], smp_cap[newest], sd_rel, hits))
+            if (!at_active() && dr_on_window(now, freq, out, expct, smp_m[newest], smp_cap[newest], sd_rel, hits, amd_m))
             { smp_n = 0; return; }
             // The brake: only with target frame rate on, and only one notch at a time.
             // DR3: also when lowering NR was found not to help (FG/present bound).
@@ -23208,7 +25834,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                 s.depth_hold_wait_said = true;
                 char hl[420];
                 snprintf(hl, sizeof hl,
-                         "[MGPU][R290] NO DEPTH in %llu s and %s: the bridge stays held, as before 0.3.1 - nothing is "
+                         "[MGPU][R290] NO DEPTH in %llu s and %s: the bridge stays held, as in older builds - nothing is "
                          "started on this launch. Please send this ReShade.log.",
                          (now - s.depth_hold_first) / 1000ull,
                          !tap_on ? "the depth tap is not on (see the [R53] TAP line and the status screen)"
@@ -23310,7 +25936,28 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                                  "written to mgpu.ini: a buffer that lines up keeps the tap (MVecTap=1, MVecLearned=<candidate>); "
                                  "none that does turns it off (depth only). Nothing of this runs on the next launch.");
         }
-        const bool learnable = g_mvec_tap_live.load(std::memory_order_relaxed) != 0;
+        bool learnable = g_mvec_tap_live.load(std::memory_order_relaxed) != 0;
+        // LEARN2: the first-launch learning found no velocity buffer at all. MEASURED on the
+        // Resident Evil Requiem demo (2026-11-15): no DLSS seen, learning on, the census never
+        // found a candidate (0 all run) - and this hold had no bound on that path, so the arm
+        // waited 17,000 frames (5 min) and nothing was ever shown. Bounded by MVecHold now:
+        // the picture starts without the game's motion, and MVecLearned=99 makes the next
+        // launch start at once. A game whose DLSS runs later still uses its own vectors.
+        if (learnable && tap_k == 0 && s.mvec_mode == 3 && mvec_handle == 0 && s.mvec_arm_waits >= s.mvec_hold)
+        {
+            g_mvec_tap_live.store(0, std::memory_order_relaxed);
+            learnable = false;
+            (void)ui_ini_write("MVecLearned", 99);
+            char gl[560];
+            snprintf(gl, sizeof gl,
+                     "[MGPU][LEARN2] the first-launch learning found no motion-vector buffer in %llu frames, and the "
+                     "game's DLSS was not seen. The picture starts now without the game's motion (MVec=1); "
+                     "MVecLearned=99 is written so the next launch starts at once. If the game has DLSS, switch it on "
+                     "in the game's graphics settings: the game's own vectors are used whenever its DLSS runs.",
+                     s.mvec_arm_waits);
+            mgpu::diag::warn(gl);
+            s.mvec_mode = 1;
+        }
         const bool can_tap = (tap_k == 1 || tap_k == 2) || learnable;   // R277: 2 is the D3D12 tap with the common assumption
         if (s.mvec_mode == 3 && mvec_handle == 0 && g_no_real_vectors.load(std::memory_order_acquire) &&
             (s.mvec_arm_waits >= s.mvec_hold || (!mgpu::calibrator::game_ngx_init_seen() && !can_tap)))
@@ -23595,7 +26242,26 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             {
                 D3D12_COMMAND_QUEUE_DESC qd{};
                 qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+                // QP1 (diagnostic): NRQueuePriority=1 creates the neural-stage
+                // queue (neural rendering + AMD's frame generation) at HIGH
+                // priority, so the GPU scheduler runs it ahead of the present
+                // path. Read when the stream is armed; a restart applies it.
+                const bool qp_high = ui_ini_read("NRQueuePriority", 0) == 1;
+                qd.Priority = qp_high ? D3D12_COMMAND_QUEUE_PRIORITY_HIGH : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
                 h = ndev->CreateCommandQueue(&qd, IID_PPV_ARGS(&s.nq));
+                if (FAILED(h) && qp_high)
+                {
+                    char ql[200];
+                    snprintf(ql, sizeof ql, "[MGPU][QP1] HIGH priority refused for the neural-stage queue (0x%08X) - "
+                             "using normal.", (unsigned)h);
+                    mgpu::diag::warn(ql);
+                    qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+                    h = ndev->CreateCommandQueue(&qd, IID_PPV_ARGS(&s.nq));
+                }
+                s.nq_high = SUCCEEDED(h) && qd.Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+                if (SUCCEEDED(h) && qp_high && s.nq_high)
+                    mgpu::diag::info("[MGPU][QP1] neural-stage queue at HIGH priority (NRQueuePriority=1, diagnostic): "
+                                     "neural rendering and AMD's frame generation go ahead of the present path.");
             }
             if (SUCCEEDED(h))
                 h = ndev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -23633,6 +26299,17 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                                   D3D12_HEAP_TYPE_READBACK, &s.tsread);
                 if (SUCCEEDED(th)) th = s.nq->GetTimestampFrequency(&s.ts_freq);
                 s.ts_ok = SUCCEEDED(th) && s.ts_freq > 0;
+                if (s.ts_ok && ui_ini_read("GpuBudget", 1) != 0)   // GB1
+                {
+                    D3D12_QUERY_HEAP_DESC gq{};
+                    gq.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; gq.Count = 5; gq.NodeMask = 0;   // GB4: + 3 in the unpack
+                    if (FAILED(ndev->CreateQueryHeap(&gq, IID_PPV_ARGS(&s.gb_heap))) ||
+                        FAILED(make_buf(ndev, 40, D3D12_HEAP_TYPE_READBACK, &s.gb_read)))
+                    {
+                        if (s.gb_heap != nullptr) { s.gb_heap->Release(); s.gb_heap = nullptr; }
+                        if (s.gb_read != nullptr) { s.gb_read->Release(); s.gb_read = nullptr; }
+                    }
+                }
                 for (UINT i = 0; i + 1 < stream_state::TS_MARKS; ++i) s.ts_min[i] = 1e30;
                 for (UINT q = 0; q < stream_state::TS_SEGS; ++q) s.ts_seg_min[q] = 1e30;   // D5b
                 char tl[400];
@@ -24607,6 +27284,14 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)
     HRESULT h = s.cqa[ii]->Reset();
     if (SUCCEEDED(h)) h = s.cql[ii]->Reset(s.cqa[ii], nullptr);
     if (FAILED(h)) return false;
+    // WT1: the copy's time as history only (never in DR's busy figure).
+    // CQ1 (2026-11-14): NO gputime marks on this list. WT1 put them here, but
+    // gputime's heap is TIMESTAMP and a COPY list may only write a
+    // COPY_QUEUE_TIMESTAMP heap: Close() failed on every frame from WT1 on and
+    // every frame fell back to the inline unpack on the neural queue (~7 ms of
+    // PCIe copies there per frame, found by GB5 on Black Myth). The copy's own
+    // marks (cq_tsheap, the right type) are unaffected.
+    const int wt_slot = -1;
 
     // Two marks per copy, ping-ponged by parity: a prefetched copy can resolve
     // into this buffer before the previous frame's marks have been read, and a
@@ -24687,7 +27372,25 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)
         s.cql[ii]->ResolveQueryData(s.cq_tsheap, D3D12_QUERY_TYPE_TIMESTAMP,
                                     ii * 2u, 2, s.cq_tsread, (UINT64)ii * 16ull);
     }
-    if (FAILED(s.cql[ii]->Close())) return false;
+    mgpu::gputime::end(s.cql[ii], wt_slot);   // WT1
+    {
+        const HRESULT ch = s.cql[ii]->Close();
+        if (FAILED(ch))
+        {
+            mgpu::gputime::cancel(wt_slot);
+            static unsigned logged = 0;   // CQ1: never silent again - the first few, with the reason
+            if (logged < 3u)
+            {
+                ++logged;
+                char l[300];
+                snprintf(l, sizeof l, "[MGPU][CQ1] the copy queue's list for f=%llu would not close (hr=0x%08X): this frame "
+                         "falls back to the inline unpack on the neural queue. If every frame does, the copy queue is "
+                         "doing nothing and the neural queue carries every PCIe copy.", f, (unsigned)ch);
+                mgpu::diag::warn(l);
+            }
+            return false;
+        }
+    }
 
     // ---- R28-B: THE GPU-SIDE ARRIVAL GATE ----
     //
@@ -24709,12 +27412,13 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)
     // releases it deliberately; see the note there.
     if (s.cq_gated && s.nfence != nullptr)
     {
-        if (FAILED(s.cq->Wait(s.nfence, (UINT64)f))) return false;
+        if (FAILED(s.cq->Wait(s.nfence, (UINT64)f))) { mgpu::gputime::cancel(wt_slot); return false; }
     }
 
     ID3D12CommandList *const cls[1] = { s.cql[ii] };
     s.cq->ExecuteCommandLists(1, cls);
-    if (FAILED(s.cq->Signal(s.cqf, (UINT64)f))) return false;
+    if (FAILED(s.cq->Signal(s.cqf, (UINT64)f))) { mgpu::gputime::submitted(wt_slot, nullptr, 0); return false; }
+    mgpu::gputime::submitted(wt_slot, s.cqf, (UINT64)f);   // WT1
     s.cqf_value = (UINT64)f;
     s.cqa_value[ii] = (UINT64)f;
     s.cq_depth_ok[ii] = depth_copied ? 1u : 0u;   // OPT4
@@ -24963,6 +27667,47 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 bool sane = true;
                 for (UINT i = 1; i < stream_state::TS_MARKS; ++i)
                     if (tv[i] < tv[i - 1]) sane = false;   // a wrapped or unwritten mark
+                if (sane && s.gb_heap != nullptr)   // GB1: this list's stages, for the budget line
+                {
+                    const double k = 1000.0 / (double)s.ts_freq;
+                    double nr = (double)(tv[3] - tv[2]) * k, sr = 0.0, post_sr = 0.0;
+                    bool have_sr = false;
+                    double u4[4] = { -1.0, -1.0, -1.0, -1.0 };   // GB4: header read, input transitions, depth, MVec, field
+                    if (s.gb_u_was == 7u && s.gb_read != nullptr)
+                    {
+                        const UINT64 *gv = nullptr;
+                        D3D12_RANGE gr{16, 40};
+                        if (SUCCEEDED(s.gb_read->Map(0, &gr, (void **)&gv)) && gv != nullptr)
+                        {
+                            const UINT64 b = gv[2], c = gv[3], d = gv[4];
+                            if (b >= tv[1] && c >= b && d >= c && tv[2] >= d)
+                            {
+                                u4[0] = (double)(b - tv[1]) * k; u4[1] = (double)(c - b) * k;
+                                u4[2] = (double)(d - c) * k;     u4[3] = (double)(tv[2] - d) * k;
+                            }
+                            D3D12_RANGE none{0, 0};
+                            s.gb_read->Unmap(0, &none);
+                        }
+                    }
+                    gb_note_unpack((double)(tv[1] - tv[0]) * k, u4);
+                    if (s.gb_sr_was && s.gb_read != nullptr)
+                    {
+                        const UINT64 *gv = nullptr;
+                        D3D12_RANGE gr{0, 16};
+                        if (SUCCEEDED(s.gb_read->Map(0, &gr, (void **)&gv)) && gv != nullptr)
+                        {
+                            if (gv[0] >= tv[2] && gv[1] >= gv[0] && tv[3] >= gv[1])
+                            {
+                                nr = (double)(gv[0] - tv[2]) * k; sr = (double)(gv[1] - gv[0]) * k;
+                                post_sr = (double)(tv[3] - gv[1]) * k; have_sr = true;
+                            }
+                            D3D12_RANGE none{0, 0};
+                            s.gb_read->Unmap(0, &none);
+                        }
+                    }
+                    gb_note((double)(tv[2] - tv[0]) * k, nr, sr, post_sr, (double)(tv[4] - tv[3]) * k,
+                            (double)(tv[4] - tv[0]) * k, have_sr);
+                }
                 if (sane)
                 {
                     // OPT2: the whole direct list, first mark to last. This is
@@ -26052,7 +28797,7 @@ void stream_poll()
     {   // SL1: write panel settings that have stood still for 400 ms
         static ULONGLONG last_fl = 0;
         const ULONGLONG nfl = GetTickCount64();
-        if (nfl - last_fl >= 100ull) { last_fl = nfl; ini_flush_pending(false); mgpu::crashlog::flush_dll_events(); }
+        if (nfl - last_fl >= 100ull) { last_fl = nfl; ini_flush_pending(false); mgpu::crashlog::flush_dll_events(); mgpu::hookprobe::tick(); }
         mgpu::gputime::poll();   // GT1: collect finished lists (cheap)
         // HD1: every 2 s while HDR is on - is Windows HDR on for the monitor
         // the picture is on (the cover, the game's window, or the bridge's).
@@ -26066,6 +28811,20 @@ void stream_poll()
             if (w == nullptr) w = g_game_hwnd;
             mgpu::hdr::poll_display(w);
         }
+    }
+    gf_tick();   // GF1: bring the game to the front at start and at the first picture (once each)
+    // TR1: the tray icon, once a second (bridge thread, which owns its window).
+    {
+        static ULONGLONG last_tr = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - last_tr >= 1000) { last_tr = now; mgpu::tray::tick(); }
+    }
+    // BT1: the bridge window as the picture on top (DcompOverlay=0), ~10x a second.
+    if (g_sc_cover == nullptr && !dcomp_overlay_mode())
+    {
+        static ULONGLONG last_bw = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - last_bw >= 100) { last_bw = now; bw_sync(); }
     }
     // SC5: re-check focus and menus for the scaled-picture cover (~10x a second).
     if (g_sc_cover != nullptr)
@@ -26789,6 +29548,12 @@ void stream_poll()
             use_cq = (cq_half_of(s, f) == ii);
             if (!use_cq) ++s.cq_fails;
         }
+        if (run_nr)   // GB5
+        {
+            if (use_cq) g_gb_cq_yes.fetch_add(1u, std::memory_order_relaxed);
+            else if (s.copy_queue && s.cq != nullptr) g_gb_cq_fallback.fetch_add(1u, std::memory_order_relaxed);
+            else g_gb_cq_off.fetch_add(1u, std::memory_order_relaxed);
+        }
 
         // FIX6: record which half this evaluate reads, so a late-latch issued
         // during it targets the other one. An inline unpack lands in ii too.
@@ -26826,6 +29591,9 @@ void stream_poll()
         if (SUCCEEDED(h))
         {
             gt_slot = mgpu::gputime::begin(s.ndev_b, s.nq, s.nl);
+            g_gt_nrq.store(s.nq, std::memory_order_relaxed);   // DR8
+            s.ac_ts_mask = 0; s.ac_ts_resolved = false;   // AC3: a fresh list carries no AMD marks yet
+            s.gb_sr_marked = false; s.gb_u_marked = 0;      // GB1 / GB4
             if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
 
             s.nl->CopyBufferRegion(s.nseal, (UINT64)slot * SEAL_STRIDE,
@@ -26883,6 +29651,7 @@ void stream_poll()
                                    : D3D12_RESOURCE_STATE_COPY_DEST,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
+                if (s.gb_heap != nullptr) { s.nl->EndQuery(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2); s.gb_u_marked |= 1u; }   // GB4
                 // ---- T1b: depth, and it follows tex_in exactly ----
                 //
                 // Same source buffer, same slot, a different offset the seal
@@ -27355,6 +30124,7 @@ void stream_poll()
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 }
 
+                if (s.gb_heap != nullptr) { s.nl->EndQuery(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, 3); s.gb_u_marked |= 2u; }   // GB4
                 // ---- R78: MVec, and it follows depth exactly ----
                 //
                 // Third region of the same slot, same two before-state cases,
@@ -27385,6 +30155,7 @@ void stream_poll()
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 }
 
+                if (s.gb_heap != nullptr) { s.nl->EndQuery(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, 4); s.gb_u_marked |= 4u; }   // GB4
                 // ---- P8.0: the motion vector field ----
                 // A CONSTANT field costs one upload and only when it changes,
                 // so the steady state adds nothing to this list. The cost that
@@ -27542,11 +30313,12 @@ void stream_poll()
                 {
                     UINT dw = s.sr_w, dh = s.sr_h;
                     int dp = g_dr_pct_x10.load(std::memory_order_relaxed);
-                    // DR5: the controller runs only with NVIDIA frame generation.
+                    // DR5/DR6: the controller runs with NVIDIA or AMD frame generation.
                     // Otherwise - or with dynamic switched off after a start that
                     // made the textures at its top - the fixed SRScale is used
                     // inside them, not the last dynamic value or the texture size.
-                    const bool dr_live = g_dr_on.load(std::memory_order_relaxed) != 0 && dp > 0 && s.fg_on == 4u;
+                    const bool dr_live = g_dr_on.load(std::memory_order_relaxed) != 0 && dp > 0 &&
+                                         (s.fg_on == 4u || s.fg_on == 3u);
                     if (!dr_live) dp = (int)s.sr_scale_pct * 10;
                     if (s.sr_scale_pct != 0u && (dr_live || g_dr_alloc.load(std::memory_order_relaxed) > (int)s.sr_scale_pct))
                     {
@@ -28197,8 +30969,10 @@ void stream_poll()
                                      (unsigned int)s.dr_h);
                     s.sr_first = false;
 
+                    if (s.gb_heap != nullptr) s.nl->EndQuery(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);   // GB1
                     const NVSDK_NGX_Result sres =
                         s.sr_eval(s.nl, s.sr_handle, s.sr_params, nullptr);
+                    if (s.gb_heap != nullptr) { s.nl->EndQuery(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1); s.gb_sr_marked = true; }
                     ++s.sr_evals;
                     if (sres != NVSDK_NGX_Result_Success)
                     {
@@ -28304,6 +31078,7 @@ void stream_poll()
                     // pair with the frame before it, and AMD must reset.
                     s.fg_prev_valid = false;
                     if (ext_up(s)) s.fsr_frame_id += 2ull;
+                    fd2_count(FD2_NOT_RUN); g_fd2_break = FD2_BROKEN_NOT_RUN;   // FD2
                 }
                 // HL1: no frame generation this frame - the HUD still goes back
                 // onto the real frame. Only when the final pass wrote: adding it
@@ -28366,6 +31141,12 @@ void stream_poll()
             if (s.ts_ok && run_nr)
                 s.nl->ResolveQueryData(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0,
                                        stream_state::TS_MARKS, s.tsread, 0);
+            if (s.ts_ok && run_nr && s.gb_heap != nullptr && s.gb_sr_marked)   // GB1
+                s.nl->ResolveQueryData(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, s.gb_read, 0);
+            if (s.ts_ok && run_nr && s.gb_heap != nullptr && s.gb_u_marked == 7u)   // GB4: only when all three were written
+                s.nl->ResolveQueryData(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2, 3, s.gb_read, 16);
+            s.gb_sr_was = s.gb_sr_marked;
+            s.gb_u_was = s.gb_u_marked;
 
             mgpu::gputime::end(s.nl, gt_slot);   // GT1
             h = s.nl->Close();
@@ -28404,6 +31185,10 @@ void stream_poll()
             ++s.nf_value;
             h = s.nq->Signal(s.nf, s.nf_value);
             mgpu::gputime::submitted(gt_slot, SUCCEEDED(h) ? s.nf : nullptr, s.nf_value);   // GT1
+            // AC3: the AMD marks of this list are readable once the fence passes this value.
+            if (SUCCEEDED(h) && s.ac_ts_resolved)   // AC4: into the slot this list resolved into
+            { s.ac_ts_pend_mask[s.ac_ts_res_slot] = s.ac_ts_mask; s.ac_ts_pend_fv[s.ac_ts_res_slot] = s.nf_value; }
+            s.ac_ts_mask = 0; s.ac_ts_resolved = false;
             if (SUCCEEDED(h))
             {
                 const HRESULT eh = s.nf->SetEventOnCompletion(s.nf_value, s.nev);   // HARDEN1

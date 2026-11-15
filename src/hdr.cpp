@@ -250,8 +250,29 @@ bool build(ID3D12Device *dev, unsigned w, unsigned h, DXGI_FORMAT fmt)
 
 // Present thread only.
 IDXGISwapChain3 *g_cs_chain = nullptr;   // the chain the colour space below was set on (not owned)
-int g_cs_set = -1;                       // -1 unknown, 0 SDR, 1 HDR10
+int g_cs_set = -1;                       // -1 unknown, else the DXGI colour space set on it
+int g_cs_failed = -1;                    // HD2: the colour space this chain refused (not retried)
 std::atomic<bool> g_cs_refused{false};   // this chain will not take HDR10: stop converting
+
+// HD2: the colour space of the GAME's own swap chain, from ReShade
+// (reshade::api::color_space: 0 unknown, 1 sRGB, 2 scRGB, 3 HDR10 PQ, 4 HDR10
+// HLG). With the game's own HDR on, its picture is already HDR: the bridge
+// must mark its own picture the same way, or Windows shows an HDR signal as
+// SDR - grey and washed out. Polled on every game Present, so turning HDR on
+// or off in the game's menu is followed mid-session.
+std::atomic<int> g_game_cs{0};
+
+const char *cs_name(int c)
+{
+    switch (c)
+    {
+    case 1: return "SDR (sRGB)";
+    case 2: return "HDR, scRGB (linear, 16-bit float)";
+    case 3: return "HDR10 (PQ, Rec.2020)";
+    case 4: return "HDR10 HLG";
+    default: return "unknown";
+    }
+}
 
 } // namespace
 
@@ -323,36 +344,85 @@ void poll_display(HWND wnd)
     }
 }
 
+void note_game_colour_space(int cs)
+{
+    const int was = g_game_cs.exchange(cs, std::memory_order_relaxed);
+    if (was == cs) return;
+    char l[300];
+    snprintf(l, sizeof l, "[MGPU][HD2] the game's picture colour space: %s%s", cs_name(cs),
+             (cs == 2 || cs == 3) ? " - the game's own HDR is on: the bridge passes its HDR picture through "
+                                    "and marks its own picture the same way (HDR output conversion stands aside)."
+             : (cs == 4) ? " - HLG has no swap chain colour space on Windows; the picture is marked SDR."
+             : ".");
+    if (cs == 4) mgpu::diag::warn(l); else mgpu::diag::info(l);
+}
+
+bool game_hdr()
+{
+    const int c = g_game_cs.load(std::memory_order_relaxed);
+    return c == 2 || c == 3;
+}
+
 bool sync_colour_space(IDXGISwapChain3 *sc, bool want)
 {
     if (sc == nullptr) return false;
-    if (sc != g_cs_chain) { g_cs_chain = sc; g_cs_set = -1; g_cs_refused.store(false); }   // new chain
-    const int target = want ? 1 : 0;
-    if (g_cs_set == target) return target == 1;
-    const DXGI_COLOR_SPACE_TYPE cs = want ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-                                          : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    if (sc != g_cs_chain) { g_cs_chain = sc; g_cs_set = -1; g_cs_failed = -1; g_cs_refused.store(false); }   // new chain
+
+    // HD1 conversion -> HDR10. Otherwise HD2: follow the game's own picture,
+    // as long as the chain's format can carry it (PQ needs 10-bit, scRGB a
+    // 16-bit float chain; the chain takes the game's format, so they match
+    // whenever the game is the one that set them).
+    DXGI_COLOR_SPACE_TYPE cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    const char *what = "SDR";
+    bool pass = false;
+    if (want)
+    {
+        cs = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        what = "HDR10 (PQ, Rec.2020) - HDR output on";
+    }
+    else if (game_hdr())
+    {
+        DXGI_SWAP_CHAIN_DESC1 d{};
+        const DXGI_FORMAT f = SUCCEEDED(sc->GetDesc1(&d)) ? d.Format : DXGI_FORMAT_UNKNOWN;
+        const int gc = g_game_cs.load(std::memory_order_relaxed);
+        if (gc == 3 && f == DXGI_FORMAT_R10G10B10A2_UNORM)
+        { cs = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020; what = "HDR10 (PQ, Rec.2020) - the game's own HDR"; pass = true; }
+        else if (gc == 2 && f == DXGI_FORMAT_R16G16B16A16_FLOAT)
+        { cs = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709; what = "scRGB (linear) - the game's own HDR"; pass = true; }
+        else if (g_cs_failed != -2)
+        {
+            g_cs_failed = -2;   // say it once per chain
+            char m[300];
+            snprintf(m, sizeof m, "[MGPU][HD2] the game's own HDR is on (%s) but the bridge's picture is format %u, "
+                     "which cannot carry it - the picture stays marked SDR.", cs_name(gc), (unsigned)f);
+            mgpu::diag::warn(m);
+        }
+    }
+
+    const int target = (int)cs;
+    if (g_cs_set == target) return cs == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    if (g_cs_failed == target) return false;   // refused once on this chain: do not retry every frame
     UINT sup = 0;
     HRESULT hr = sc->CheckColorSpaceSupport(cs, &sup);
     if (SUCCEEDED(hr) && (sup & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0)
         hr = sc->SetColorSpace1(cs);
     else if (SUCCEEDED(hr))
         hr = E_NOTIMPL;
-    char l[240];
+    char l[260];
     if (SUCCEEDED(hr))
     {
         g_cs_set = target;
-        snprintf(l, sizeof l, "[MGPU][HD1] picture colour space: %s.",
-                 want ? "HDR10 (PQ, Rec.2020) - HDR output on" : "SDR");
+        snprintf(l, sizeof l, "[MGPU][%s] picture colour space: %s.", pass ? "HD2" : "HD1", what);
         mgpu::diag::info(l);
-        return target == 1;
+        return cs == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
     }
-    // Could not switch. HDR10 refused: stop converting on this chain (apply
-    // checks the flag), so a PQ picture is never shown as SDR.
-    snprintf(l, sizeof l, "[MGPU][HD1] the swap chain refused colour space %s (0x%08X).%s",
-             want ? "HDR10" : "SDR", (unsigned)hr, want ? " HDR stays off on this picture." : "");
+    // Could not switch. HDR10 refused for the conversion: stop converting on
+    // this chain (apply checks the flag), so a PQ picture is never shown as SDR.
+    snprintf(l, sizeof l, "[MGPU][%s] the swap chain refused colour space %s (0x%08X).%s",
+             pass ? "HD2" : "HD1", what, (unsigned)hr, want ? " HDR stays off on this picture." : "");
     mgpu::diag::warn(l);
     if (want) g_cs_refused.store(true);
-    else g_cs_set = 0;
+    g_cs_failed = target;
     return false;
 }
 
@@ -363,6 +433,7 @@ bool apply(ID3D12Device *dev, ID3D12GraphicsCommandList *cl, ID3D12Resource *bb,
     if (!enabled() || !display_hdr() || dev == nullptr || cl == nullptr || bb == nullptr || w < 16 || h < 16)
         return false;
     if (g_cs_refused.load()) return false;
+    if (game_hdr()) return false;   // HD2: the game's picture is already HDR - never convert twice
     if (fmt != DXGI_FORMAT_R10G10B10A2_UNORM) { g_fmt_ok.store(0); return false; }
     g_fmt_ok.store(1);
     if (!build(dev, w, h, fmt)) return false;
@@ -400,6 +471,7 @@ bool apply(ID3D12Device *dev, ID3D12GraphicsCommandList *cl, ID3D12Resource *bb,
 const char *status()
 {
     if (!enabled()) return "";
+    if (game_hdr()) return "The game's own HDR is on, so its HDR picture is shown as it is and this conversion stands aside.";
     if (g_disp_hdr.load() == 0) return "Windows HDR is off for this monitor - turn on 'Use HDR' in Windows display settings.";
     if (g_disp_hdr.load() < 0) return "Checking the monitor...";
     if (g_fmt_ok.load() == 0) return "This game's picture is not 10-bit, so HDR cannot be made from it.";

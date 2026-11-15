@@ -188,7 +188,7 @@ enum state
 #define MGPU_E207_L1 "ERROR 207"
 #define MGPU_E207_L2 "NEURAL CARD AND GAME CARD ARE THE SAME CARD - SEE ERROR 207 IN RESHADE.LOG"
 
-#define MGPU_S206_L1 "MGPU BRIDGE"
+#define MGPU_S206_L1 "ATOMIC MGPU BRIDGE"
 #define MGPU_S206_L2 "AUTOARM IS OFF IN MGPU.INI - NOTHING WILL ARM BY ITSELF"
 
 // R145. Not codes: the arm names the lane it is held on. "ARMING" for ninety
@@ -205,7 +205,7 @@ enum state
 #define MGPU_E302_L1 "ERROR 302"
 #define MGPU_E302_L2 "DLSS-NR REFUSED TO CREATE ON THIS DRIVER"
 
-#define MGPU_IDLE_L1 "MGPU BRIDGE"
+#define MGPU_IDLE_L1 "ATOMIC MGPU BRIDGE"
 #define MGPU_IDLE_L2 "WAITING FOR THE FIRST FRAME"
 
 // Diagnostic HUD drawn over a live neural frame. Uses the same scissored-clear
@@ -222,7 +222,7 @@ void draw_fps_hud(ID3D12GraphicsCommandList *cl,
                   double game_gbs = -1.0, double tot_out = -1.0, double tot_in = -1.0);   // BW5
 
 // CK1: up to two short lines (clock, stopwatch) in a box at the top-right.
-// SV1: screen saver - black, or (style 1) MGPU BRIDGE drifting in dim grey.
+// SV1: screen saver - black, or (style 1) ATOMIC MGPU BRIDGE drifting in dim grey.
 void draw_saver(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                 unsigned width, unsigned height, int style, unsigned long long ms);
 void draw_clock_box(ID3D12GraphicsCommandList *cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,

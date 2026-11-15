@@ -47,6 +47,15 @@ namespace mgpu::gpu1
     // mgpu.ini DcompOverlay=1. Read at present-chain creation and at window
     // creation, nowhere else.
     bool dcomp_overlay_mode();
+    // HW1: the bridge window is still hidden, waiting for something to show
+    // (DcompOverlay off, BridgeShowIdle=0). The idle loop paces itself then,
+    // because a hidden window's Present does not wait for vsync.
+    bool bridge_window_hidden();
+    // TR1: the tray icon's status and its "status window" menu item.
+    // tray_status returns 0 waiting, 1 arming, 2 running, 3 error.
+    int  tray_status(char *text, size_t n);
+    void hw_status_window(bool show);
+    void tray_details(char *out, size_t n);   // TR3: the Status box text
     bool dcomp_overlay_mode_settled(unsigned timeout_ms);   // R273b: bridge thread - wait for it, bounded, then decide
     // R242: DcompForceWindowed (absent = 1). See dllmain's create_swapchain / set_fullscreen_state.
     bool dcomp_force_windowed();
@@ -559,6 +568,15 @@ int  ui_fg_dyn_target();
 void ui_set_fg_dyn_target(int v);
 float ui_fg_dyn_avg();
 bool ui_fg_clock();             // FC1: the even frame clock (FGClock)
+bool ui_fsr_chain();            // AC1: AMD 4x by chaining a second context (FSRChain)
+void ui_set_fsr_chain(bool on);
+int  ui_fsr_mult();            // X3: AMD's multiplier 2/3/4 (FSRMult)
+void ui_set_fsr_mult(int m);
+bool ui_fsr_rebuilt();        // SF2: the rebuilt AMD DLL (4x) is there and has not failed
+int  ui_fsr_quality();  void ui_set_fsr_quality(int q);   // GV1: 0 Quality, 1 Balanced, 2 Fast
+int  ui_fsr_quality_support();   // GV1: -1 unknown yet, 0 the rebuilt DLL predates presets, 1 supported
+bool ui_fsr_chain_fallback(); // SF2: allow the chained 4x without it (FSRChainFallback)
+void ui_set_fsr_chain_fallback(bool on);
 void ui_set_fg_clock(bool on);
 bool ui_fg_extras_failed();        // MFG7: the 5x/6x buffers could not be made (out of video memory)
 void ui_set_fg_mult(int m);
@@ -583,6 +601,7 @@ bool ui_bus_hud();     void ui_set_bus_hud(bool on);   // HUD3: log the bus traf
 // NM1: NR network: 0 = the DLL's default, 1 = A (original), 2 = B (fast).
 // Read when NR is created, so a change applies from the next launch.
 int  ui_nr_model();    void ui_set_nr_model(int m);
+int  ui_nr_model2();   void ui_set_nr_model2(int m);   // NM2: 2nd and later passes
 // FL1: FG Lite (lighter NVIDIA frame generation) and FG DLL source
 // (0 = driver model store first, 1 = mgpu\nvngx_dlssg.dll first). Next launch.
 int  ui_fg_lite();     void ui_set_fg_lite(int on);
@@ -608,6 +627,8 @@ bool ui_dr_on();  void ui_set_dr_on(bool on);
 int  ui_dr_min(); void ui_set_dr_min(int v);
 int  ui_dr_max(); void ui_set_dr_max(int v);
 float ui_dr_now();   // current scale %, 0 = not running
+bool ui_dr_aggr();         // DR6: SRDynAggressive (ini only)
+void ui_set_dr_aggr(bool on);
 int  ui_dr_alloc();  // % the textures were made at this run
 float ui_dr_busy();   // DR3: neural card busy %, -1 = not measured yet
 const char *ui_dr_status();   // DR3: why it is holding ("" = running normally)
@@ -622,6 +643,21 @@ void ui_at_cancel();
 int  ui_at_state();
 void ui_at_progress(int *cap, int *mult, int *tested, int *target);
 void ui_at_result(int *cap, int *mult, float *out);
+// BM3: benchmark sweep. Applies one configuration (gen 3 AMD / 4 NVIDIA, the
+// Limiter rate, the multiplier) WITHOUT writing mgpu.ini; target frame rate and
+// the dynamic multiplier are held off. ui_bs_end puts the saved settings back
+// (from mgpu.ini, which the sweep never touched).
+void ui_bs_apply(int gen, int cap, int mult);
+void ui_bs_end();
+int  ui_bs_dr_start(int pct);  // BM6: a sweep step starts dynamic resolution at pct, controller history cleared; returns % set
+int  ui_bs_hold_nr(int pct);   // BM5: hold dynamic resolution at pct during a sweep (0 = let go); returns % held, 0 = none
+bool ui_bs_active();
+// The neural card's NVML figures since the last reset (sweep only): power % of
+// its limit, driver-busy %, SM clock MHz, max temperature. False = no samples.
+void ui_bs_nvx_reset();
+bool ui_bs_nvx_take(float *power_pct, float *busy_pct, float *clk_mhz, int *temp_max);
+void ui_nvml_keepalive();   // keep the NVML thread sampling (it idles 5 s after the last ask)
+void ui_ini_read_word(const char *key, char *out, unsigned n);   // one word (no spaces), "" = absent
 float ui_tf_out_fps(); float ui_tf_expected_fps(); bool ui_tf_short();
 int  ui_tf_ceiling(); int ui_tf_retry_s();
 int  ui_fov_mode();    void ui_set_fov_mode(int m);       // FV1/FV2: 0 off, 1 centre, 2 lower band
@@ -647,6 +683,14 @@ void sc_set_panel_live(bool up);
 bool sc_cover_live_rect(RECT *r);   // the 4K picture's screen rect while it is shown
 // PP2: the pointer from the cover window's own mouse messages (worker.cpp).
 bool sc_panel_live();
+// BT1: DcompOverlay=0 with the bridge window on the game's monitor - the window
+// kept on top, never activated, the mouse passed on to the game.
+bool bw_active();
+void bw_set_aside(bool on);
+bool bw_mouse(HWND self, UINT msg, WPARAM wp, LPARAM lp, LRESULT *res);
+bool bw_on_top();
+bool bw_panel();            // BT5: the ReShade panel is open on the picture's runtime
+void bw_set_panel(bool up);
 void sc_cover_mouse(int x, int y, unsigned btn, int wheel);
 bool sc_cover_mouse_get(float *u, float *v, unsigned *btn, int *wheel);   // false: no message yet / panel not up
 void ui_driver_notice(char *out, unsigned n);   // DRV1: empty when the driver is fine
@@ -657,6 +701,7 @@ bool ui_detailed_log();  void ui_set_detailed_log(bool on);
 bool ui_perf_log();      void ui_set_perf_log(bool on);      // PF1: the 10 s performance summary
 // DV1: one line naming the NVIDIA DLL versions loaded this session.
 void ui_dll_versions(char *out, unsigned n);
+void ui_fsr_in_use(char *out, unsigned n);   // DV2: which AMD DLL makes the frames now
 int  ui_fg_source();   void ui_set_fg_source(int v);
 bool ui_stopwatch();   void ui_set_stopwatch(bool on);
 void set_hook_present_active(bool on);   // HP1: dllmain says the present-time feed is running
@@ -961,6 +1006,10 @@ void stream_note_real_vectors();
 // consumer reads a slot whose copy has not landed and the SEAL checker says so
 // on the first frame - bad_magic or a contract mismatch, loudly, not silently.
 void stream_on_present(void *cmd_queue);
+
+// GP2: wait until the render card has finished the game's frame from `latency`
+// frames ago. 0 ok, 1 timed out, 2 a device is gone, 3 not streaming.
+int gp_brake(unsigned latency, unsigned timeout_ms, unsigned long long *overruns);
 
 void stream_on_finish_effects(void *cmd_list, void *cmd_queue,
                               unsigned long long rtv_handle,

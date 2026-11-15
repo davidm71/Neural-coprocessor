@@ -790,6 +790,28 @@ void get_selection(selection_result &out)
 // from the bridge thread's present loop and from an overlay callback, neither
 // of which may block behind a selection that is mid-decision.
 unsigned nv_driver_version() { return g_nv_drv.load(); }
+
+// GP1: the two cards' names for the panel footer, as Windows reports them.
+// try_lock: the panel never waits behind a selection that is mid-decision.
+void card_names(char *game, unsigned gn, char *mgpu, unsigned mn)
+{
+    if (game && gn) game[0] = 0;
+    if (mgpu && mn) mgpu[0] = 0;
+    auto &S = st();
+    std::unique_lock<std::mutex> lk(S.cs, std::try_to_lock);
+    if (!lk.owns_lock()) return;
+    const LUID g = S.result.game_luid_from_swapchain ? S.result.game_luid
+                 : (S.provisional_known ? S.provisional_luid : LUID{});
+    const bool g_known = S.result.game_luid_from_swapchain || S.provisional_known;
+    for (const entry &e : S.table)
+    {
+        if (g_known && game && gn && e.luid.LowPart == g.LowPart && e.luid.HighPart == g.HighPart)
+            snprintf(game, gn, "%s", e.desc);
+        if (S.result.valid && mgpu && mn && e.luid.LowPart == S.result.selected_luid.LowPart &&
+            e.luid.HighPart == S.result.selected_luid.HighPart)
+            snprintf(mgpu, mn, "%s", e.desc);
+    }
+}
 int topology_block(unsigned *nv_count) { if (nv_count) *nv_count = g_topo_nv.load(); return g_topo_block.load(); }
 
 unsigned long long ms_since_last_swapchain_event()

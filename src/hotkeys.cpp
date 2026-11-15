@@ -50,6 +50,7 @@ const def DEFS[A_COUNT] = {
     { "Record input path (replay)", "HotkeyInputPath", { M_CTRL | M_ALT, 'I' },           false },
     { "Clock show/hide",           "HotkeyClock",      { M_CTRL | M_ALT, 'C' },           false },
     { "Stopwatch show/hide",       "HotkeyStopwatch",  { M_CTRL | M_ALT, 'S' },           false },
+    { "Benchmark sweep start/stop", "HotkeySweep",     { M_CTRL | M_ALT, 'W' },           false },
 };
 
 std::mutex g_mx;                       // bindings + conflicts (panel reads them)

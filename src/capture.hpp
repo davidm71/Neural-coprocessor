@@ -17,6 +17,10 @@
 //        (not generated) frames' pacing, game and neural frame rates, and the
 //        settings it ran with. Writes a per-run CSV and summary, and appends one
 //        line to benchmarks\results.csv so runs with different settings line up.
+//        Odd/even pacing too: whether every other gap is short and the next long.
+//   BM3  the sweep: the benchmark once per frame generation configuration
+//        (generator, Limiter, multiplier), round after round, mgpu.ini untouched;
+//        a summary table in benchmarks\MGPU_sweep_*.txt.
 //
 // Files go to <add-on folder>\mgpu\captures\ (screenshots, videos) and
 // <add-on folder>\mgpu\benchmarks\.
@@ -37,7 +41,8 @@ namespace capture
 // ---- triggers (any thread) ----
 void request_screenshot();
 void toggle_recording();
-void toggle_benchmark();
+void toggle_benchmark();         // during a sweep: stops the sweep
+void toggle_sweep();             // BM3: start / stop the benchmark sweep
 void shutdown();                 // finishes a recording / benchmark in progress
 
 // ---- the present path (present_frame, under its present lock) ----
@@ -60,16 +65,27 @@ void on_present_shown();
 // ---- settings (panel; saved to mgpu.ini) ----
 int  record_seconds();   void set_record_seconds(int s);   // 0 = until stopped
 int  record_fps();       void set_record_fps(int f);       // 0 = every frame shown
+int  record_codec();     void set_record_codec(int c);     // VR2: 0 H.264, 1 H.265 (HEVC)
 bool record_audio();     void set_record_audio(bool on);
 int  bench_seconds();    void set_bench_seconds(int s);
 int  bench_delay();      void set_bench_delay(int s);
 bool bench_replay();     void set_bench_replay(bool on);   // BM2: play the recorded input path
+// BM3 sweep: BenchSweep=amd:40x4,amd:50x3,nv:40x4,nv:50x3 (gen:CAPxMULT, up to 12),
+// each step settles, then measures; every configuration once per round.
+int  sweep_seconds();    void set_sweep_seconds(int s);    // measured per step (BenchSweepSeconds)
+int  sweep_settle();     void set_sweep_settle(int s);     // not measured after each switch (BenchSweepSettle)
+int  sweep_rounds();     void set_sweep_rounds(int r);     // BenchSweepRounds
+int  sweep_nr();         void set_sweep_nr(int p);         // BM5: hold neural resolution at p % during a sweep (0 = dynamic)
+void sweep_list(char *out, unsigned n);                     // the list in force (default when absent)
+bool set_sweep_list(const char *list);                      // false = something in it could not be read
 bool screenshot_hud();   void set_screenshot_hud(bool on); // screenshots include the FPS HUD (default on)
 bool record_hud();       void set_record_hud(bool on);     // video includes the FPS HUD (default off)
 
 // ---- status ----
 int  recording_state();  // 0 idle, 1 starting, 2 recording, 3 finishing
 int  bench_state();      // 0 idle, 1 countdown, 2 measuring
+int  sweep_state();      // BM3: 0 idle, 1 running
+void sweep_progress(int *step, int *steps);
 // One HUD line (font-safe: A-Z 0-9 . - : / space), empty when there is nothing to say.
 void hud_line(char *out, unsigned n);
 // The last result or file, for the panel.

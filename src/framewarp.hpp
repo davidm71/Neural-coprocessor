@@ -58,6 +58,7 @@ void emergency_unhook();  // REV: DllMain live unload - remove the mouse hook, j
 
 // ---- settings (panel; saved to mgpu.ini) ----
 bool  enabled();      void set_enabled(bool on);
+bool  camera_live();  // FD1: the menu check's current verdict (true = the camera follows the mouse)
 int   scale();        void set_scale(int milli_deg_per_count);   // 1..500
 bool  invert_y();     void set_invert_y(bool on);
 int   lead_ms();      void set_lead_ms(int ms);                  // 0..60

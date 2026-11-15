@@ -11,6 +11,11 @@ cmake_minimum_required(VERSION 3.21)
 
 project(mgpu_bridge CXX)
 
+# Community release defaults to a 20-FPS final bridge presentation ceiling.
+# For your separate unrestricted private build use -DATOMIC_COMMUNITY_20FPS=OFF
+# in a DIFFERENT build directory. Do not ship the unrestricted binary publicly.
+option(ATOMIC_COMMUNITY_20FPS "Limit bridge output to 20 FPS (Community Edition)" ON)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -80,6 +85,10 @@ add_library(mgpu_bridge SHARED
     src/hdr.cpp
     # GT1: the neural card's busy time from GPU timestamps (dynamic resolution).
     src/gputime.cpp
+    src/dllid.cpp
+    src/hookprobe.cpp
+    src/gamepresent.cpp
+    src/tray.cpp
     src/crashlog.cpp
     # SH1: a one-time report of how Steam's overlay hooks Present.
     src/steam_hooks.cpp
@@ -91,6 +100,14 @@ add_library(mgpu_bridge SHARED
 target_include_directories(mgpu_bridge PRIVATE
     "ext/reshade/include"
 )
+
+if(ATOMIC_COMMUNITY_20FPS)
+    target_compile_definitions(mgpu_bridge PRIVATE ATOMIC_COMMUNITY_20FPS=1)
+    message(STATUS "Atomic MGPU Community Edition: final presentation capped at 20 FPS")
+else()
+    message(STATUS "Atomic MGPU: unrestricted output build (do not publish as Community Edition)")
+endif()
+
 
 # ---------------------------------------------------------------------------
 # P7.1. The overlay panel's only dependency: two ImGui headers.
@@ -174,6 +191,14 @@ target_compile_definitions(mgpu_bridge PRIVATE
     _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR
 )
 
+# PR1: the release build. ON = quiet log (warnings, errors and a few setup
+# lines; everything with DetailedLog=1) and no developer probes in the panel.
+# OFF = the diagnostic build. tools/make_production.py turns it on.
+option(MGPU_PRODUCTION "Release build: quiet log, no developer probes" ON)
+if(MGPU_PRODUCTION)
+    target_compile_definitions(mgpu_bridge PRIVATE MGPU_PRODUCTION=1)
+endif()
+
 # dxgi: factory + EnumAdapters1 (T2). d3d12: the private device (T3).
 target_link_libraries(mgpu_bridge PRIVATE
     dxgi
@@ -196,6 +221,19 @@ target_link_libraries(mgpu_bridge PRIVATE
 # trip as a logic error and teaches less - keep the first-try bar low.
 target_compile_options(mgpu_bridge PRIVATE /W3)
 
+# IN1: the installer, AtomicMGPU-Setup.exe - a small Windows app shipped in the
+# release folder beside the add-on (it copies the files from its own folder
+# into a game's folder). Static runtime, so it needs no Visual C++ redist; its
+# own manifest (common controls 6, DPI aware, no elevation) is in setup.rc.
+enable_language(RC)
+add_executable(atomic_mgpu_setup WIN32 installer/setup.cpp installer/setup.rc)
+set_target_properties(atomic_mgpu_setup PROPERTIES
+    OUTPUT_NAME "AtomicMGPU-Setup"
+    MSVC_RUNTIME_LIBRARY "MultiThreaded")
+target_compile_definitions(atomic_mgpu_setup PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_options(atomic_mgpu_setup PRIVATE /MANIFEST:NO)
+target_link_libraries(atomic_mgpu_setup PRIVATE comctl32 comdlg32 shell32 dxgi version ole32 advapi32 gdi32)
+
 option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)
 if(MGPU_BUILD_TESTS)
     enable_testing()
@@ -216,4 +254,8 @@ if(MGPU_BUILD_TESTS)
     add_executable(mgpu_fg_clock_test tests/fg_clock_test.cpp)
     target_include_directories(mgpu_fg_clock_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     add_test(NAME mgpu_fg_clock_test COMMAND mgpu_fg_clock_test)
+
+    add_executable(mgpu_fsr_chain_test tests/fsr_chain_test.cpp)
+    target_include_directories(mgpu_fsr_chain_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME mgpu_fsr_chain_test COMMAND mgpu_fsr_chain_test)
 endif()

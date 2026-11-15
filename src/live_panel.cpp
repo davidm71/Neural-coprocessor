@@ -45,25 +45,28 @@ namespace
 // ---- R292: the key, read once at attach --------------------------------------
 std::atomic<int> g_key{-1};   // -1 not read, 0 off, 1 on
 
+// PO1: ON unless mgpu.ini says PanelOverPicture=0. It was OFF unless the file
+// said 1, and the diagnostic mgpu.ini never did - so Home opened the panel in
+// the game's own (smaller) window with the picture behind it (2026-11-15).
 int read_key(void *module)
 {
     wchar_t mod[MAX_PATH] = {};
     const DWORD len = (module != nullptr) ? GetModuleFileNameW((HMODULE)module, mod, MAX_PATH) : 0;
-    if (len == 0 || len >= MAX_PATH) return 0;
+    if (len == 0 || len >= MAX_PATH) return 1;
     wchar_t *slash = wcsrchr(mod, L'\\');
-    if (slash == nullptr) return 0;
+    if (slash == nullptr) return 1;
     slash[1] = L'\0';
     wchar_t path[MAX_PATH] = {};
     _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%lsmgpu.ini", mod);
     FILE *f = nullptr;
-    if (_wfopen_s(&f, path, L"rb") != 0 || f == nullptr) return 0;
+    if (_wfopen_s(&f, path, L"rb") != 0 || f == nullptr) return 1;
     static char buf[mgpu::config::MAX_BYTES + 2u];
     const size_t got = fread(buf, 1, mgpu::config::MAX_BYTES + 1u, f);
     fclose(f);
-    if (got > mgpu::config::MAX_BYTES) return 0;
+    if (got > mgpu::config::MAX_BYTES) return 1;
     buf[got] = '\0';
     const char *k = mgpu::config::find(buf, got, "PanelOverPicture");
-    return (k != nullptr && *k == '1') ? 1 : 0;
+    return (k != nullptr && *k == '0') ? 0 : 1;
 }
 
 // ---- the panel's state ------------------------------------------------------
@@ -78,6 +81,12 @@ std::atomic<void *> g_windowless{nullptr};// the GPU 1 runtime with no window = 
 std::atomic<void *> g_host{nullptr};      // the runtime the panel was actually opened on
 std::atomic<int>    g_said_host{0};
 std::atomic<int>    g_probe{0};
+// WH1: the wheel for this frame, in notches. Written by feed_input and used by
+// wheel_here, both on the host runtime's overlay pass. It cannot go into
+// io.MouseWheel: that is read in NewFrame and cleared in EndFrame, and the
+// feed runs between the two, so every notch written there was thrown away.
+float               g_wheel_pend = 0.0f;
+std::atomic<int>    g_wh_hook{0}, g_wh_cover{0};   // notches seen, for the R294 line
 
 // R293: the last time the host's reshade_overlay event fired (GetTickCount64).
 std::atomic<unsigned long long> g_host_drawn_ms{0};
@@ -175,6 +184,14 @@ void feed_input(reshade::api::effect_runtime *runtime)
             ldown = (b & 1u) != 0u;
             rdown = (b & 2u) != 0u;
             mdown = (b & 4u) != 0u;
+            // WH1: the picture window gets WM_MOUSEWHEEL only when Windows sends
+            // it there (focus, "scroll inactive windows"); the mouse hook sees
+            // every notch. Use the hook when it is in, never both.
+            int hw = 0;
+            const bool hk = mgpu::hotkeys::panel_mouse_get(nullptr, nullptr, nullptr, &hw);
+            if (wheel != 0) g_wh_cover.fetch_add(wheel / WHEEL_DELTA, std::memory_order_relaxed);
+            if (hw != 0) g_wh_hook.fetch_add(hw / WHEEL_DELTA, std::memory_order_relaxed);
+            if (hk) wheel = hw;
         }
         else if (HWND gh = (HWND)mgpu::gpu1::dcomp_game_hwnd();
                  gh != nullptr && mgpu::hotkeys::panel_mouse_get(nullptr, nullptr, nullptr, nullptr))
@@ -258,7 +275,7 @@ void feed_input(reshade::api::effect_runtime *runtime)
         io.MouseDown[0] = ldown;
         io.MouseDown[1] = rdown;
         io.MouseDown[2] = (scaled || hooked) ? mdown : ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0);
-        if ((scaled || hooked) && wheel != 0) io.MouseWheel += (float)wheel / (float)WHEEL_DELTA;   // PP2/PP3
+        g_wheel_pend = (scaled || hooked) ? (float)wheel / (float)WHEEL_DELTA : 0.0f;   // PP2/PP3, WH1
         // PP3: modifier and ESC state from the keyboard hook - ReShade freezes
         // GetAsyncKeyState while it blocks the game's input.
         io.KeyCtrl  = mgpu::hotkeys::key_down(VK_CONTROL);
@@ -285,13 +302,14 @@ void feed_input(reshade::api::effect_runtime *runtime)
         char pr[640];
         snprintf(pr, sizeof pr,
                  "[MGPU][R294] feed: %s%s | live=%d host=%p runtime=%p | io pos=(%.0f,%.0f) "
-                 "cursor=%d wantCapture=%d down0=%d",
+                 "cursor=%d wantCapture=%d down0=%d | wheel notches: hook %d, picture window %d",
                  why, (why != last_why) ? "  <- CHANGED" : "",
                  g_live.load(std::memory_order_relaxed),
                  g_host.load(std::memory_order_relaxed), (void *)runtime,
                  (double)ImGui::GetIO().MousePos.x, (double)ImGui::GetIO().MousePos.y,
                  (int)ImGui::GetIO().MouseDrawCursor, (int)ImGui::GetIO().WantCaptureMouse,
-                 (int)ImGui::GetIO().MouseDown[0]);
+                 (int)ImGui::GetIO().MouseDown[0],
+                 g_wh_hook.load(std::memory_order_relaxed), g_wh_cover.load(std::memory_order_relaxed));
         mgpu::diag::info(pr);
         last_why = why;
     }
@@ -331,9 +349,13 @@ void on_reshade_overlay(reshade::api::effect_runtime *runtime)
         }
         t_own = true;
         g_own_ms.store(GetTickCount64(), std::memory_order_relaxed);
-        if (ImGui::Begin("MGPU Bridge###mgpu_panel_own", nullptr, ImGuiWindowFlags_NoDocking))
+        if (ImGui::Begin("Atomic MGPU Bridge###mgpu_panel_own", nullptr, ImGuiWindowFlags_NoDocking))
+        {
+            wheel_here();   // WH1 (an open combo list takes it instead: it is the hovered window)
             g_drawer(runtime);
+        }
         ImGui::End();
+        g_wheel_pend = 0.0f;
         t_own = false;
     }
 
@@ -380,6 +402,23 @@ void attach(void *module)
 #else
     mgpu::diag::warn("[MGPU][R292] PanelOverPicture=1, but this build has no ImGui: the key is ignored and "
                      "the shipped behaviour stays.");
+#endif
+}
+
+void wheel_here()
+{
+#if defined(MGPU_HAVE_IMGUI)
+    if (g_wheel_pend == 0.0f || !ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) return;
+    // ImGui's own step: five lines a notch, at most two thirds of the window.
+    float step = ImGui::GetFontSize() * 5.0f;
+    const float cap = ImGui::GetWindowHeight() * 0.67f;
+    if (cap > 0.0f && step > cap) step = cap;
+    float y = ImGui::GetScrollY() - g_wheel_pend * step;
+    const float ymax = ImGui::GetScrollMaxY();
+    if (y > ymax) y = ymax;
+    if (y < 0.0f) y = 0.0f;
+    ImGui::SetScrollY(y);
+    g_wheel_pend = 0.0f;
 #endif
 }
 

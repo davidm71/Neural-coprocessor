@@ -42,6 +42,9 @@
 #include "adapter.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#ifndef WS_EX_NOREDIRECTIONBITMAP
+#define WS_EX_NOREDIRECTIONBITMAP 0x00200000L   // DF2: Windows 8+; defined here in case the SDK target is older
+#endif
 #include "worker.hpp"
 #include "hud_probe.hpp"   // HUD1
 #include "hotkeys.hpp"     // HK1
@@ -49,6 +52,7 @@
 #include "scaler.hpp"
 #include "framewarp.hpp"   // FW1
 #include "replay.hpp"      // BM2
+#include "tray.hpp"        // TR1
 
 // T4 (brief section 00, exception 1): the add-on's own module handle,
 // defined in dllmain.cpp and captured at DLL_PROCESS_ATTACH.
@@ -156,6 +160,11 @@ namespace
     LRESULT CALLBACK bridge_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         (void)wParam; (void)lParam;
+        {   // BT1: the picture on top passes the mouse on to the game
+            LRESULT r = 0;
+            if (mgpu::gpu1::bw_mouse(hWnd, msg, wParam, lParam, &r)) return r;
+            if (mgpu::tray::on_message(hWnd, msg, wParam, lParam, &r)) return r;   // TR1
+        }
         switch (msg)
         {
         case WM_CLOSE:
@@ -238,6 +247,7 @@ namespace
     {
         RECT rect[8]{};
         bool primary[8]{};
+        wchar_t device[8][32]{};   // AM1: GDI name, e.g. \\.\DISPLAY1
         UINT count = 0;
     };
 
@@ -245,14 +255,88 @@ namespace
     {
         desktop_monitors *d = reinterpret_cast<desktop_monitors *>(lp);
         if (d->count >= 8) return FALSE;
-        MONITORINFO mi{}; mi.cbSize = sizeof mi;
+        MONITORINFOEXW mi{}; mi.cbSize = sizeof mi;
         if (GetMonitorInfoW(mh, &mi) != FALSE)
         {
             d->rect[d->count]    = mi.rcMonitor;
             d->primary[d->count] = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+            wcsncpy_s(d->device[d->count], 32, mi.szDevice, _TRUNCATE);
             ++d->count;
         }
         return TRUE;
+    }
+
+    // AM1: which desktop monitors are cabled to the bridge card, by the
+    // Windows display configuration (QueryDisplayConfig) instead of DXGI.
+    //
+    // MEASURED on davidm71's rig (3080 Ti renders, 5060 Ti displays, iGPU
+    // drives a second panel): DXGI said the bridge card had no outputs and
+    // the render card had one, while CCD put the 4K panel's path on the
+    // BRIDGE LUID and the iGPU panel on neither. CCD was right - the cable is
+    // in the 5060 Ti - and the old fallback ("first non-primary monitor")
+    // picked the iGPU panel, so every user with that layout had to know to
+    // write Monitor=0.
+    //
+    // Pass 1 matches the TARGET adapter (the card the connector is on); pass
+    // 2 the SOURCE adapter, for drivers that only fill that one. A LUID that
+    // matches nothing (the two namespaces can differ on some drivers) returns
+    // 0, and the caller falls back to the old rule, so this can only replace
+    // a guess with a measurement, never make placement worse than before.
+    UINT ccd_monitors_on_adapter(LUID luid, const desktop_monitors &mons,
+                                 bool match[8], const char **how)
+    {
+        for (UINT i = 0; i < 8; ++i) match[i] = false;
+        typedef LONG (WINAPI *pfn_sizes)(UINT32, UINT32 *, UINT32 *);
+        typedef LONG (WINAPI *pfn_query)(UINT32, UINT32 *, DISPLAYCONFIG_PATH_INFO *,
+                                         UINT32 *, DISPLAYCONFIG_MODE_INFO *,
+                                         DISPLAYCONFIG_TOPOLOGY_ID *);
+        typedef LONG (WINAPI *pfn_info)(DISPLAYCONFIG_DEVICE_INFO_HEADER *);
+        HMODULE u = GetModuleHandleW(L"user32.dll");
+        if (u == nullptr) return 0;
+        pfn_sizes p_sizes = (pfn_sizes)(void *)GetProcAddress(u, "GetDisplayConfigBufferSizes");
+        pfn_query p_query = (pfn_query)(void *)GetProcAddress(u, "QueryDisplayConfig");
+        pfn_info  p_info  = (pfn_info)(void *)GetProcAddress(u, "DisplayConfigGetDeviceInfo");
+        if (p_sizes == nullptr || p_query == nullptr || p_info == nullptr) return 0;
+
+        UINT32 np = 0, nm = 0;
+        if (p_sizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || np == 0) return 0;
+        DISPLAYCONFIG_PATH_INFO *paths =
+            (DISPLAYCONFIG_PATH_INFO *)calloc(np, sizeof(DISPLAYCONFIG_PATH_INFO));
+        DISPLAYCONFIG_MODE_INFO *modes =
+            (DISPLAYCONFIG_MODE_INFO *)calloc(nm ? nm : 1, sizeof(DISPLAYCONFIG_MODE_INFO));
+        UINT found = 0;
+        if (paths != nullptr && modes != nullptr &&
+            p_query(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, nullptr) == ERROR_SUCCESS)
+        {
+            for (int pass = 0; pass < 2 && found == 0; ++pass)
+            {
+                for (UINT32 i = 0; i < np; ++i)
+                {
+                    const LUID a = (pass == 0) ? paths[i].targetInfo.adapterId
+                                               : paths[i].sourceInfo.adapterId;
+                    if (a.LowPart != luid.LowPart || a.HighPart != luid.HighPart) continue;
+
+                    DISPLAYCONFIG_SOURCE_DEVICE_NAME sn{};
+                    sn.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                    sn.header.size      = sizeof sn;
+                    sn.header.adapterId = paths[i].sourceInfo.adapterId;
+                    sn.header.id        = paths[i].sourceInfo.id;
+                    if (p_info(&sn.header) != ERROR_SUCCESS) continue;
+
+                    for (UINT m = 0; m < mons.count; ++m)
+                        if (!match[m] && _wcsicmp(mons.device[m], sn.viewGdiDeviceName) == 0)
+                        {
+                            match[m] = true;
+                            ++found;
+                        }
+                }
+                if (found != 0)
+                    *how = (pass == 0) ? "the display path's TARGET adapter (the card the cable is in)"
+                                       : "the display path's SOURCE adapter";
+            }
+        }
+        free(paths); free(modes);
+        return found;
     }
 
     void enumerate_desktop_monitors(desktop_monitors &out)
@@ -267,7 +351,7 @@ namespace
         int  x = CW_USEDEFAULT, y = CW_USEDEFAULT;
         UINT outputs_total = 0;      // outputs the adapter reports
         UINT outputs_attached = 0;   // of those, attached to the desktop
-        char detail[320] = {};
+        char detail[420] = {};
     };
 
     void pick_bridge_placement(const mgpu::adapter::selection_result &sel,
@@ -351,9 +435,47 @@ namespace
             }
             else
             {
+                // AM1: ask the Windows display configuration which monitor the
+                // bridge card is cabled to before guessing. Several matches:
+                // the primary one first (that is where a game runs by default),
+                // otherwise the first. Only when this window IS the picture
+                // (DcompOverlay off): in overlay mode the window is never shown
+                // and its placement stays exactly as before.
+                DXGI_ADAPTER_DESC1 ad{};
+                bool ccd_match[8]{};
+                const char *ccd_how = nullptr;
+                const UINT n_ccd = (!mgpu::gpu1::dcomp_overlay_mode() &&
+                                    SUCCEEDED(ad1->GetDesc1(&ad)))
+                    ? ccd_monitors_on_adapter(ad.AdapterLuid, mons, ccd_match, &ccd_how) : 0;
+                if (n_ccd != 0)
+                {
+                    UINT p = mons.count;
+                    for (UINT i = 0; i < mons.count; ++i)
+                        if (ccd_match[i] && mons.primary[i]) { p = i; break; }
+                    if (p == mons.count)
+                        for (UINT i = 0; i < mons.count; ++i)
+                            if (ccd_match[i]) { p = i; break; }
+                    out.known = true;
+                    out.x = (int)mons.rect[p].left;
+                    out.y = (int)mons.rect[p].top;
+                    char dn[40] = {};
+                    WideCharToMultiByte(CP_UTF8, 0, mons.device[p], -1, dn, 39, nullptr, nullptr);
+                    snprintf(out.detail, sizeof out.detail,
+                             "[AM1] auto: DXGI named no outputs for the bridge card, so the Windows "
+                             "display configuration was asked - %u monitor(s) on the bridge card by "
+                             "%s; using monitor %u of %u \"%s\"%s, rect (%d,%d)-(%d,%d)",
+                             n_ccd, ccd_how, p, mons.count, dn,
+                             mons.primary[p] ? " (primary)" : "",
+                             (int)mons.rect[p].left, (int)mons.rect[p].top,
+                             (int)mons.rect[p].right, (int)mons.rect[p].bottom);
+                    return;
+                }
+
                 // First non-primary monitor. The game is on the primary one on
                 // essentially every rig this will meet, and "not where the game
-                // is" is the requirement - not "which card owns it".
+                // is" is the requirement - not "which card owns it". Reached
+                // only when the display configuration could not name the card's
+                // monitor either (AM1 above).
                 bool found = false;
                 for (UINT i = 0; i < mons.count; ++i)
                     if (!mons.primary[i]) { pick = i; found = true; break; }
@@ -367,8 +489,8 @@ namespace
                              "placed by Windows");
                     return;
                 }
-                how = "auto, from the DESKTOP monitor list because the bridge adapter reported "
-                      "no outputs of its own: the first non-primary monitor";
+                how = "auto, from the DESKTOP monitor list because neither DXGI nor the display "
+                      "configuration named a monitor on the bridge card: the first non-primary monitor";
             }
 
             out.known = true;
@@ -433,14 +555,14 @@ namespace
         char t[220];
         if (!st.armed)
             snprintf(t, sizeof t,
-                     "MGPU Bridge (GPU 1) - NOT ARMED - press CTRL+ALT+F10 in gameplay "
+                     "Atomic MGPU Bridge (GPU 1) - NOT ARMED - press CTRL+ALT+F10 in gameplay "
                      "| D3D12 only");
         else if (st.summarised)
             snprintf(t, sizeof t,
-                     "MGPU Bridge (GPU 1) - finished, ran to its bound | D3D12 only");
+                     "Atomic MGPU Bridge (GPU 1) - finished, ran to its bound | D3D12 only");
         else
             snprintf(t, sizeof t,
-                     "MGPU Bridge (GPU 1) - armed | x%u | neural %s | %llu frames | D3D12 only",
+                     "Atomic MGPU Bridge (GPU 1) - armed | x%u | neural %s | %llu frames | D3D12 only",
                      st.passes, st.neural ? (st.nr_ok ? "ON" : "requested") : "off",
                      (unsigned long long)st.consumed);
 
@@ -701,10 +823,24 @@ namespace
                                      "is the same panel.");
                 }
 
+                // DF2 (experiment): CoverNoRedirect=1 creates the window with no
+                // redirection bitmap. Every window otherwise gets a hidden GDI
+                // surface under whatever composition layer it shows, and a window
+                // with two layers is always composed by the desktop compositor -
+                // which keeps the picture (on the SC3 cover or here) off direct
+                // flip. Flip-model and composition swapchains do not need it.
+                // Only at creation: it cannot be added to a window later.
+                if (mgpu::gpu1::ui_ini_read("CoverNoRedirect", 0) == 1)
+                {
+                    ex_style |= WS_EX_NOREDIRECTIONBITMAP;
+                    mgpu::diag::info("[MGPU][DF2] the bridge window is created WS_EX_NOREDIRECTIONBITMAP (CoverNoRedirect=1): "
+                                     "no hidden GDI surface under the picture. Check with PresentMon whether the mod's swap "
+                                     "chain leaves \"Composed: Flip\". If the picture is missing, set CoverNoRedirect=0.");
+                }
                 hwnd = CreateWindowExW(
                     ex_style,
                     class_name_w,
-                    L"MGPU Bridge (GPU 1) - starting | D3D12 only",
+                    L"Atomic MGPU Bridge (GPU 1) - starting | D3D12 only",
                     wnd_style,
                     place.x, place.y,
                     width, height,
@@ -765,7 +901,14 @@ namespace
                     // as it always has.
                     if (!mgpu::gpu1::dcomp_overlay_mode())
                     {
-                        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        // HW1: shown at the first neural frame (or an error
+                        // screen) unless BridgeShowIdle=1 asks for it now.
+                        if (!mgpu::gpu1::bridge_window_hidden())
+                            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        else
+                            mgpu::diag::info("[MGPU][HW1] the bridge window stays hidden until the first "
+                                             "neural frame (or an error screen) - nothing covers the game "
+                                             "while it starts. BridgeShowIdle=1 shows it from the start.");
                     }
                     else
                     {
@@ -775,6 +918,8 @@ namespace
                                          "If you can swap to a bridge window, this line did not "
                                          "run.");
                     }
+
+                    mgpu::tray::install(hwnd);   // TR1
 
                     // P7.10: say what it is doing straight away. The present
                     // loop refreshes this every half second, but if the present
@@ -1064,6 +1209,7 @@ namespace
                         if (hp.n[A_SCREENSHOT]) mgpu::capture::request_screenshot();
                         if (hp.n[A_RECORD] & 1u) mgpu::capture::toggle_recording();
                         if (hp.n[A_BENCH] & 1u)  mgpu::capture::toggle_benchmark();
+                        if (hp.n[A_SWEEP] & 1u)  mgpu::capture::toggle_sweep();   // BM3
                         if (hp.n[A_PATH] & 1u)   mgpu::replay::toggle_record();
                         if (hp.n[A_CLOCK] & 1u)     mgpu::gpu1::ui_set_clock(!mgpu::gpu1::ui_clock());
                         if (hp.n[A_STOPWATCH] & 1u) mgpu::gpu1::ui_set_stopwatch(!mgpu::gpu1::ui_stopwatch());
@@ -1421,6 +1567,9 @@ namespace
                 // frame has actually been captured. Placed after the present so
                 // its one expensive poll cannot delay a frame that was ready.
                 mgpu::gpu1::capture_poll();
+                // HW1: a hidden window's Present returns at once (occluded) -
+                // pace the idle loop to ~60 Hz so it does not spin GPU 1.
+                if (mgpu::gpu1::bridge_window_hidden()) Sleep(16);
 
                 ++frame;
                 if (frame == 1)
@@ -1550,6 +1699,7 @@ namespace
         mgpu::framewarp::release_gpu_now();   // FW1: the present queue is drained now
         mgpu::scaler::release();              // SC1: same point
 
+        mgpu::tray::remove();   // TR1: before the window it reports to goes
         if (hwnd != nullptr)
         {
             // DestroyWindow must be called from the thread that created the
@@ -1617,8 +1767,20 @@ namespace
     }
 }
 
+namespace { std::atomic<bool> g_user_exit{false}; }   // TR4
+
+void user_exit()
+{
+    if (g_user_exit.exchange(true)) return;
+    mgpu::diag::info("[MGPU][TR4] Exit from the tray icon - the bridge stops and stays stopped for the "
+                     "rest of this game session. The game keeps running on its own card; restart the "
+                     "game to use the bridge again.");
+    stop();
+}
+
 void ensure_started()
 {
+    if (g_user_exit.load()) return;   // TR4: exited from the tray - stay stopped
     bool expected = false;
     if (!st().started.compare_exchange_strong(expected, true))
         return;
