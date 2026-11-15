@@ -1,16 +1,31 @@
 # Atomic MGPU Bridge
 
-> **COMMUNITY EDITION — OUTPUT LIMITED TO 20 FPS.** This source package builds
-> with an intentional maximum of 20 **bridge-presented** frames per second,
-> whether frames are real or generated. It does **not** cap the game's own
-> rendering rate, and it does not disable the underlying FG multipliers.
-> The resulting output may feel choppy; that is the deliberately restricted
-> demonstration. The full experimental builds are offered through
-> [Atomic MGPU Patreon](https://www.patreon.com/AtomicMgpu).
->
-> **Compatibility:** Requires a game with NVIDIA DLSS support and compatible
-> dual-NVIDIA-GPU hardware. Not every DLSS game is supported.
->
+## Community Edition — Important Information
+
+**The Community Edition is intentionally limited to approximately 20 FPS at the bridge's final output.**
+
+This restriction applies to both real and generated frames presented by Atomic MGPU. It does not limit the game's underlying rendering rate or disable the Frame Generation multipliers.
+
+**Dynamic Frame Generation:** The maximum configurable dynamic FG target is 120 FPS. This setting does not override the separate 20 FPS output limit.
+
+### Compatibility Requirements
+
+- Requires a game with **NVIDIA DLSS support**.
+- Requires two compatible NVIDIA graphics cards.
+- Not every DLSS-enabled game is guaranteed to work.
+- Performance and compatibility vary depending on game implementation and hardware.
+
+### Open-Source Licensing and Patreon
+
+The publicly available source code remains subject to its applicable open-source licenses, including the original project's MIT license.
+
+The Community Edition's restrictions are not DRM and may be modified by users under the applicable license terms.
+
+Patreon support helps fund continued development, hardware testing, experimental builds, and future Frame Generation improvements.
+
+**[Support Atomic MGPU on Patreon](https://www.patreon.com/AtomicMgpu)**
+
+---
 
 **Version 3.0** - davidm71's fork of [maohgad-web/Neural-coprocessor](https://github.com/maohgad-web/Neural-coprocessor)
 (MGPU Bridge) by Marcelo Guibout, based on its 0.2.5 release.
