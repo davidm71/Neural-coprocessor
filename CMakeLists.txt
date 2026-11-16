@@ -11,11 +11,6 @@ cmake_minimum_required(VERSION 3.21)
 
 project(mgpu_bridge CXX)
 
-# Community release defaults to a 20-FPS final bridge presentation ceiling.
-# For your separate unrestricted private build use -DATOMIC_COMMUNITY_20FPS=OFF
-# in a DIFFERENT build directory. Do not ship the unrestricted binary publicly.
-option(ATOMIC_COMMUNITY_20FPS "Limit bridge output to 20 FPS (Community Edition)" ON)
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -100,14 +95,6 @@ add_library(mgpu_bridge SHARED
 target_include_directories(mgpu_bridge PRIVATE
     "ext/reshade/include"
 )
-
-if(ATOMIC_COMMUNITY_20FPS)
-    target_compile_definitions(mgpu_bridge PRIVATE ATOMIC_COMMUNITY_20FPS=1)
-    message(STATUS "Atomic MGPU Community Edition: final presentation capped at 20 FPS")
-else()
-    message(STATUS "Atomic MGPU: unrestricted output build (do not publish as Community Edition)")
-endif()
-
 
 # ---------------------------------------------------------------------------
 # P7.1. The overlay panel's only dependency: two ImGui headers.

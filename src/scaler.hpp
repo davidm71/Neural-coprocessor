@@ -36,6 +36,9 @@ int  sharpness();       void set_sharpness(int pct);   // 0..100
 // fast-moving pixels (8+ px per frame); still pixels keep all of it.
 int  mas();             void set_mas(int on);
 int  mas_motion();      void set_mas_motion(int pct);   // 0..100
+// BB1: back buffers run()'s per-buffer descriptor sets are sized for (the
+// bridge window has 2..6, PresentBuffers). gpu1_context checks MAX_BB against it.
+constexpr unsigned kMaxBackBuffers = 6u;
 // NH1: NIS in half precision (NIS_USE_HALF_PRECISION=1, min16float). Live.
 // The half pipeline is compiled the first time it is wanted, in the background
 // (NH1b/c); full precision runs until it is ready.

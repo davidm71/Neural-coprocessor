@@ -66,7 +66,7 @@
 #define MGPU_VERSION_STR "3.0"
 // VR2: the fork's build tag, shared by the R141 log line and the panel footer
 // so the two can never disagree. Bump it with every shipped change.
-#define MGPU_SOURCE_TAG "IN14"
+#define MGPU_SOURCE_TAG "IN17"
 
 // TR3: the same identity for the tray icon's About box (tray.cpp).
 namespace mgpu
@@ -1657,11 +1657,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 if (dyn)
                 {
                     int tg = mgpu::gpu1::ui_fg_dyn_target();
-#if defined(ATOMIC_COMMUNITY_20FPS)
-                    if (ui_tip(ImGui::SliderInt("Shown fps##dmf", &tg, 60, 120, "%d fps"), "Community Edition: dynamic Frame Generation target is limited to 120 fps. Final output is independently limited to 20 fps.")) mgpu::gpu1::ui_set_fg_dyn_target(tg);
-#else
                     if (ui_tip(ImGui::SliderInt("Shown fps##dmf", &tg, 60, 360, "%d fps"), "The frame rate the dynamic multiplier aims to show.")) mgpu::gpu1::ui_set_fg_dyn_target(tg);
-#endif
                     // FC1: frame spacing - the original per-pair spacing (default) or the
                     // even frame clock (FGClock=1). Live; either can be picked at any time.
                     int fc = mgpu::gpu1::ui_fg_clock() ? 1 : 0;

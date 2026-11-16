@@ -110,6 +110,7 @@ namespace
     // chain is created; a restart applies a change). Upstream R348 (ZhizhenS):
     // 6 removed horizontal bands with frame generation. 2 is the old chain.
     static const unsigned MAX_BB = 6;
+    static_assert(MAX_BB <= mgpu::scaler::kMaxBackBuffers, "BB1: the scaler needs a descriptor set per back buffer");
     struct state
     {
         std::mutex cs;
@@ -1660,44 +1661,6 @@ static void perf_present(unsigned long long evals, unsigned long long gens)
 // one present at a time.
 static std::mutex g_present_mx;
 
-#if defined(ATOMIC_COMMUNITY_20FPS)
-// Community Edition: intentionally cap the BRIDGE's final presentation rate
-// (real AND generated frames) to <= 20 submitted frames/s. This is not a game
-// render-rate cap and is not a licensing/security boundary: MIT source can be
-// modified and rebuilt. Called only while g_present_mx is held, so the timer is
-// serialized across both the ordinary worker and the FG presentation thread.
-// QPC is monotonic and unaffected by wall-clock adjustments.
-static void community_pace_present_20fps()
-{
-    static LARGE_INTEGER frequency = {};
-    static LONGLONG last_start = 0;
-    if (frequency.QuadPart == 0 && !QueryPerformanceFrequency(&frequency))
-        return;
-    if (frequency.QuadPart <= 0) return;
-
-    LARGE_INTEGER now{};
-    QueryPerformanceCounter(&now);
-    // Round UP so a nominal 20 FPS never asks for less than 50 ms.
-    const LONGLONG min_ticks = (frequency.QuadPart + 19) / 20;
-    if (last_start > 0 && now.QuadPart > last_start &&
-        now.QuadPart - last_start < min_ticks)
-    {
-        const LONGLONG due = last_start + min_ticks;
-        while (now.QuadPart < due)
-        {
-            const LONGLONG remaining = due - now.QuadPart;
-            const DWORD sleep_ms = static_cast<DWORD>((remaining * 1000) / frequency.QuadPart);
-            // Do not busy-spin the last millisecond, but avoid oversleeping
-            // larger intervals unnecessarily. Windows timer resolution still
-            // affects achieved frame rate; this sets a ceiling, not a guarantee.
-            Sleep(sleep_ms > 1 ? sleep_ms - 1 : 1);
-            QueryPerformanceCounter(&now);
-        }
-    }
-    last_start = now.QuadPart;
-}
-#endif
-
 // ---- FIX7 (audit 2026-10-10): who may write an FG buffer set ----
 //
 // The present thread reads fg_real[k] / fg_out[k] on the PRESENT queue; the NR
@@ -2590,6 +2553,7 @@ int ui_frame_gen();     // FG1
 // that is not declared this early. It is defined in the anonymous namespace
 // immediately above stream_nr_create, which is its only caller.
 
+static bool g_bb1_scale_failed = false;   // BB1: the last enlarge fell back to a crop
 bool present_frame(float r, float g, float b)
 {
     std::lock_guard<std::mutex> present_lock(g_present_mx);   // FG2
@@ -2641,13 +2605,6 @@ bool present_frame(float r, float g, float b)
     // never hangs the present thread (it then presents as before).
     if (lat_wait != nullptr)
         (void)WaitForSingleObjectEx(lat_wait, 100, TRUE);
-
-#if defined(ATOMIC_COMMUNITY_20FPS)
-    // Both the normal worker and FG presenter reach this point. Limiting here
-    // prevents an INI option, UI setting, or automatic FG multiplier from
-    // bypassing the Community Edition's final 20-FPS presentation ceiling.
-    community_pace_present_20fps();
-#endif
 
     char line[800];   // P5.3 widened: the Present=in banner is longer than 320 and a
                       // truncated banner is a wrong label on a whole run
@@ -2935,7 +2892,26 @@ bool present_frame(float r, float g, float b)
         // saturated hue that changed every frame and read as a fault. Same
         // dark neutral the idle screen uses, so the two never disagree.
         const float color_pre[4] = { 0.030f, 0.032f, 0.035f, 1.0f };
-        cl->ClearRenderTargetView(rtv, color_pre, 0, nullptr);
+        // BB1 (from ZhizhenS, PR #1): CLEAR ONLY WHAT THE PICTURE WILL NOT COVER.
+        // This ran every frame, so every back buffer briefly held this colour
+        // before the picture landed; a screen that reads a buffer mid-write
+        // (independent flip, immediate flips) showed it as a dark horizontal
+        // band with frame generation on. A full-size copy or an enlarge covers
+        // every pixel, so the clear is skipped then. A failed enlarge falls back
+        // to a crop, which gets its border clear back from the next frame.
+        // PresentRaceProbe=1: magenta every frame instead - any band that is a
+        // mid-write read shows magenta. Diagnostic only.
+        static const bool s_race_probe = ui_ini_read("PresentRaceProbe", 0) == 1;
+        const bool fills_chain =
+            (g_sc_active.load(std::memory_order_relaxed) && (nw != bw || nh != bh) && !g_bb1_scale_failed) ||
+            (cw == bw && ch == bh && nw == bw && nh == bh);
+        if (s_race_probe)
+        {
+            const float color_probe[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
+            cl->ClearRenderTargetView(rtv, color_probe, 0, nullptr);
+        }
+        else if (!fills_chain)
+            cl->ClearRenderTargetView(rtv, color_pre, 0, nullptr);
         cl->ResourceBarrier(1, &barrier);
 
         D3D12_RESOURCE_BARRIER nb{};
@@ -3054,6 +3030,7 @@ bool present_frame(float r, float g, float b)
                 split_done = true;   // the left half is in the enlarged picture already
             }
         }
+        if (want_scale) g_bb1_scale_failed = !scaled;   // BB1: a crop has a border again
         if (!scaled)
             cl->CopyTextureRegion(&pd, (lsrc != nullptr) ? halfw : 0u, 0, 0, &ps, &pbox);
 
@@ -13495,20 +13472,7 @@ static int dyn_on_now()
 static int dyn_target_now()
 {
     int v = g_dyn_target.load(std::memory_order_relaxed);
-    if (v < 0)
-    {
-#if defined(ATOMIC_COMMUNITY_20FPS)
-        v = ini_read_sr_int("FGDynTarget", 120, 60, 120);
-#else
-        v = ini_read_sr_int("FGDynTarget", 180, 60, 480);
-#endif
-    }
-#if defined(ATOMIC_COMMUNITY_20FPS)
-    // Community build: enforce the dynamic FG target cap even for stale INI
-    // values or internal changes that bypass the ImGui slider.
-    if (v > 120) v = 120;
-#endif
-    g_dyn_target.store(v, std::memory_order_relaxed);
+    if (v < 0) { v = ini_read_sr_int("FGDynTarget", 180, 60, 480); g_dyn_target.store(v); }
     return v;
 }
 // Frames to show for this pair (2..cap+1), from the target and the real interval.
@@ -22730,11 +22694,7 @@ void ui_set_fg_clock(bool on)
 void ui_set_fg_dyn_target(int v)
 {
     if (v < 60) v = 60;
-#if defined(ATOMIC_COMMUNITY_20FPS)
-    if (v > 120) v = 120;
-#else
     if (v > 480) v = 480;
-#endif
     g_dyn_target.store(v);
     g_dyn_reset_seq.fetch_add(1u, std::memory_order_release);
     (void)ui_ini_write("FGDynTarget", v);
