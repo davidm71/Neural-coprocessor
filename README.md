@@ -2,11 +2,11 @@
 
 ## Community Edition — Important Information
 
-**The Community Edition is intentionally limited to approximately 20 FPS at the bridge's final output.**
+**The Community Edition is intentionally limited to approximately 30 FPS before frame generation is applied.**
 
 This restriction applies to both real and generated frames presented by Atomic MGPU. It does not limit the game's underlying rendering rate or disable the Frame Generation multipliers.
 
-**Dynamic Frame Generation:** The maximum configurable dynamic FG target is 120 FPS. This setting does not override the separate 20 FPS output limit.
+**Dynamic Frame Generation:** The maximum configurable dynamic FG target is 120 FPS. This setting does not override the separate 30 FPS limit prior frame generation.
 
 ### Compatibility Requirements
 
