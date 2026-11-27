@@ -69,6 +69,27 @@ void panel_mouse(bool on);
 bool panel_mouse_get(int *x, int *y, unsigned *btn, int *wheel);
 // PP3: a key's state as the keyboard hook saw it (ReShade freezes GetAsyncKeyState).
 bool key_down(int vk);
+// PO1: ReShade's overlay key itself already needs Shift (ReShade.ini KeyOverlay).
+bool overlay_key_has_shift();
+// PO2: ReShade's overlay key (virtual-key code), and whether the game or the
+// bridge window is in front.
+int overlay_vk();
+// KS2: put the keyboard hook back (Windows drops a low-level hook silently when
+// it answers slowly) - called whenever the MGPU panel opens. And its state:
+// installed, and ms since it last saw a real key (~0 = never).
+void rehook_keyboard();
+// KS3: arrow presses (key-down events, Windows' key repeat included) seen by
+// the hook - [0] LEFT, [1] RIGHT without CTRL/ALT, [2] any arrow at all.
+void arrow_counts(unsigned out[3]);
+// KS4: the key's physical state from the system, past ReShade's filter (which
+// answers "up" for every key while the panel blocks the game's input).
+bool raw_key(int vk);
+// PO3: called every frame the MGPU panel is drawn on its own: for the next
+// 250 ms Esc (which closes it) is kept from the game, its release too. Expires
+// by itself, so Esc can never stay swallowed after the panel is gone.
+void panel_escape_alive();
+bool kb_hook_state(unsigned long long &last_key_ms);
+bool in_front();
 // SV3: how long ago a real (not injected) key press / mouse action was, in ms (~0 = never).
 // False when the hooks are not running.
 bool real_input_ages(unsigned long long &key_ms, unsigned long long &mouse_ms);
@@ -88,6 +109,15 @@ int         conflict(unsigned a);
 void        begin_capture(unsigned a);   // next combination pressed becomes the binding
 void        cancel_capture();
 int         capturing();                 // action being captured, -1 = none
+// HK13: Arm (CTRL+ALT+F10) and Hide/show (CTRL+ALT+F6) are FIXED - not on the
+// panel's list, never rebound, never taken by another action.
+bool        fixed(unsigned a);
+// HK15: the action's CURRENT combination as text ("CTRL+ALT+E"), for messages and
+// tips that used to name the default. A small per-thread ring of buffers.
+const char *name_now(unsigned a);
+// HK10: why the last combination was refused (in use, not Ctrl/Alt + A-Z/F1-F12,
+// ReShade's key) - for 6 s, while still capturing.
+bool        capture_refusal(char *out, unsigned n);
 // HK7: a key the PANEL saw (ImGui) while capturing - a second source beside the
 // keyboard hook. mods: 1 CTRL, 2 ALT, 4 SHIFT. True if it became the binding.
 bool        capture_from_panel(unsigned char mods, int vk);

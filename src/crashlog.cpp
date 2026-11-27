@@ -1,7 +1,9 @@
 // ---------------------------------------------------------------------------
 // crashlog.cpp - CR1. See crashlog.hpp.
 // ---------------------------------------------------------------------------
+#include "calibrator.hpp"   // UT3
 #include "crashlog.hpp"
+#include <dxgi.h>        // PG1: IDXGISwapChain::Present (the bridge's own, guarded)
 #include "adapter.hpp"       // SO3: the render card's video memory
 #include "diag.hpp"
 #include "mgpu_ini_parser.hpp"
@@ -15,6 +17,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cctype>   // SW1c
 #include <cstring>
 #include <cwchar>
 
@@ -184,6 +187,7 @@ VOID CALLBACK dw_cb(ULONG reason, const dw_data *d, PVOID)
     InterlockedExchange(&e.seq, idx + 1);
     if (reason == 1 && g_pin_ev != nullptr && is_sl(e.name)) SetEvent(g_pin_ev);   // PN1
     so_note_module(reason, e.name, d->DllBase, d->SizeOfImage);                      // SO2
+    if (reason == 1) mgpu::calibrator::ut_on_load(d->DllBase, e.name);                // UT3
 }
 
 // The newest unload (our own record) that covered `addr`.
@@ -439,6 +443,16 @@ sg::rate_window<5>    g_so_rate;
 // from a Present (a hook whose code was just released); 0 off.
 std::atomic<int>      g_fh_mode{1};
 sg::rate_window<5>    g_fh_rate;
+// PG1 (LR99): PresentGuard - 1 (default) guards the bridge's OWN Present; 0 off.
+// PG2 (LR104): PresentGuardGame - 1 (default since LR105) also acts on the
+// game's Present (strict checks); 0 only reports what it would have done.
+std::atomic<int>      g_pg_mode{1};
+std::atomic<int>      g_pg2_mode{1};                // PG2: PresentGuardGame - 1 act (default since LR105), 0 report only
+std::atomic<bool>     g_pg_cet{false};              // the process runs with hardware shadow stacks: PG1 off
+sg::rate_window<5>    g_pg_rate;
+std::atomic<uintptr_t> g_pg_slot[2];                // dxgi's vtable slots for Present / Present1 (hookprobe)
+thread_local CONTEXT *t_pg_ctx = nullptr;           // set only while guarded_present is inside Present
+thread_local volatile LONG t_pg_hit = 0;            // the handler resumed guarded_present at its snapshot
 std::atomic<long>     g_so_attempts{0}, g_so_declined{0}, g_so_resumed{0}, g_so_failed{0};
 std::atomic<long>     g_fatal_seen{0};              // every fatal first-chance exception
 thread_local int      t_in_handler = 0;             // a fault inside this handler is never handled
@@ -465,7 +479,13 @@ struct so_rec
     bool     presenting;      //      the faulting thread passed a present event < 250 ms before
     int      evidence;        //      sg::present_evidence: 2, 1, 0 (unverified), -1 (contrary)
     int      hp_slot;         //      its health assessment (-1: none - table full)
-    int      variant;         // SO5: 0 = Steam's overlay faulted in its own code, 1 = a call jumped into freed memory
+    int      variant;         // SO5: 0 = Steam's overlay faulted in its own code, 1 = a call jumped into freed memory,
+                              // PG1: 2 = the bridge's own Present faulted in a hook being rewritten
+                              // PG2: 3 = the GAME's Present faulted there (LR103)
+    int      pg_where;        // PG1: 1 = Present's first bytes in dxgi.dll, 2 = code outside any module
+    bool     pg2_on;          // PG2 (LR104): PresentGuardGame=1 (else: a report of what it would have done)
+    int      pg2_why;         //      sg::pg2_why
+    int      fp_reg;          //      the frame register in that Present's unwind data (0 none)
     DWORD    mem_state, mem_type;   // SO5: what the memory at the fault was (VirtualQuery)
     uint64_t mem_base;        //      its allocation base
 };
@@ -507,10 +527,25 @@ void so_record(const so_rec &r)
     SYSTEMTIME t{};
     GetLocalTime(&t);
     line_buf l;
-    l.d2(t.wHour); l.s(":"); l.d2(t.wMinute); l.s(":"); l.d2(t.wSecond); l.s(r.variant == 1 ? " [MGPU][SO5] " : " [MGPU][SO1] ");
+    l.d2(t.wHour); l.s(":"); l.d2(t.wMinute); l.s(":"); l.d2(t.wSecond);
+    l.s(r.variant == 3 ? " [MGPU][PG2] " : r.variant == 2 ? " [MGPU][PG1] " : r.variant == 1 ? " [MGPU][SO5] " : " [MGPU][SO1] ");
     if (r.outcome == SO_STEPPED) { l.s("STEPPED OVER #"); l.d((unsigned long long)r.n); l.s(" (attempt; verdict follows as SO2)"); }
     else l.s("NOT stepped over");
-    if (r.variant == 1)
+    if (r.variant == 3)
+    {
+        l.s(": the game's Present faulted at "); l.x(r.rip);
+        l.s(" (the first bytes of Windows' Present - a hook rewriting them), thread "); l.d(r.tid);
+        if (r.outcome == SO_STEPPED) l.s(" - one frame not shown");
+        else if (!r.pg2_on) l.s(r.pg2_why == 0 ? " - PG2 is off (PresentGuardGame=0); it WOULD have been taken"
+                                               : " - PG2 is off (PresentGuardGame=0); it would NOT have been taken");
+    }
+    else if (r.variant == 2)
+    {
+        l.s(": the bridge's own Present faulted at "); l.x(r.rip);
+        l.s(r.pg_where == 1 ? " (the first bytes of Windows' Present - a hook rewriting them)" : " (hook code outside any module)");
+        l.s(", thread "); l.d(r.tid); l.s(" - one frame not shown");
+    }
+    else if (r.variant == 1)
     {
         l.s(": a call jumped into "); l.s(r.mem_state == MEM_FREE ? "FREED" : r.mem_state == MEM_RESERVE ? "uncommitted" : "non-code");
         l.s(" memory at "); l.x(r.rip); l.s(" (block "); l.x(r.mem_base); l.s("), thread "); l.d(r.tid);
@@ -518,13 +553,18 @@ void so_record(const so_rec &r)
     else { l.s(": gameoverlayrenderer64.dll+"); l.x(r.rip - r.ov_base); l.s(" reading "); l.x(r.addr); l.s(", thread "); l.d(r.tid); }
     if (r.outcome == SO_STEPPED || r.outcome == SO_DECLINED_DEST || r.outcome == SO_DECLINED_RATE)
     { l.s(", return to "); l.x(r.dest_rip); if (r.variant == 0) { l.s(" after "); l.d(r.frames); l.s(" overlay frame(s)"); } }
-    if (r.outcome == SO_STEPPED)
+    if (r.outcome == SO_STEPPED && r.variant == 2) l.s(", from the snapshot taken just before the call");
+    else if (r.outcome == SO_STEPPED && r.variant == 3) { l.s(", return found "); l.d((unsigned long long)r.frames * 8u); l.s(" bytes above the fault's rsp"); }
+    else if (r.outcome == SO_STEPPED)
         l.s(r.evidence >= 2 ? ", in a Present (call + thread)" : r.evidence == 1 ? ", in a Present (one sign)"
                                                                  : ", S_OK UNVERIFIED (no sign of a Present)");
     switch (r.outcome)
     {
     case SO_DECLINED_SIG:    l.s(" - "); l.s(sg::sig_text((sg::sig)r.sigv)); break;
-    case SO_DECLINED_DEST:   l.s(" - unsafe return: "); l.s(sg::dest_text((sg::dest)r.destv)); break;
+    case SO_DECLINED_DEST:
+        if (r.variant == 3) { if (r.pg2_why != 0) { l.s(" - "); l.s(sg::pg2_text((sg::pg2_why)r.pg2_why)); } }   // PG2
+        else { l.s(" - unsafe return: "); l.s(sg::dest_text((sg::dest)r.destv)); }
+        break;
     case SO_DECLINED_RATE:   l.s(" - LIMIT REACHED (5 in 60 s): the fault is passed on and the game will likely close"); break;
     case SO_DECLINED_NESTED: l.s(" - raised while another exception was being handled"); break;
     default: break;
@@ -765,6 +805,277 @@ bool fh_try(PEXCEPTION_POINTERS ep)
     return true;
 }
 
+// ---- PG1 (LR99): THE BRIDGE'S OWN PRESENT, GUARDED AGAINST A HOOK BEING REWRITTEN ----
+//
+// Cyberpunk 2077, 2026-11-26, halfway through the benchmark: RivaTuner (RTSS,
+// with MSI Afterburner) put its hook on Windows' Present, took it off and put it
+// back every 10 s ([MGPU][SO5] CHANGED at :04, :14, :24, :34, :44), rewriting the
+// first bytes of dxgi.dll's Present each time. The bridge presents its own window
+// from a thread of its own, and at 10:06:51 that thread ran Present while the
+// bytes were half rewritten: an access violation at dxgi.dll+0x84c9, 9 bytes into
+// Present (+0x84c0), writing 0x1a7 - an instruction made of half old, half new
+// bytes. SO1 and SO5 could not take it: it is not in Steam's overlay, and it is
+// not a jump into freed memory.
+//
+// Here the caller is the bridge itself, so the step-over does not have to work
+// out a return by walking the stack. guarded_present() takes a snapshot of its
+// own registers (RtlCaptureContext) just before it calls Present; if Present
+// faults where a hook is being rewritten, the handler puts the thread back at
+// that snapshot - the same point, the same registers, the same stack - and
+// guarded_present returns S_OK without having shown the frame. Nothing is
+// guessed: every register the code around it relies on is the one it had.
+//
+// Taken ONLY when all of these hold, otherwise the fault goes on as before (SO1,
+// SO5, then CR1):
+//  - the thread is inside guarded_present's Present (a thread-local snapshot);
+//  - an access violation or an illegal/privileged instruction;
+//  - in the first 32 bytes of dxgi.dll's Present or Present1 (the bytes a hook
+//    rewrites, read from the vtable slots hookprobe found - before any lock is
+//    taken), or in code outside every module (a hook's trampoline being
+//    replaced or freed);
+//  - not raised while another exception was being handled;
+//  - at most 5 in any 60 s;
+//  - the process does not run with hardware shadow stacks (CET), where moving a
+//    thread back to a snapshot is refused by Windows - checked at install.
+// It gets an SO2 health verdict like every other step-over. The GAME's own
+// Present is not covered here (no snapshot of its caller); SO1 and SO5 stay its
+// guards.
+bool pg_try(PEXCEPTION_POINTERS ep)
+{
+    CONTEXT *saved = t_pg_ctx;
+    if (saved == nullptr || g_pg_mode.load(std::memory_order_relaxed) == 0) return false;
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    CONTEXT *cx = ep->ContextRecord;
+    const DWORD code = er->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_PRIV_INSTRUCTION) return false;
+    const uint64_t rip = (uint64_t)(uintptr_t)er->ExceptionAddress;
+    uint64_t fn[2] = { 0, 0 };
+    for (int i = 0; i < 2; ++i)
+    {
+        const uintptr_t slot = g_pg_slot[i].load(std::memory_order_acquire);
+        uintptr_t v = 0;
+        if (slot != 0 && read_mem((const void *)slot, &v, sizeof v)) fn[i] = (uint64_t)v;
+    }
+    MEMORY_BASIC_INFORMATION mbi{};
+    const bool q = VirtualQuery((LPCVOID)(uintptr_t)rip, &mbi, sizeof mbi) == sizeof mbi;
+    const bool in_module = q && mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE;
+    const int where_at = sg::pg_where(rip, fn[0], fn[1], in_module);   // tested in steam_guard_test
+    if (where_at == 0) return false;   // somewhere else in a module: not this guard's fault
+
+    so_rec r{};
+    r.variant = 2; r.pg_where = where_at; r.hp_slot = -1;
+    r.tid = GetCurrentThreadId(); r.code = code;
+    r.kind = er->NumberParameters >= 1 ? er->ExceptionInformation[0] : 0;
+    r.addr = er->NumberParameters >= 2 ? er->ExceptionInformation[1] : 0;
+    r.rip = rip; r.ms = GetTickCount64();
+    if (q) { r.mem_state = mbi.State; r.mem_type = mbi.Type; r.mem_base = (uint64_t)(uintptr_t)mbi.AllocationBase; }
+    const DWORD64 rg[16] = { cx->Rax, cx->Rcx, cx->Rdx, cx->Rbx, cx->Rsp, cx->Rbp, cx->Rsi, cx->Rdi,
+                             cx->R8, cx->R9, cx->R10, cx->R11, cx->R12, cx->R13, cx->R14, cx->R15 };
+    for (int i = 0; i < 16; ++i) r.regs[i] = rg[i];
+    r.code_ok = read_mem((const void *)(uintptr_t)(rip - 16), r.code_bytes, sizeof r.code_bytes);
+    r.dest_rip = saved->Rip; r.dest_rsp = saved->Rsp;
+    r.presenting = true; r.evidence = 2;
+    if (er->ExceptionRecord != nullptr) { r.outcome = SO_DECLINED_NESTED; g_so_declined.fetch_add(1); so_record(r); return false; }
+    if (!g_pg_rate.take(r.ms, 60000ull)) { r.outcome = SO_DECLINED_RATE; g_so_declined.fetch_add(1); so_record(r); return false; }
+
+    // Commit: back to the snapshot. The debug registers and the context's own
+    // flags are the thread's as they are now (a snapshot does not hold them).
+    CONTEXT c = *saved;
+    c.Dr0 = cx->Dr0; c.Dr1 = cx->Dr1; c.Dr2 = cx->Dr2; c.Dr3 = cx->Dr3; c.Dr6 = cx->Dr6; c.Dr7 = cx->Dr7;
+    c.ContextFlags = cx->ContextFlags;
+    *cx = c;
+    t_pg_ctx = nullptr;
+    t_pg_hit = 1;
+
+    r.n = g_so_attempts.fetch_add(1) + 1;
+    r.outcome = SO_STEPPED;
+    r.hp_slot = g_hp.claim(r.n, (uint32_t)r.tid, r.ms, g_fatal_seen.load(std::memory_order_relaxed));
+    so_record(r);
+    return true;
+}
+
+// ---- PG2 (LR103, made strict and opt-in in LR104): THE GAME'S PRESENT ----
+//
+// Cyberpunk 2077, 2026-11-26 11:30:09, LR102: RivaTuner flipped its Present
+// hook again and the GAME's presenting thread (Streamline -> DLSS-G -> dxgi.dll)
+// was inside the bytes: dxgi.dll+0x84c9, writing 0x1a7 - PG1's fault on a
+// thread PG1 does not cover (no snapshot of its caller exists).
+//
+// LR104: a return is resumed ONLY when two independent derivations agree and
+// nothing saved has changed - the decision is the portable rule
+// sg::pg2_decide (tested; see steam_guard.hpp for each condition):
+//  - the stack scan (sg::pg2_pick) finds a believable return just above rsp;
+//  - Windows' own unwind data for that Present, applied from the faulting rip,
+//    lands on the same return address and the same rsp;
+//  - every callee-saved register (integer and xmm) the unwind reads back from
+//    the stack equals the thread's current value;
+//  - the CALL before the return provably targets that Present (direct call or
+//    a [rip+x] pointer holding it) or goes through Present's vtable slot.
+// What remains assumed - a register the prologue had not saved yet was not
+// changed by the half-written bytes - cannot be checked from here, so:
+//
+// ON BY DEFAULT since LR105 (PresentGuardGame=1): it acts only at a moment the
+// game would otherwise close, so for a user who never edits mgpu.ini it can
+// only turn a certain crash into a skipped frame - or, if a check fails, into
+// the same crash. PresentGuardGame=0 makes it report only: the same facts are
+// gathered (reads only), the verdict is written ("it would have been taken" /
+// "would not: <reason>") and the fault goes on exactly as before LR103.
+//
+// Also required: not the bridge's own guarded call (PG1); an access violation
+// or illegal / privileged instruction in the first 32 bytes of dxgi.dll's
+// Present or Present1; not nested; at most 5 in any 60 s (shared with PG1);
+// not under CET (g_pg_mode is 0 there, and PG2 follows it).
+bool pg2_try(PEXCEPTION_POINTERS ep)
+{
+    if (t_pg_ctx != nullptr) return false;                                  // the bridge's own call: PG1
+    if (g_pg_mode.load(std::memory_order_relaxed) == 0) return false;      // PresentGuard=0 or CET: nothing
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    CONTEXT *cx = ep->ContextRecord;
+    const DWORD code = er->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_PRIV_INSTRUCTION) return false;
+    const uint64_t rip = (uint64_t)(uintptr_t)er->ExceptionAddress;
+    uint64_t fn[2] = { 0, 0 };
+    for (int i = 0; i < 2; ++i)
+    {
+        const uintptr_t slot = g_pg_slot[i].load(std::memory_order_acquire);
+        uintptr_t v = 0;
+        if (slot != 0 && read_mem((const void *)slot, &v, sizeof v)) fn[i] = (uint64_t)v;
+    }
+    if (sg::pg_where(rip, fn[0], fn[1], true) != 1) return false;          // only Present's first bytes
+    const uint64_t f_start = (fn[0] != 0 && rip >= fn[0] && rip - fn[0] < sg::PG_PROLOGUE) ? fn[0] : fn[1];
+    MEMORY_BASIC_INFORMATION fm{};
+    if (VirtualQuery((LPCVOID)(uintptr_t)f_start, &fm, sizeof fm) != sizeof fm || fm.Type != MEM_IMAGE) return false;
+    const uint64_t f_mod = (uint64_t)(uintptr_t)fm.AllocationBase;
+    const bool enabled = g_pg2_mode.load(std::memory_order_relaxed) == 1;
+
+    so_rec r{};
+    r.variant = 3; r.pg_where = 1; r.hp_slot = -1; r.pg2_on = enabled;
+    r.tid = GetCurrentThreadId(); r.code = code;
+    r.kind = er->NumberParameters >= 1 ? er->ExceptionInformation[0] : 0;
+    r.addr = er->NumberParameters >= 2 ? er->ExceptionInformation[1] : 0;
+    r.rip = rip; r.ms = GetTickCount64();
+    r.mem_state = fm.State; r.mem_type = fm.Type; r.mem_base = f_mod;
+    const DWORD64 rg[16] = { cx->Rax, cx->Rcx, cx->Rdx, cx->Rbx, cx->Rsp, cx->Rbp, cx->Rsi, cx->Rdi,
+                             cx->R8, cx->R9, cx->R10, cx->R11, cx->R12, cx->R13, cx->R14, cx->R15 };
+    for (int i = 0; i < 16; ++i) r.regs[i] = rg[i];
+    r.code_ok = read_mem((const void *)(uintptr_t)(rip - 16), r.code_bytes, sizeof r.code_bytes);
+    r.presenting = t_present_ms != 0 && r.ms - t_present_ms < 250ull;
+    if (er->ExceptionRecord != nullptr) { r.outcome = SO_DECLINED_NESTED; g_so_declined.fetch_add(1); so_record(r); return false; }
+
+    const NT_TIB *tib = (const NT_TIB *)NtCurrentTeb();
+    const uint64_t lo = (uint64_t)(uintptr_t)tib->StackLimit, hi = (uint64_t)(uintptr_t)tib->StackBase;
+    sg::pg2_facts f{};
+
+    // 1. the scan
+    sg::pg2_cand cand[sg::PG2_SLOTS];
+    int n = 0;
+    for (; n < sg::PG2_SLOTS; ++n)
+    {
+        const uint64_t slot = (uint64_t)cx->Rsp + 8ull * (uint64_t)n;
+        if (slot < lo || slot + 16 > hi) break;
+        sg::pg2_cand &c = cand[n];
+        c = sg::pg2_cand{};
+        uint64_t v = 0;
+        if (!read_mem((const void *)(uintptr_t)slot, &v, sizeof v)) break;
+        c.d.rip = v; c.d.rsp = slot + 8; c.d.walked_out = true; c.d.in_overlay = false; c.d.reenters = false;
+        DWORD type = 0;
+        c.d.executable = v != 0 && so_executable(v, type);
+        c.image = c.d.executable && type == MEM_IMAGE;
+        if (c.image)
+        {
+            MEMORY_BASIC_INFORMATION vm{};
+            c.same_module = VirtualQuery((LPCVOID)(uintptr_t)v, &vm, sizeof vm) == sizeof vm &&
+                            (uint64_t)(uintptr_t)vm.AllocationBase == f_mod;
+        }
+        c.d.readable_before = v > 8 && read_mem((const void *)(uintptr_t)(v - 8), c.d.before, 8);
+        if (c.d.readable_before)
+        {
+            const sg::call_info ci = sg::decode_call(c.d.before);
+            c.sem = sg::call_semantic(ci);
+            c.direct = ci.kind == sg::call_kind::direct;
+            c.direct_to_fn = c.direct && sg::direct_target(c.d.before, v) == f_start;
+        }
+    }
+    f.scan_index = sg::pg2_pick(cand, n);
+
+    // 2. the unwind, on a copy (nothing real changes)
+    CONTEXT u = *cx;
+    if (f.scan_index >= 0 && cx->Rsp >= lo && cx->Rsp + 0x200 < hi)
+    {
+        DWORD64 base = 0;
+        PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(rip, &base, nullptr);
+        f.unwind_found = fe != nullptr && base + fe->BeginAddress == f_start;
+        if (f.unwind_found)
+        {
+            // The frame register the prologue may set (UNWIND_INFO byte 3, low 4 bits).
+            uint8_t ui[4] = {};
+            int fp_reg = 0;
+            if (read_mem((const void *)(uintptr_t)(base + fe->UnwindData), ui, sizeof ui)) fp_reg = ui[3] & 0x0F;
+            KNONVOLATILE_CONTEXT_POINTERS nv{};
+            PVOID hd = nullptr;
+            DWORD64 fr = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, rip, fe, &u, &hd, &fr, &nv);
+            const sg::pg2_cand &k = cand[f.scan_index];
+            f.unwind_agrees = u.Rip == k.d.rip && u.Rsp == k.d.rsp;
+            // integer: index = register number (0 rax .. 15 r15); xmm: 0..15
+            bool rest[16]; uint64_t then[16], now[16];
+            const DWORD64 *uc = &u.Rax, *cc = &cx->Rax;   // Rax..R15 are consecutive in CONTEXT
+            for (int i = 0; i < 16; ++i) { rest[i] = nv.IntegerContext[i] != nullptr; then[i] = uc[i]; now[i] = cc[i]; }
+            const bool int_same = sg::pg2_regs_same(rest, then, now, 16, fp_reg);
+            bool x_same = true;
+            for (int i = 0; i < 16; ++i)
+                if (nv.FloatingContext[i] != nullptr && memcmp(&(&u.Xmm0)[i], &(&cx->Xmm0)[i], sizeof(M128A)) != 0)
+                    x_same = false;
+            f.regs_same = int_same && x_same;
+            r.fp_reg = fp_reg;
+        }
+    }
+    // 3. the call before the return
+    if (f.scan_index >= 0)
+    {
+        const sg::pg2_cand &k = cand[f.scan_index];
+        const sg::call_info ci = sg::decode_call(k.d.before);
+        r.call_kind = (int)ci.kind; r.call_disp = ci.disp; r.sem = (int)k.sem;
+        if (k.direct_to_fn) f.call_verified = true;
+        const uint64_t ps = sg::rip_mem_slot(k.d.before, k.d.rip);
+        uint64_t target = 0;
+        if (ps != 0 && read_mem((const void *)(uintptr_t)ps, &target, sizeof target) && target == f_start)
+            f.call_verified = true;
+        f.call_names_present = k.sem == sg::call_sem::present || k.sem == sg::call_sem::present1;
+        r.dest_rip = k.d.rip; r.dest_rsp = k.d.rsp; r.frames = (unsigned)f.scan_index;
+        r.evidence = sg::present_evidence(k.sem, r.presenting);
+    }
+    else { r.dest_rip = 0; r.dest_rsp = cx->Rsp; }
+    const sg::pg2_why why = sg::pg2_decide(f);
+    r.pg2_why = (int)why;
+    r.destv = (int)(why == sg::pg2_why::taken ? sg::dest::ok : sg::dest::none);
+
+    if (why != sg::pg2_why::taken || !enabled)
+    {
+        // Off, or not every check passed: the fault goes on exactly as before.
+        r.outcome = SO_DECLINED_DEST; g_so_declined.fetch_add(1); so_record(r); return false;
+    }
+    if (!g_pg_rate.take(r.ms, 60000ull)) { r.outcome = SO_DECLINED_RATE; g_so_declined.fetch_add(1); so_record(r); return false; }
+
+    // Commit: that Present returns S_OK to its caller. rip, rsp and rax change;
+    // the callee-saved registers are the unwind's, which were checked equal.
+    const DWORD keep = cx->ContextFlags;
+    CONTEXT c = *cx;
+    c.Rip = cand[f.scan_index].d.rip;
+    c.Rsp = cand[f.scan_index].d.rsp;
+    c.Rax = 0;
+    *cx = c;
+    cx->ContextFlags = keep;
+
+    r.n = g_so_attempts.fetch_add(1) + 1;
+    r.outcome = SO_STEPPED;
+    r.hp_slot = g_hp.claim(r.n, (uint32_t)r.tid, r.ms, g_fatal_seen.load(std::memory_order_relaxed));
+    so_record(r);
+    return true;
+}
+
 LONG CALLBACK on_exception(PEXCEPTION_POINTERS ep)
 {
     if (ep == nullptr || ep->ExceptionRecord == nullptr) return EXCEPTION_CONTINUE_SEARCH;
@@ -774,7 +1085,7 @@ LONG CALLBACK on_exception(PEXCEPTION_POINTERS ep)
     ++t_in_handler;
     LONG r = EXCEPTION_CONTINUE_SEARCH;
     if (ep->ContextRecord != nullptr && ep->ExceptionRecord->ExceptionCode != EXCEPTION_STACK_OVERFLOW &&
-        (so_try(ep) || fh_try(ep)))   // SO5: a call into freed memory from a Present
+        (pg_try(ep) || pg2_try(ep) || so_try(ep) || fh_try(ep)))   // PG1 first: exact; PG2: the game's Present (LR103); SO5: freed memory
         r = EXCEPTION_CONTINUE_EXECUTION;
     else
         r = log_exception(ep);   // CR1, exactly as before
@@ -853,7 +1164,56 @@ void so_log_record(const so_rec &e)
     if (e.dest_rip != 0) where((const void *)(uintptr_t)e.dest_rip, dst, sizeof dst); else snprintf(dst, sizeof dst, "-");
     char l[1400];
     int n = 0;
-    if (e.variant == 1)   // SO5
+    if (e.variant == 3)   // PG2 (LR103; strict and opt-in since LR104)
+    {
+        char who[700];
+        mgpu::hookprobe::last(who, sizeof who);
+        if (e.outcome == SO_STEPPED)
+            n = snprintf(l, sizeof l, "[MGPU][PG2] STEPPED OVER #%ld (an attempt - the SO2 line says whether rendering came "
+                         "back): the GAME's Present faulted in its first bytes (%s at %s, %s 0x%llx, thread %lu) - a hook "
+                         "(RivaTuner, an overlay) rewriting them. ONE FRAME WAS NOT SHOWN: that Present returned S_OK to %s "
+                         "(return found %u bytes above the fault's rsp; call form %d, %s; thread presenting: %s). Present was "
+                         "last seen going through: %s | this session: %ld stepped over, %ld passed on",
+                         e.n, code_name(e.code), rip, e.kind == 1 ? "writing" : e.kind == 8 ? "executing" : "reading",
+                         (unsigned long long)e.addr, (unsigned long)e.tid, dst, e.frames * 8u, e.call_kind,
+                         sg::sem_text((sg::call_sem)e.sem), e.presenting ? "yes" : "no", who,
+                         g_so_attempts.load(), g_so_declined.load());
+        else
+            n = snprintf(l, sizeof l, "[MGPU][PG2] NOT STEPPED OVER%s: the game's Present faulted in its first bytes (%s at %s, "
+                         "thread %lu) | %s%s | scan: return %s %u bytes above rsp, call form %d (%s); unwind frame register %d | "
+                         "the fault was passed on as before (see the CR1 line) | Present was last seen going through: %s",
+                         e.pg2_on ? "" : " (PG2 is off: PresentGuardGame=0 - report only)",
+                         code_name(e.code), rip, (unsigned long)e.tid,
+                         e.outcome == SO_DECLINED_RATE ? "LIMIT REACHED: 5 in the last 60 s"
+                         : e.outcome == SO_DECLINED_NESTED ? "raised while another exception was being handled"
+                         : e.pg2_why == 0 ? "every independent check passed - it WOULD have been taken"
+                                          : sg::pg2_text((sg::pg2_why)e.pg2_why),
+                         e.outcome == SO_DECLINED_DEST && e.pg2_why != 0 ? " - it would NOT have been taken" : "",
+                         dst, e.frames * 8u, e.call_kind, sg::sem_text((sg::call_sem)e.sem), e.fp_reg, who);
+    }
+    else if (e.variant == 2)   // PG1
+    {
+        char who[700];
+        mgpu::hookprobe::last(who, sizeof who);
+        const char *at = e.pg_where == 1 ? "in the first bytes of Windows' Present - the bytes a hook (RivaTuner, an overlay) "
+                                           "rewrites when it puts its hook on or takes it off"
+                                         : "in code that belongs to no module - a hook's trampoline being replaced or freed";
+        if (e.outcome == SO_STEPPED)
+            n = snprintf(l, sizeof l, "[MGPU][PG1] STEPPED OVER #%ld (an attempt - the SO2 line says whether rendering came "
+                         "back): the bridge's own Present faulted (%s at %s, %s 0x%llx), %s. ONE FRAME WAS NOT SHOWN; the "
+                         "present thread went on from its snapshot just before the call (rsp 0x%llx) with Present's S_OK. "
+                         "Present was last seen going through: %s | this session: %ld stepped over, %ld passed on",
+                         e.n, code_name(e.code), rip, e.kind == 1 ? "writing" : e.kind == 8 ? "executing" : "reading",
+                         (unsigned long long)e.addr, at, (unsigned long long)e.dest_rsp, who,
+                         g_so_attempts.load(), g_so_declined.load());
+        else
+            n = snprintf(l, sizeof l, "[MGPU][PG1] NOT STEPPED OVER: the bridge's own Present faulted (%s at %s), %s | %s | "
+                         "the fault was passed on as before (see the CR1 line) | Present was last seen going through: %s",
+                         code_name(e.code), rip, at,
+                         e.outcome == SO_DECLINED_RATE ? "LIMIT REACHED: 5 in the last 60 s"
+                                                       : "raised while another exception was being handled", who);
+    }
+    else if (e.variant == 1)   // SO5
     {
         char who[700];
         mgpu::hookprobe::last(who, sizeof who);
@@ -1047,12 +1407,139 @@ void so_poll()
     }
 }
 
+// SW1. STACK OVERFLOW, WITH THE CALL CHAIN. REPORTED 2026-11-18 (Rise of the
+// Tomb Raider, IN31, and Josefo's earlier Rise run): crash.txt said only
+// "STACK OVERFLOW in KERNELBASE.dll+0x...", which names where the stack ran
+// out, not what filled it. The handler has almost no stack left, so it copies
+// the faulting thread's registers into a static buffer and wakes a thread
+// made at start-up for this; that thread walks the overflowed stack with
+// Windows' unwind tables (on its own, healthy stack) and writes the first
+// frames plus the return addresses that repeat most - a runaway recursion
+// shows up as one or two addresses repeated thousands of times.
+CONTEXT g_sw_ctx;
+volatile LONG g_sw_busy = 0;
+DWORD g_sw_tid = 0;
+HANDLE g_sw_go = nullptr, g_sw_done = nullptr;
+
+// SW1c: like where(), but marks WHICH copy of a module: two DLLs can share a
+// name - ReShade installed as dxgi.dll next to the game and Windows' own
+// dxgi.dll in System32 - and IN33's SW1 line could not tell them apart.
+void where_tagged(const void *addr, char *out, size_t n)
+{
+    HMODULE h = nullptr;
+    char full[MAX_PATH] = {};
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &h) && h != nullptr && GetModuleFileNameA(h, full, MAX_PATH) != 0)
+    {
+        const char *base = strrchr(full, '\\');
+        base = (base != nullptr) ? base + 1 : full;
+        char low[MAX_PATH] = {};
+        for (size_t i = 0; full[i] && i < MAX_PATH - 1; ++i) low[i] = (char)tolower((unsigned char)full[i]);
+        const char *tag = strstr(low, "\\windows\\") ? "Windows:" : "local:";
+        snprintf(out, n, "%s%s+0x%llx", tag, base, (unsigned long long)((const char *)addr - (const char *)h));
+    }
+    else where(addr, out, n);
+}
+
+void sw_walk()
+{
+    CONTEXT c = g_sw_ctx;
+    struct hit { DWORD64 pc; unsigned n; };
+    static hit top[64];
+    unsigned ntop = 0;
+    static DWORD64 first[24];
+    unsigned nfirst = 0, frames = 0;
+    for (; frames < 20000; ++frames)
+    {
+        const DWORD64 pc = c.Rip;
+        if (pc == 0) break;
+        if (nfirst < 24) first[nfirst++] = pc;
+        unsigned i = 0;
+        for (; i < ntop; ++i) if (top[i].pc == pc) { ++top[i].n; break; }
+        if (i == ntop && ntop < 64) { top[ntop].pc = pc; top[ntop].n = 1; ++ntop; }
+
+        DWORD64 base = 0;
+        PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(pc, &base, nullptr);
+        if (fe != nullptr)
+        {
+            PVOID hd = nullptr; DWORD64 ef = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, pc, fe, &c, &hd, &ef, nullptr);
+        }
+        else
+        {
+            DWORD64 ret = 0;
+            if (!read_mem((const void *)(uintptr_t)c.Rsp, &ret, sizeof ret)) break;
+            c.Rip = ret; c.Rsp += 8;
+        }
+    }
+    // most repeated first
+    for (unsigned a = 0; a < ntop; ++a)
+        for (unsigned b = a + 1; b < ntop; ++b)
+            if (top[b].n > top[a].n) { hit t = top[a]; top[a] = top[b]; top[b] = t; }
+
+    static char line[6000];
+    SYSTEMTIME t{}; GetLocalTime(&t);
+    int len = snprintf(line, sizeof line, "%02u:%02u:%02u.%03u [MGPU][SW1] stack overflow on thread %lu: %u frame(s) "
+                       "walked | most repeated:", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds,
+                       (unsigned long)g_sw_tid, frames);
+    char at[160];
+    for (unsigned i = 0; i < ntop && i < 6 && len < 5000; ++i)
+    {
+        where_tagged((const void *)(uintptr_t)top[i].pc, at, sizeof at);
+        len += snprintf(line + len, sizeof line - (size_t)len, " %s x%u", at, top[i].n);
+    }
+    len += snprintf(line + len, sizeof line - (size_t)len, " | first frames:");
+    for (unsigned i = 0; i < nfirst && len < 5800; ++i)
+    {
+        where_tagged((const void *)(uintptr_t)first[i], at, sizeof at);
+        len += snprintf(line + len, sizeof line - (size_t)len, " %s", at);
+    }
+    if (len > (int)sizeof line - 3) len = (int)sizeof line - 3;
+    line[len++] = '\r'; line[len++] = '\n'; line[len] = '\0';
+    crash_write(line, (size_t)len);
+}
+
+DWORD WINAPI sw_thread(LPVOID)
+{
+    for (;;)
+    {
+        if (WaitForSingleObject(g_sw_go, INFINITE) != WAIT_OBJECT_0) return 0;
+        __try { sw_walk(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        SetEvent(g_sw_done);
+    }
+}
+
+void sw_start()
+{
+    g_sw_go = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_sw_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_sw_go == nullptr || g_sw_done == nullptr) return;
+    HANDLE h = CreateThread(nullptr, 256 * 1024, &sw_thread, nullptr, 0, nullptr);
+    if (h != nullptr) CloseHandle(h);
+    else { CloseHandle(g_sw_go); g_sw_go = nullptr; }
+}
+
+// From the handler: tiny stack use - a struct copy and two kernel calls.
+void sw_report(const CONTEXT *ctx)
+{
+    if (g_sw_go == nullptr || ctx == nullptr) return;
+    if (InterlockedExchange(&g_sw_busy, 1) != 0) return;   // once
+    g_sw_ctx = *ctx;
+    g_sw_tid = GetCurrentThreadId();
+    SetEvent(g_sw_go);
+    WaitForSingleObject(g_sw_done, 3000);
+}
+
 LONG log_exception(PEXCEPTION_POINTERS ep)
 {
     const EXCEPTION_RECORD *er = ep->ExceptionRecord;
     if (InterlockedIncrement(&g_count) > 8) return EXCEPTION_CONTINUE_SEARCH;   // a storm says nothing new
     if (er->ExceptionCode == EXCEPTION_STACK_OVERFLOW)
     {
+        // SW1b: hand the chain to the helper FIRST - after overflow_line's
+        // module lookups there may be no stack left to wake it (IN32 wrote
+        // the KERNELBASE line and nothing else).
+        sw_report(ep->ContextRecord);
         overflow_line(er->ExceptionAddress);
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -1195,12 +1682,24 @@ void install(HMODULE self)
                     if (v != nullptr && *v >= '0' && *v <= '3') g_so_mode.store(*v - '0');
                     const char *ph = mgpu::config::find(buf, got, "PresentHookGuard");   // SO5
                     if (ph != nullptr && (*ph == '0' || *ph == '1')) g_fh_mode.store(*ph - '0');
+                    const char *pgv = mgpu::config::find(buf, got, "PresentGuard");      // PG1 (LR99)
+                    if (pgv != nullptr && *pgv >= '0' && *pgv <= '2') g_pg_mode.store(*pgv == '0' ? 0 : 1);   // LR103's "2" = 1
+                    const char *pgg = mgpu::config::find(buf, got, "PresentGuardGame");  // PG2 (LR104)
+                    if (pgg != nullptr && (*pgg == '0' || *pgg == '1')) g_pg2_mode.store(*pgg - '0');
                 }
                 CloseHandle(f);
             }
         }
     }
+    {   // PG1: with hardware shadow stacks Windows refuses to move a thread back to a snapshot
+        PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY ss{};
+        if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessUserShadowStackPolicy, &ss, sizeof ss) &&
+            ss.EnableUserShadowStack)
+            g_pg_cet.store(true);
+        if (g_pg_cet.load()) g_pg_mode.store(0);
+    }
     so_refresh_overlay();   // Steam injects the overlay before ReShade loads add-ons
+    sw_start();   // SW1
     g_veh = AddVectoredExceptionHandler(1, on_exception);
 }
 
@@ -1242,6 +1741,20 @@ void announce()
             mgpu::diag::info("[MGPU][DW1] watching DLL loads and unloads - each is logged as [MGPU][DW1] "
                              "(startup loads are summed up), and a crash lists the last few.");
     }
+    mgpu::diag::info(g_pg_mode.load() != 0
+                         ? (g_pg2_mode.load() == 1
+                                ? "[MGPU][PG1] the bridge's own Present is guarded, and PG2 (PresentGuardGame=1, default) "
+                                  "also steps over the game's Present when a hook rewriting its first bytes (RivaTuner/"
+                                  "Afterburner, an overlay) faults it and every independent check passes - one frame not "
+                                  "shown instead of the game closing. PresentGuardGame=0 makes PG2 report only."
+                                : "[MGPU][PG1] the bridge's own Present is guarded: if it faults in the first bytes of "
+                                  "Windows' Present while a hook (RivaTuner/Afterburner, an overlay) is rewriting them, that "
+                                  "one frame is not shown and the bridge goes on (PresentGuard=0 turns this off). The game's "
+                                  "own Present is NOT stepped over (PresentGuardGame=0: PG2 reports only).")
+                         : g_pg_cet.load()
+                         ? "[MGPU][PG1] Present guard OFF: this game runs with hardware shadow stacks (CET), where "
+                           "Windows will not let a thread be moved back to a snapshot."
+                         : "[MGPU][PG1] Present guard OFF (PresentGuard=0).");
     mgpu::diag::info(g_veh != nullptr
                          ? "[MGPU][CR1] crash catcher installed: a fatal error anywhere in the game is named "
                            "(module, offset, call chain) in mgpu\\crash.txt and here, as [MGPU][CR1]. Errors are "
@@ -1277,6 +1790,34 @@ void flush_dll_events()
                  (const void *)e.base, (unsigned long long)e.size / 1024ull, (double)(e.ms - g_dw_t0) / 1000.0);
         mgpu::diag::info(l);
     }
+}
+
+// PG1 (LR99): see pg_try. NOT inlined: the snapshot belongs to this frame,
+// which stays alive for the whole Present call.
+__declspec(noinline) long guarded_present(IDXGISwapChain *sc, unsigned interval, unsigned flags)
+{
+    if (g_pg_mode.load(std::memory_order_relaxed) == 0) return (long)sc->Present(interval, flags);
+    CONTEXT snap;
+    t_pg_hit = 0;
+    RtlCaptureContext(&snap);
+    // The handler comes back HERE (RtlCaptureContext "returns" a second time)
+    // with t_pg_hit set, the snapshot's registers and stack. Nothing set after
+    // the snapshot is read on that path - only the thread-local flag.
+    if (t_pg_hit != 0)
+    {
+        t_pg_hit = 0;
+        return (long)S_OK;
+    }
+    t_pg_ctx = &snap;
+    const HRESULT hr = sc->Present(interval, flags);
+    t_pg_ctx = nullptr;
+    return (long)hr;
+}
+
+void set_present_slots(uintptr_t present_slot, uintptr_t present1_slot)
+{
+    g_pg_slot[0].store(present_slot, std::memory_order_release);
+    g_pg_slot[1].store(present1_slot, std::memory_order_release);
 }
 
 // SO2: the milestones a step-over is judged by. Per frame this is one relaxed

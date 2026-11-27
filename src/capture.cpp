@@ -10,6 +10,7 @@
 //                 writes benchmark files.
 //   audio         WASAPI loopback capture while a recording runs.
 // ---------------------------------------------------------------------------
+#include "d3dc.hpp"   // SC1
 #include "capture.hpp"
 #include "framewarp.hpp"
 
@@ -42,6 +43,8 @@
 
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#include "gpu_safety_d3d12.hpp"   // LR100: the bounded drain with the event-retention rule
+#include "replay_rules.hpp"   // LR106: a replay benchmark waits for the overlay to close
 #include "replay.hpp"
 
 #if defined(_MSC_VER)
@@ -490,7 +493,7 @@ bool rec_build(ID3D12Device *dev, unsigned w, unsigned h, DXGI_FORMAT fmt, char 
                       (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0;
     g_texfmt = bgra ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
 
-    HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+    HMODULE dc = mgpu::sys_d3dcompiler_module() /* SC1 */;
     pfn_compile cmp = dc ? (pfn_compile)(void *)GetProcAddress(dc, "D3DCompile") : nullptr;
     if (cmp == nullptr) { snprintf(why, whyn, "d3dcompiler_47.dll not available"); return false; }
     ID3DBlob *cs = nullptr, *err = nullptr;
@@ -1686,7 +1689,10 @@ void bench_write(bm_job &j)
 // median) when it hitched: over 30 stutters a minute, a frame gap over 100 ms,
 // or the multiplier not running (shown / real under 95% of it).
 struct sw_step { int round = 0; bm_stats r; bool flagged = false; char why[64] = {}; };
-struct sw_cfg { int gen = 4, cap = 40, mult = 2; char name[24] = {}; bm_series acc; std::vector<sw_step> steps; };
+// NB2: nr - 0 = the sweep-wide rule (BenchSweepNR / BenchSweepNRStart), 1 = hold
+// at nr_pct, 2 = dynamic with NR time budget `budget` ms (0 = no budget).
+struct sw_cfg { int gen = 4, cap = 40, mult = 2; int nr = 0, nr_pct = 0, budget = 0; char name[32] = {}; bm_series acc;
+                std::vector<sw_step> steps; };
 std::vector<sw_cfg> g_sw_cfg;              // worker thread
 std::vector<std::string> g_sw_lines;       // worker thread: one line per step
 std::atomic<int> g_sw_req{0};              // any thread -> worker: 1 start, 2 stop
@@ -1695,6 +1701,9 @@ std::atomic<int> g_sw_step{0}, g_sw_steps{0};
 char g_sw_label[40] = {};                  // g_mx: "AMD 40X4" for the HUD
 int  g_sw_rounds = 1, g_sw_settle = 5, g_sw_dwell = 20, g_sw_nr = 0;
 bool g_sw_in_step = false, g_sw_stop = false, g_sw_replay = false;
+// NB3: NR / FG-stage GPU totals when the step's measurement began (exact step means).
+bool g_sw_nb_snap = false;
+unsigned long long g_sw_nb0[4] = {};
 char g_sw_why[160] = {};
 ULONGLONG g_sw_step_t = 0, g_sw_t0 = 0;
 char g_sw_start[40] = {}, g_sw_base[600] = {};
@@ -1751,6 +1760,20 @@ bool sw_parse(const char *list, std::vector<sw_cfg> &out, char *bad, size_t bn)
             else ok = false;
         }
         if (ok) ok = cap >= 20 && cap <= 240 && mult >= 2 && mult <= (c.gen == 3 ? 4 : 6);
+        // NB2: optional neural resolution per configuration: @60 holds 60%,
+        // @dyn runs dynamic resolution, @b8 dynamic with an 8 ms NR budget.
+        if (ok)
+        {
+            const char *at = strchr(tok, '@');
+            if (at != nullptr)
+            {
+                int v = 0;
+                if (!strcmp(at + 1, "dyn")) { c.nr = 2; c.budget = 0; }
+                else if (at[1] == 'b' && sscanf(at + 2, "%d", &v) == 1 && v >= 1 && v <= 50) { c.nr = 2; c.budget = v; }
+                else if (sscanf(at + 1, "%d", &v) == 1 && v >= 33 && v <= 90) { c.nr = 1; c.nr_pct = v; }
+                else ok = false;
+            }
+        }
         if (!ok)
         {
             const size_t u = strlen(bad);
@@ -1758,7 +1781,11 @@ bool sw_parse(const char *list, std::vector<sw_cfg> &out, char *bad, size_t bn)
             continue;
         }
         c.cap = cap; c.mult = mult;
-        snprintf(c.name, sizeof c.name, "%s %dx%d", c.gen == 3 ? "AMD" : "NVIDIA", cap, mult);
+        char nrs[16] = "";
+        if (c.nr == 1) snprintf(nrs, sizeof nrs, " @%d%%", c.nr_pct);
+        else if (c.nr == 2 && c.budget > 0) snprintf(nrs, sizeof nrs, " b%dms", c.budget);
+        else if (c.nr == 2) snprintf(nrs, sizeof nrs, " dyn");
+        snprintf(c.name, sizeof c.name, "%s %dx%d%s", c.gen == 3 ? "AMD" : "NVIDIA", cap, mult, nrs);
         out.push_back(c);
     }
     return !out.empty();
@@ -1767,7 +1794,11 @@ bool sw_parse(const char *list, std::vector<sw_cfg> &out, char *bad, size_t bn)
 void sw_label(const sw_cfg &c)
 {
     std::lock_guard<std::mutex> lk(g_mx);
-    snprintf(g_sw_label, sizeof g_sw_label, "%s %dX%d", c.gen == 3 ? "AMD" : "NV", c.cap, c.mult);
+    char nrs[16] = "";   // NB2
+    if (c.nr == 1) snprintf(nrs, sizeof nrs, " @%d%%", c.nr_pct);
+    else if (c.nr == 2 && c.budget > 0) snprintf(nrs, sizeof nrs, " B%dMS", c.budget);
+    else if (c.nr == 2) snprintf(nrs, sizeof nrs, " DYN");
+    snprintf(g_sw_label, sizeof g_sw_label, "%s %dX%d%s", c.gen == 3 ? "AMD" : "NV", c.cap, c.mult, nrs);
 }
 
 void sweep_start()
@@ -1782,7 +1813,8 @@ void sweep_start()
     if (bad[0])
     {
         char l[400]; snprintf(l, sizeof l, "[MGPU][BM3] BenchSweep: skipped what it could not read: %s "
-                              "(write gen:CAPxMULT, e.g. amd:40x4,nv:50x3; AMD 2-4x, NVIDIA 2-6x, cap 20-240)", bad);
+                              "(write gen:CAPxMULT, e.g. amd:40x4,nv:50x3; AMD 2-4x, NVIDIA 2-6x, cap 20-240; "
+                              "optional @60 / @dyn / @b8 for neural resolution)", bad);
         mgpu::diag::warn(l);
     }
     if (!any) { set_msg("Sweep not started: BenchSweep in mgpu.ini lists no configuration it can read.", "SWEEP NOT STARTED", 4000); return; }
@@ -1917,10 +1949,10 @@ void sweep_write(const char *state, bool final, std::vector<sw_score> &rows,
     fputs("Each figure is the MEDIAN of the configuration's clean steps. A step is flagged and left out when it\n"
           "hitched (over 30 stutters a minute, a gap over 100 ms, or the multiplier not running) - a scene cut,\n"
           "a loading screen or the end of a fly-through. \"used\" says how many steps count.\n\n", f);
-    fprintf(f, "%-16s %5s %7s %7s %6s %7s %7s %7s %7s %8s %7s %7s %10s %5s %6s %5s\n",
+    fprintf(f, "%-22s %5s %7s %7s %6s %7s %7s %7s %7s %8s %7s %7s %10s %5s %6s %5s\n",
             "configuration", "used", "shown", "real", "ran", "1% low", "p99 ft", "stut/m", "real sd",
             "odd/even", "spread", "jitter", "latency", "NR %", "power", "busy");
-    fprintf(f, "%-16s %5s %7s %7s %6s %7s %7s %7s %7s %8s %7s %7s %10s %5s %6s %5s\n",
+    fprintf(f, "%-22s %5s %7s %7s %6s %7s %7s %7s %7s %8s %7s %7s %10s %5s %6s %5s\n",
             "", "", "fps", "fps", "as", "fps", "ms", "", "ms", "%", "%", "ms", "avg/p99 ms", "", "%", "%");
     for (const sw_score &x : rows)
     {
@@ -1928,7 +1960,7 @@ void sweep_write(const char *state, bool final, std::vector<sw_score> &rows,
         if (x.all_flagged) snprintf(used, sizeof used, "0/%u!", x.total); else snprintf(used, sizeof used, "%u/%u", x.used, x.total);
         if (x.lat >= 0.0) snprintf(lat, sizeof lat, "%.1f/%.1f", x.lat, x.lat99); else snprintf(lat, sizeof lat, "-");
         fig(dr, sizeof dr, x.dr, "%.0f"); fig(pw, sizeof pw, x.pw, "%.0f"); fig(bz, sizeof bz, x.busy, "%.0f");
-        fprintf(f, "%-16s %5s %7.1f %7.1f %5.2fx %7.1f %7.2f %7.1f %7.2f %8.1f %7.1f %7.2f %10s %5s %6s %5s%s%s\n",
+        fprintf(f, "%-22s %5s %7.1f %7.1f %5.2fx %7.1f %7.2f %7.1f %7.2f %8.1f %7.1f %7.2f %10s %5s %6s %5s%s%s\n",
                 x.c->name, used, x.shown, x.real, x.ran, x.l1, x.p99, x.stutm, x.rsd, x.oe, x.spread, x.jit,
                 lat, dr, pw, bz,
                 x.real >= 0.0 && x.real < (double)x.c->cap * 0.99 ? "  < short of the Limiter" : "  = held the Limiter",
@@ -1938,7 +1970,7 @@ void sweep_write(const char *state, bool final, std::vector<sw_score> &rows,
     for (const sw_score &x : rows)
     {
         char sl[200]; slots_text(compute(x.c->acc), sl, sizeof sl);
-        fprintf(f, "  %-16s %s\n", x.c->name, sl[0] ? sl : "-");
+        fprintf(f, "  %-22s %s\n", x.c->name, sl[0] ? sl : "-");
     }
     fputs("\n", f);
     if (*b_jit)  fprintf(f, "Smoothest (lowest jitter):        %s\n", (*b_jit)->c->name);
@@ -2024,12 +2056,31 @@ void sweep_result(const bm_series *s, const bm_stats *r, bool replay_aborted)
         else if (r->mx > 100.0) { st.flagged = true; snprintf(st.why, sizeof st.why, "a %.0f ms gap", r->mx); }
         else if (r->ran_as > 0.0 && r->ran_as < (double)c.mult * 0.95) { st.flagged = true; snprintf(st.why, sizeof st.why, "ran as %.2fx", r->ran_as); }
         c.steps.push_back(st);
-        snprintf(line, sizeof line, "%sround %d %-16s shown %.1f, real %.1f fps, ran as %.2fx, 1%% low %.1f, odd/even %.1f%%, "
-                 "spread %.1f%%, jitter %.2f ms, latency %.1f ms, NR %.0f%%%s%s",
+        // NB2: the neural card's NR and frame generation times (GPU timestamps,
+        // smoothed over the last ~10 real frames of the step).
+        // NB3: exact means over the measured part of the step (from the
+        // running totals), falling back to the smoothed value without a start mark.
+        char nb[120] = "";
+        {
+            unsigned long long t[4] = {};
+            mgpu::gpu1::ui_nb_totals(&t[0], &t[1], &t[2], &t[3]);
+            double nrm = -1.0, fgm = -1.0;
+            if (g_sw_nb_snap)
+            {
+                if (t[1] > g_sw_nb0[1]) nrm = (double)(t[0] - g_sw_nb0[0]) / 1000.0 / (double)(t[1] - g_sw_nb0[1]);
+                if (t[3] > g_sw_nb0[3]) fgm = (double)(t[2] - g_sw_nb0[2]) / 1000.0 / (double)(t[3] - g_sw_nb0[3]);
+            }
+            else { nrm = mgpu::gpu1::ui_nb_nr_ms(); fgm = mgpu::gpu1::ui_nb_fg_ms(); }
+            if (nrm >= 0.0 || fgm >= 0.0)
+                snprintf(nb, sizeof nb, ", NR GPU %.2f ms, FG stage GPU %.2f ms per real frame%s",
+                         nrm >= 0.0 ? nrm : 0.0, fgm >= 0.0 ? fgm : 0.0, g_sw_nb_snap ? "" : " (smoothed)");
+        }
+        snprintf(line, sizeof line, "%sround %d %-22s shown %.1f, real %.1f fps, ran as %.2fx, 1%% low %.1f, odd/even %.1f%%, "
+                 "spread %.1f%%, jitter %.2f ms, latency %.1f ms, NR %.0f%%%s%s%s",
                  st.flagged ? "* " : "  ", round, c.name, r->avg, r->real_fps, r->ran_as, r->l1, r->oe_pct, r->spread_pct,
-                 r->jit_ms, r->lat_avg, r->dr, st.flagged ? " - flagged: " : "", st.flagged ? st.why : "");
+                 r->jit_ms, r->lat_avg, r->dr, nb, st.flagged ? " - flagged: " : "", st.flagged ? st.why : "");
     }
-    else snprintf(line, sizeof line, "  round %d %-16s too short - no result", round, c.name);
+    else snprintf(line, sizeof line, "  round %d %-22s too short - no result", round, c.name);
     g_sw_lines.push_back(line);
     g_sw_step.fetch_add(1);
     // BM5: the step in ReShade.log, and the summary rewritten now - a crash or
@@ -2059,6 +2110,12 @@ void sweep_tick()
     }
     if (g_sw_in_step)
     {
+        // NB3: the measurement has begun (settle over) - note the GPU timing totals.
+        if (b == 2 && !g_sw_nb_snap)
+        {
+            mgpu::gpu1::ui_nb_totals(&g_sw_nb0[0], &g_sw_nb0[1], &g_sw_nb0[2], &g_sw_nb0[3]);
+            g_sw_nb_snap = true;
+        }
         // A countdown that never sees a frame (the bridge is not running).
         if (b == 1 && g_bm_cd0 == 0 && GetTickCount64() - g_sw_step_t > 15000ull)
         {
@@ -2073,11 +2130,36 @@ void sweep_tick()
     if (idx >= g_sw_steps.load()) { sweep_finish("done"); return; }
     const sw_cfg &c = g_sw_cfg[(size_t)idx % g_sw_cfg.size()];
     mgpu::gpu1::ui_bs_apply(c.gen, c.cap, c.mult);
-    if (g_sw_nr == 0 && g_sw_nrstart > 0) (void)mgpu::gpu1::ui_bs_dr_start(g_sw_nrstart);   // BM6: a common start
+    // NB2: this configuration's own neural resolution, else the sweep-wide rule.
+    if (c.nr == 1)
+    {
+        mgpu::gpu1::ui_bs_budget(-1);
+        if (mgpu::gpu1::ui_bs_hold_nr(c.nr_pct) == 0)
+            mgpu::diag::warn("[MGPU][NB2] sweep step asks for a held neural resolution, but dynamic resolution is "
+                             "off - the fixed SRScale applies to this step.");
+    }
+    else if (c.nr == 2)
+    {
+        (void)mgpu::gpu1::ui_bs_hold_nr(0);
+        mgpu::gpu1::ui_bs_budget(c.budget);
+        const int st = g_sw_nrstart > 0 ? g_sw_nrstart : g_sw_nr0;
+        if (st > 0) (void)mgpu::gpu1::ui_bs_dr_start(st);
+        if (!mgpu::gpu1::ui_dr_on())
+            mgpu::diag::warn("[MGPU][NB2] sweep step asks for dynamic resolution, but it is off (SRDynamic=0) - "
+                             "the fixed SRScale applies to this step.");
+    }
+    else
+    {
+        mgpu::gpu1::ui_bs_budget(-1);
+        if (g_sw_nr > 0) (void)mgpu::gpu1::ui_bs_hold_nr(g_sw_nr);
+        else (void)mgpu::gpu1::ui_bs_hold_nr(0);
+        if (g_sw_nr == 0 && g_sw_nrstart > 0) (void)mgpu::gpu1::ui_bs_dr_start(g_sw_nrstart);   // BM6: a common start
+    }
     sw_label(c);
     g_bm_dly_ovr.store(g_sw_settle);
     g_bm_len_ovr.store(g_sw_dwell);
     g_sw_in_step = true;
+    g_sw_nb_snap = false;   // NB3
     g_sw_step_t = GetTickCount64();
     std::lock_guard<std::mutex> plk(g_pmx);
     g_bm_stop.store(false); g_bm_cd0 = 0; g_bm.store(1);
@@ -2256,19 +2338,22 @@ void shutdown()
         if (!fence_done(g_last_fence, g_last_value))
         {
             gpu_idle = false;
-            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (ev && SUCCEEDED(g_last_fence->SetEventOnCompletion(g_last_value, ev)))
-                (void)WaitForSingleObject(ev, 5000);
-            if (ev) CloseHandle(ev);
+            // LR100: the shared bounded drain (gpu_safety_d3d12.hpp). It closes
+            // its event ONLY when the fence passed or the device is gone - the
+            // old code closed it after a 5 s timeout too, while the driver
+            // still held it registered and could set it later (a handle that
+            // may by then name another object). Kept on purpose when pending.
+            // It also asks the device itself (GetDeviceRemovedReason), so a
+            // removal is seen before the fence reads UINT64_MAX.
+            const mgpu::gpusafe::drain_r dr = mgpu::gpusafe::drain_fence_self(g_last_fence, g_last_value, 5000, 0);
             // REV6: decided here, not by fence_done(). fence_done() treats
             // UINT64_MAX as NOT done on purpose - for a screenshot it means
             // the copied pixels are invalid. For shutdown the question is
             // different: is the GPU still using these buffers? A removed
             // device reports UINT64_MAX on every fence and executes nothing
             // more, so then the answer is no and they are released normally.
-            const UINT64 c = g_last_fence->GetCompletedValue();
-            const bool removed = (c == UINT64_MAX);
-            gpu_idle = removed || c >= g_last_value;
+            const bool removed = dr.removed;
+            gpu_idle = removed || dr.drained;
             if (removed)
                 mgpu::diag::warn("[MGPU][REV6] capture shutdown: the GPU device was lost - nothing is in "
                                  "flight, buffers released.");
@@ -2470,6 +2555,10 @@ void on_present_shown()
     if (bs == 1)
     {
         if (g_bm_cd0 == 0) g_bm_cd0 = now;
+        // LR106: with input replay on, the countdown starts over while the
+        // overlay is open - a replay that began under an open panel moved its
+        // cursor (Cyberpunk), and now stops at once if the overlay is up.
+        if (mgpu::replay_rules::hold_countdown(get(S_BENCH_RPL) != 0, mgpu::gpu1::ui_any_menu_open())) g_bm_cd0 = now;
         if (now - g_bm_cd0 >= (LONGLONG)bm_delay_s() * qpc_freq())
         {
             g_bm_t.clear(); g_bm_gen.clear(); g_bm_lat.clear();

@@ -980,8 +980,10 @@ namespace
                         {
                             mgpu::diag::info("[MGPU][R246] NgxProbeAtStart=1: the NGX probe runs now, "
                                              "before the present loop (the pre-R246 place).");
+                            mgpu::gpu1::su_set_stage(mgpu::gpu1::SU_LOADING);     // SU1
                             (void)mgpu::gpu1::ngx_probe(1280, 720);
                             mgpu::gpu1::note_ngx_probe_ran();   // R290
+                            mgpu::gpu1::su_set_stage(mgpu::gpu1::SU_UPSCALING);   // SU1
                             if (mgpu::gpu1::ngx_probe_init_was_outofdate())
                             {
                                 ngx_retry_pending = true; ngx_retry_n = 0;
@@ -1351,6 +1353,7 @@ namespace
                         char why[320];
                         r282_state = mgpu::gpu1::ngx_probe_scene_hold_decide(why, sizeof why) ? 1 : 2;
                         mgpu::diag::info(why);
+                        if (r282_state == 1) mgpu::gpu1::su_set_stage(mgpu::gpu1::SU_WAITING);   // SU1
                     }
                     // R290: the depth hold's fallback also releases it (it fires only once
                     // the game's DLSS has been seen).
@@ -1409,8 +1412,10 @@ namespace
                                  "this process.",
                                  gf, waited, (gf == 0ull) ? " - BOUND reached, the game has rendered nothing yet" : "");
                         mgpu::diag::info(line);
+                        mgpu::gpu1::su_set_stage(mgpu::gpu1::SU_LOADING);     // SU1
                         (void)mgpu::gpu1::ngx_probe(1280, 720);
                         mgpu::gpu1::note_ngx_probe_ran();   // R290
+                        mgpu::gpu1::su_set_stage(mgpu::gpu1::SU_UPSCALING);   // SU1
                         if (mgpu::gpu1::ngx_probe_init_was_outofdate())
                         {
                             ngx_retry_pending = true; ngx_retry_n = 0;
@@ -1569,7 +1574,7 @@ namespace
                 mgpu::gpu1::capture_poll();
                 // HW1: a hidden window's Present returns at once (occluded) -
                 // pace the idle loop to ~60 Hz so it does not spin GPU 1.
-                if (mgpu::gpu1::bridge_window_hidden()) Sleep(16);
+                if (mgpu::gpu1::bridge_window_hidden() || mgpu::gpu1::picture_hidden_for_resize()) Sleep(16);   // + RC3
 
                 ++frame;
                 if (frame == 1)
@@ -1694,6 +1699,7 @@ namespace
         mgpu::gpu1::fg_present_stop();       // FG2: before anything it presents with goes
         mgpu::gpu1::stream_shutdown();
         mgpu::gpu1::late_latch_shutdown();   // HARDEN2: bridge thread, loop has exited
+        mgpu::gpu1::release_game_device_refs();   // EX1 (IN89): after the stream let go of GPU 0, no lock held
 
         mgpu::gpu1::shutdown();
         mgpu::framewarp::release_gpu_now();   // FW1: the present queue is drained now
@@ -1784,6 +1790,8 @@ void ensure_started()
     bool expected = false;
     if (!st().started.compare_exchange_strong(expected, true))
         return;
+    mgpu::gpu1::ex_session_begin();   // EX1 (IN90): a new bridge session - the closing latch starts over
+    mgpu::gpu1::su_set_stage(mgpu::gpu1::SU_ARMING);   // SU1 (IN95)
 
     // Publish the ready event before the thread exists: the _beginthreadex
     // call is the happens-before edge, so the worker's first read of the
@@ -1797,6 +1805,18 @@ void ensure_started()
     // one.
     if (st().stop_event == nullptr)
         st().stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    else if (WaitForSingleObject(st().stop_event, 0) == WAIT_OBJECT_0)
+    {
+        // ST1: A STOP SIGNALLED WHILE NO BRIDGE THREAD RAN IS STALE. MEASURED on
+        // Shadow of the Tomb Raider: the game opens and closes test devices at
+        // start-up; one was released after the previous bridge thread had already
+        // exited, so stop() set the event with no thread to consume it. The bridge
+        // thread started for the REAL game then saw it at once ("shutdown before
+        // the T2 selection completed") and the bridge stayed off for the session.
+        ResetEvent(st().stop_event);
+        mgpu::diag::info("[MGPU][ST1] a stop request left over from a device the game closed while no bridge "
+                         "thread was running is cleared - the new bridge thread starts normally.");
+    }
     unsigned tid = 0;
     const uintptr_t th = _beginthreadex(nullptr, 0, bridge_main, nullptr, 0, &tid);
     if (th == 0)

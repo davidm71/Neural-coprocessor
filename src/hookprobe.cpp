@@ -1,5 +1,6 @@
 // hookprobe.cpp - SO5. See hookprobe.hpp.
 #include "hookprobe.hpp"
+#include "crashlog.hpp"   // PG1
 #include "diag.hpp"
 #include "gpu1_context.hpp"   // ui_ini_read
 
@@ -148,6 +149,7 @@ void init(IUnknown *queue)
     void **vt = *(void ***)sc;
     g_slot[0] = (uintptr_t)&vt[8];    // IDXGISwapChain::Present
     g_slot[1] = (uintptr_t)&vt[22];   // IDXGISwapChain1::Present1
+    mgpu::crashlog::set_present_slots(g_slot[0], g_slot[1]);   // PG1: where a hook rewrites Present
     sc->Release();
     f->Release();
     g_on = true;

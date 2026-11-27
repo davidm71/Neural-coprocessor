@@ -8,9 +8,10 @@
 // it happened in (this add-on, an NVIDIA DLL, the driver, the game) with the
 // offset inside it and the call chain, to <add-on folder>\mgpu\crash.txt
 // (plain WriteFile, flushed, safe even when the heap is damaged) and to
-// ReShade.log. It handles one thing only: the known fault in Steam's overlay
-// (SO1/SO2, crashlog.cpp), which it steps over after checking it is that fault
-// and that the return is safe. Every other error goes on exactly as before.
+// ReShade.log. It steps over only faults it can recognise and return from
+// safely: the known fault in Steam's overlay (SO1/SO2), a Present hook that
+// jumped into freed memory (SO5), and a fault in the bridge's own Present while
+// a hook rewrites it (PG1). Every other error goes on exactly as before.
 //
 // The handler sees errors first, before any code that might catch them, so a
 // line can also appear for an error something recovered from. The one that
@@ -19,6 +20,9 @@
 #pragma once
 
 #include <windows.h>
+#include <cstdint>
+
+struct IDXGISwapChain;   // PG1 (dxgi.h)
 
 namespace mgpu
 {
@@ -36,6 +40,15 @@ void note_present(int source, long hr);   // 0 = ReShade's present event (hr 0),
 void present_begin();                     // SO5: the calling thread is about to Present (one TLS write)
 bool wants_device_check();                // true for ~5 s after a step-over
 void note_device(long removed_reason);    // GetDeviceRemovedReason of the presenting device
+
+// PG1 (LR99): the bridge's OWN Present, guarded against a hook (RivaTuner /
+// Afterburner, an overlay) rewriting the first bytes of Windows' Present - or
+// replacing its own trampoline - while this thread is running through them.
+// Such a fault puts the thread back where it was just before the call and
+// returns S_OK: one frame not shown instead of a crash. [MGPU][PG1].
+long guarded_present(IDXGISwapChain *sc, unsigned interval, unsigned flags);
+// hookprobe: the addresses of dxgi.dll's vtable slots for Present and Present1.
+void set_present_slots(uintptr_t present_slot, uintptr_t present1_slot);
 
 } // namespace crashlog
 } // namespace mgpu

@@ -276,6 +276,14 @@ void set_mvec_hook(void (*fn)(void *cmd_list, unsigned long long handle));
 void set_mvec_hook_d3d11(void (*fn)(void *context, unsigned long long resource));
 void set_eval_copy(int mode);
 
+// UT1. Which upscaler the table is read from. UpscalerTap= in mgpu.ini:
+// 0 auto (DLSS first, then the game's XeSS or FSR 3.1 when DLSS is silent),
+// 1 DLSS only, 2 XeSS only, 3 FSR only, -1 no XeSS/FSR taps.
+void set_upscaler_tap(int mode);
+// UT3. Called by the DLL watcher when a DLL loads: routes XeSS/FSR exports
+// through the bridge before the game can look them up.
+void ut_on_load(void *base, const char *name);
+
 // R118. What the ini asked for: 0 off, 1 on, 2 AUTO. Read by gpu1_context so
 // the auto-fallback can tell "the user wants auto" from "the user said on",
 // without a second parse of mgpu.ini.
@@ -315,6 +323,34 @@ unsigned long long latch_refused();
 // The caller writes the key and logs it; this only decides when.
 bool sf_path_should_promote();
 void apply_jitter_offset(void *nr_params, float mvec_scale_x, float mvec_scale_y);
+
+// ---- XT2 (IN86, diagnostic builds only): the game's own device ----
+// The device pointer the GAME passed to its NGX D3D12 Init - the object the
+// game itself holds (ReShade's wrapper, not the device underneath). nullptr
+// until the game initialises NGX on D3D12, and always in production builds.
+void *game_ngx_device12();
+// XT2 (IN90, passive): the last reading of the count on that device (ReShade's
+// wrapper): -3 never read, -1 a read faulted, 0 seen destroyed.
+long game_device12_refs();
+// Read it now - ONLY where the caller's situation guarantees the device is held
+// by something else for the duration: `holder_device_native` is the device
+// (underneath) of a queue or swap chain inside its own destroy event; it is
+// read only if that is the tracked device. -3: not read. Production: -3.
+long xt2_read_if_device(void *holder_device_native);
+// Read it now - the caller itself holds a reference on it (EX1, before giving
+// its references back). -3: nothing tracked / production.
+long xt2_read_guaranteed();
+// XT2 (IN88): ReShade's device objects, so a device found underneath (the
+// real one) can be turned into ReShade's wrapper - the object whose count
+// reaching zero raises destroy_device. Called from init_device /
+// destroy_device for D3D12 devices; diagnostic builds only, no-ops otherwise.
+void xt2_note_device(void *native, void *api_device);
+void xt2_forget_device(void *api_device);
+// The reference count on a COM object, read with AddRef + Release inside a
+// fault guard: -1 if reading it faulted. Only safe on an object the caller
+// knows cannot reach zero meanwhile (it holds a reference, or the object's
+// owner is inside a call that uses it).
+long probe_refs(void *unk);
 
 } // namespace calibrator
 } // namespace mgpu

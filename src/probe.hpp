@@ -120,6 +120,7 @@ int jitter_mode();
 // R106. MvecFromEval: 0 barrier-triggered copy (current, default), 1 copy from
 // the DLSS evaluate call instead - once per frame, guaranteed.
 int eval_copy_mode();
+int upscaler_tap();   // UT1
 
 // R180/R182. The Starfield path key: -2 absent (AUTO), 0 off, 1 on.
 int sf_path_mode();

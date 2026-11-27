@@ -3,6 +3,7 @@
 // See screen.hpp for why this exists and why it can work when nothing else can.
 // ---------------------------------------------------------------------------
 
+#include "d3dc.hpp"   // SC1
 #include "screen.hpp"
 
 #include <cstring>
@@ -266,7 +267,7 @@ bool ensure_hud_blend_pipeline(ID3D12GraphicsCommandList *cl)
     ID3D12Device *dev = nullptr;
     if (FAILED(cl->GetDevice(IID_PPV_ARGS(&dev))) || dev == nullptr) return false;
 
-    HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+    HMODULE dc = mgpu::sys_d3dcompiler_module() /* SC1 */;
     if (dc == nullptr) { dev->Release(); return false; }
     hud_d3dcompile_fn compile = reinterpret_cast<hud_d3dcompile_fn>(
         GetProcAddress(dc, "D3DCompile"));

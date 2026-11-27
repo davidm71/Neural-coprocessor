@@ -685,6 +685,16 @@ void on_swapchain(::reshade::api::swapchain *swapchain, bool resize)
                  (unsigned)S.result.game_luid.HighPart,
                  (unsigned)S.result.game_luid.LowPart);
         mgpu::diag::info(line);
+        // RS1. A previous bridge run was torn down (shutdown() below cleared
+        // the decision): the game LUID still stands, so select again from it.
+        if (!S.decided)
+        {
+            mgpu::diag::info("[MGPU][RS1] the previous bridge run was torn down - choosing the bridge "
+                             "card again so the new bridge thread can start");
+            if (!S.table_enumerated)
+                enumerate_table_locked(S);
+            try_select_locked(S);
+        }
         return;
     }
 
@@ -739,6 +749,12 @@ void note_game_luid_d3d11(unsigned long long luid_low, long luid_high)
                  (unsigned)luid.HighPart, (unsigned)luid.LowPart,
                  (unsigned)S.result.game_luid.HighPart, (unsigned)S.result.game_luid.LowPart);
         mgpu::diag::info(line);
+        if (!S.decided)   // RS1, as above
+        {
+            if (!S.table_enumerated)
+                enumerate_table_locked(S);
+            try_select_locked(S);
+        }
         return;
     }
     S.result.game_luid = luid;
@@ -760,6 +776,10 @@ void shutdown()
 {
     auto &S = st();
     std::lock_guard<std::mutex> lk(S.cs);
+    // RS1: the table's entry for the selected card is the same reference as
+    // selected_adapter - drop it from the table first so it is released once.
+    for (entry &e : S.table)
+        if (e.adapter != nullptr && (void *)e.adapter == S.result.selected_adapter) e.adapter = nullptr;
     if (S.result.selected_adapter != nullptr)
     {
         static_cast<IDXGIAdapter1 *>(S.result.selected_adapter)->Release();
@@ -770,6 +790,18 @@ void shutdown()
     // cannot act on this run's stale selection.
     if (S.ready != nullptr)
         ResetEvent(S.ready);
+    // RS1. REPORTED 2026-11-17 (Shadow of the Tomb Raider, IN25): the game
+    // creates and destroys devices during startup; the first bridge run was
+    // torn down, the re-armed thread then waited forever on this event,
+    // because the selection was one-shot and never ran again. Forget the
+    // decision (keep the game's LUID) so the next swapchain event re-selects
+    // from a fresh adapter list and sets the event.
+    for (entry &e : S.table)
+        if (e.adapter != nullptr) { e.adapter->Release(); e.adapter = nullptr; }
+    S.table.clear();
+    S.table_enumerated = false;
+    S.decided = false;
+    S.result.valid = false;
     if (S.game_ad3 != nullptr) { S.game_ad3->Release(); S.game_ad3 = nullptr; }   // R182
 }
 

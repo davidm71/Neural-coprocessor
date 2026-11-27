@@ -31,6 +31,7 @@
 #endif
 
 #include <reshade.hpp>
+#include "panel_theme.hpp"   // TH1
 
 #include "live_panel.hpp"
 #include "diag.hpp"
@@ -79,6 +80,15 @@ thread_local bool   t_own = false;
 std::atomic<void *> g_game{nullptr};      // the game's effect runtime
 std::atomic<void *> g_windowless{nullptr};// the GPU 1 runtime with no window = the neural picture
 std::atomic<void *> g_host{nullptr};      // the runtime the panel was actually opened on
+std::atomic<void *> g_pic_rt{nullptr};    // PW1: the picture runtime BT5 opened the overlay on
+std::atomic<void *> g_po_rt{nullptr};     // PO1: plain mode - the runtime the panel is shown on
+std::atomic<bool>   g_self_toggle{false}; // HX1 (IN92b): the add-on itself is toggling an overlay (Esc close)
+std::atomic<int>    g_po_on{-1};          // PO1: PanelOnly, -1 not read
+std::atomic<bool>   g_po_up{false};       // PO1: a panel-only window is up (any mode)
+std::atomic<bool>   g_po_allow{false};    // PO1: the "ReShade menu" button's one open
+void (*g_po_closer)() = nullptr;          // PO1: dllmain's close-everything
+void (*g_po_shift)(reshade::api::effect_runtime *) = nullptr;   // PO2: Shift+Home
+void (*g_po_tick)(reshade::api::effect_runtime *) = nullptr;    // PO4
 std::atomic<int>    g_said_host{0};
 std::atomic<int>    g_probe{0};
 // WH1: the wheel for this frame, in notches. Written by feed_input and used by
@@ -290,7 +300,11 @@ void feed_input(reshade::api::effect_runtime *runtime)
         static int esc_prev = 0;
         const int esc = mgpu::hotkeys::key_down(VK_ESCAPE) ? 1 : 0;   // PP3
         if (esc != 0 && esc_prev == 0)
+        {
+            g_self_toggle.store(true, std::memory_order_relaxed);   // HX1: ours, not a mirrored key
             runtime->open_overlay(false, reshade::api::input_source::keyboard);
+            g_self_toggle.store(false, std::memory_order_relaxed);
+        }
         esc_prev = esc;
 
         why = scaled ? "fed (pointer on the scaled picture)" : hooked ? "fed (mouse hook, game window)" : from_game ? "fed (game runtime io)" : "fed (desktop fallback)";
@@ -322,6 +336,10 @@ void feed_input(reshade::api::effect_runtime *runtime)
 // while its tab is selected. Registered only with PanelOverPicture=1 (attach).
 void on_reshade_overlay(reshade::api::effect_runtime *runtime)
 {
+    {   // TH2: with PanelTheme=2 every runtime's ReShade overlay gets the mod's colours
+        static const int th = mgpu::gpu1::ui_ini_read("PanelTheme", 2);
+        if (th == 2) mgpu::theme::apply_global();
+    }
     feed_input(runtime);
 
     // UX1: the panel in its own window on the host runtime, while it is up.
@@ -329,8 +347,34 @@ void on_reshade_overlay(reshade::api::effect_runtime *runtime)
     // GPU 1 runtime that tab is neither selected nor sized when the overlay
     // opens - it opened on Home, narrow, every time. This window is opened
     // focused, wide on first use and never narrower than the panel needs.
-    if (g_drawer != nullptr && g_live.load(std::memory_order_relaxed) != 0 && is_host((void *)runtime))
+    // PW1: also on the picture's runtime while BT5 has the overlay open there.
+    const bool pic = runtime != nullptr && (void *)runtime == g_pic_rt.load(std::memory_order_relaxed);
+    // PO1: plain mode - the panel shown on this runtime with ReShade's menu closed.
+    const bool po = runtime != nullptr && (void *)runtime == g_po_rt.load(std::memory_order_relaxed);
+    const bool live_host = g_live.load(std::memory_order_relaxed) != 0 && is_host((void *)runtime);
+    if (g_drawer != nullptr && (live_host || pic || po))
     {
+        if (g_po_up.load(std::memory_order_relaxed))
+        {
+            mgpu::hotkeys::panel_escape_alive();   // PO3: Esc is ours while this is drawn
+            // PO1: ReShade's menu is closed, so ReShade neither draws its
+            // pointer nor blocks the game: do both for as long as the panel is
+            // drawn (the live host's feed and BT5's game-chain block already
+            // do this for their modes; doing it again is harmless).
+            if (!live_host)
+            {
+                ImGui::GetIO().MouseDrawCursor = true;
+                if (po) runtime->block_input_next_frame();
+                // ESC closes it (edge, from the keyboard hook - the picture
+                // window never has the keyboard focus). The live host's feed
+                // has its own ESC.
+                static int esc_prev = 0;
+                const int esc = mgpu::hotkeys::key_down(VK_ESCAPE) ? 1 : 0;
+                // Not while a hotkey is being captured: there Esc cancels the capture.
+                if (esc != 0 && esc_prev == 0 && g_po_closer != nullptr && mgpu::hotkeys::capturing() < 0) g_po_closer();
+                esc_prev = esc;
+            }
+        }
         const float fs = ImGui::GetFontSize();
         const ImGuiIO &io = ImGui::GetIO();
         const float dw = (io.DisplaySize.x > 0.0f) ? io.DisplaySize.x : 1920.0f;
@@ -341,6 +385,15 @@ void on_reshade_overlay(reshade::api::effect_runtime *runtime)
         // left, so the two no longer stack on top of each other.
         ImGui::SetNextWindowPos(ImVec2(dw - fs * 1.5f, fs * 3.0f), ImGuiCond_FirstUseEver, ImVec2(1.0f, 0.0f));
         ImGui::SetNextWindowSize(ImVec2(want_w, dh * 0.82f), ImGuiCond_FirstUseEver);
+        // PO1: shown on its own, the panel opens full height on the right, at
+        // the width it was last left at.
+        static float po_w = 0.0f;
+        const bool po_full = g_po_up.load(std::memory_order_relaxed);
+        if (po_full)
+        {
+            ImGui::SetNextWindowPos(ImVec2(dw - fs * 0.6f, fs * 0.6f), ImGuiCond_Appearing, ImVec2(1.0f, 0.0f));
+            ImGui::SetNextWindowSize(ImVec2(po_w > min_w ? po_w : want_w, dh - fs * 1.2f), ImGuiCond_Appearing);
+        }
         ImGui::SetNextWindowSizeConstraints(ImVec2(min_w, fs * 16.0f), ImVec2(FLT_MAX, FLT_MAX), nullptr, nullptr);
         if (g_focus_req.load(std::memory_order_relaxed) > 0)
         {
@@ -349,12 +402,19 @@ void on_reshade_overlay(reshade::api::effect_runtime *runtime)
         }
         t_own = true;
         g_own_ms.store(GetTickCount64(), std::memory_order_relaxed);
+        // TH1: the window frame in the panel's colours too (PanelTheme=0 keeps ReShade's).
+        static const int theme = mgpu::gpu1::ui_ini_read("PanelTheme", 2);
+        const int tn = (theme != 0) ? mgpu::theme::push_window() : 0;
         if (ImGui::Begin("Atomic MGPU Bridge###mgpu_panel_own", nullptr, ImGuiWindowFlags_NoDocking))
         {
-            wheel_here();   // WH1 (an open combo list takes it instead: it is the hovered window)
+            // WH1 (an open combo list takes it instead: it is the hovered window).
+            // TH1: themed, the panel scrolls inside its child window, which calls it.
+            if (tn == 0) wheel_here();
+            if (po_full) po_w = ImGui::GetWindowSize().x;   // PO1
             g_drawer(runtime);
         }
         ImGui::End();
+        if (tn != 0) ImGui::PopStyleColor(tn);
         g_wheel_pend = 0.0f;
         t_own = false;
     }
@@ -364,6 +424,22 @@ void on_reshade_overlay(reshade::api::effect_runtime *runtime)
     // present, even though its overlay is refused.
     if ((void *)runtime == g_game.load(std::memory_order_relaxed))
     {
+        // PO2: Shift+Home (Shift + ReShade's overlay key) opens ReShade's menu.
+        // Edge of the key while Shift is held, from the keyboard hook, only
+        // with the game (or the picture) in front. Not when ReShade's own key
+        // is already a Shift combination - ReShade handles that one itself.
+        if (g_po_shift != nullptr && panel_only() && !mgpu::hotkeys::overlay_key_has_shift())
+        {
+            static int prev = 0;
+            const int vk = mgpu::hotkeys::overlay_vk();
+            const int down = (vk > 0 && mgpu::hotkeys::key_down(vk)) ? 1 : 0;
+            if (down != 0 && prev == 0 && mgpu::hotkeys::key_down(VK_SHIFT) &&
+                !mgpu::hotkeys::key_down(VK_CONTROL) && !mgpu::hotkeys::key_down(VK_MENU) &&
+                mgpu::hotkeys::in_front())
+                g_po_shift(runtime);
+            prev = down;
+        }
+        if (g_po_tick != nullptr && panel_only()) g_po_tick(runtime);   // PO4
         ImGuiIO &gio = ImGui::GetIO();
         const float x = gio.MousePos.x, y = gio.MousePos.y;
         const float dw = gio.DisplaySize.x, dh = gio.DisplaySize.y;
@@ -472,6 +548,11 @@ void runtime_destroyed(reshade::api::effect_runtime *runtime)
     void *r = runtime;
     if (g_windowless.load(std::memory_order_relaxed) == r)
         g_windowless.store(nullptr, std::memory_order_relaxed);   // re-recorded by note_runtime
+    if (g_po_rt.load(std::memory_order_relaxed) == r)   // PO1: never drawn on a runtime that is going away
+    {
+        g_po_rt.store(nullptr, std::memory_order_relaxed);
+        g_po_up.store(false, std::memory_order_relaxed);
+    }
     if (g_host.load(std::memory_order_relaxed) == r)
     {
         g_host.store(nullptr, std::memory_order_relaxed);
@@ -514,6 +595,48 @@ bool is_host(void *runtime)
     return runtime == g_host.load(std::memory_order_relaxed) ||
            runtime == g_windowless.load(std::memory_order_relaxed);
 }
+
+void set_picture_panel(void *runtime, bool open)
+{
+    if (!on()) return;
+    if (open && runtime != nullptr)
+    {
+        if (g_pic_rt.exchange(runtime, std::memory_order_relaxed) != runtime)
+            g_focus_req.store(3, std::memory_order_relaxed);   // opened focused, like UX1
+    }
+    else if (runtime == nullptr || g_pic_rt.load(std::memory_order_relaxed) == runtime)
+        g_pic_rt.store(nullptr, std::memory_order_relaxed);
+}
+
+bool panel_only()
+{
+    int v = g_po_on.load(std::memory_order_relaxed);
+    if (v < 0) { v = mgpu::gpu1::ui_ini_read("PanelOnly", 1) != 0 ? 1 : 0; g_po_on.store(v); }
+    return v == 1 && on();
+}
+void po_set(void *runtime, bool open)
+{
+    if (open && runtime != nullptr)
+    {
+        if (g_po_rt.exchange(runtime, std::memory_order_relaxed) != runtime)
+            g_focus_req.store(3, std::memory_order_relaxed);
+    }
+    else if (runtime == nullptr || g_po_rt.load(std::memory_order_relaxed) == runtime)
+        g_po_rt.store(nullptr, std::memory_order_relaxed);
+}
+void *po_runtime() { return g_po_rt.load(std::memory_order_relaxed); }
+bool self_toggle() { return g_self_toggle.load(std::memory_order_relaxed); }
+void po_mark(bool up)
+{
+    g_po_up.store(up, std::memory_order_relaxed);
+    if (up) mgpu::hotkeys::rehook_keyboard();   // KS2: arrows, Esc and Shift+Home come from it
+}
+bool po_up() { return g_po_up.load(std::memory_order_relaxed); }
+void set_po_closer(void (*fn)()) { g_po_closer = fn; }
+void set_po_shift(void (*fn)(reshade::api::effect_runtime *)) { g_po_shift = fn; }
+void set_po_tick(void (*fn)(reshade::api::effect_runtime *)) { g_po_tick = fn; }
+void po_allow_reshade_once() { g_po_allow.store(true, std::memory_order_relaxed); }
+bool po_take_allow() { return g_po_allow.exchange(false, std::memory_order_relaxed); }
 
 void note_opened_on(void *runtime, bool open)
 {

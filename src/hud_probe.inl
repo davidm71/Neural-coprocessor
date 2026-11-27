@@ -1025,7 +1025,8 @@ void summary()
                       g_frame ? (double)g_t[i].bars.load(std::memory_order_relaxed) / (double)g_frame : 0.0,
                       so, sn);
     }
-    snprintf(l + w, sizeof l - (size_t)w, "(%u live). CTRL+ALT+J captures one frame.", live);
+    snprintf(l + w, sizeof l - (size_t)w, "(%u live). %s captures one frame.", live,
+             mgpu::hotkeys::name_now(mgpu::hotkeys::A_HUDPROBE));   // HK15
     mgpu::diag::info(l);
 }
 
@@ -1055,7 +1056,7 @@ void start()
         mgpu::diag::info("[MGPU][HL1] HudLess=1: looking for the game's HUD-less scene texture. "
                          "Expect a LOCKED line within a few seconds of gameplay.");
     if (probe_on) mgpu::diag::info("[MGPU][HUD1] " HUD_BUILD " HUD-less frame search ON (HudProbe=1). Catalogues display-resolution "
-                     "colour textures; CTRL+ALT+J (or the panel button) saves one frame's worth of them as images to "
+                     "colour textures; its hotkey (panel: Hotkeys) or the panel button saves one frame's worth of them as images to "
                      "mgpu\\hudprobe. Costs a table lookup per barrier while on. Set HudProbe=0 when done.");
 }
 

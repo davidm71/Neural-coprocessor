@@ -1,6 +1,7 @@
 // ---------------------------------------------------------------------------
 // hotkeys.cpp - HK1. See hotkeys.hpp.
 // ---------------------------------------------------------------------------
+#include "pinthread.hpp"   // TL2
 #include "hotkeys.hpp"
 
 #include <windows.h>
@@ -36,11 +37,16 @@ const def DEFS[A_COUNT] = {
     { "Arm / transit probe",       "HotkeyArm",        { M_CTRL | M_ALT, VK_F10 },        false },
     { "Hide/show bridge (overlay)", "HotkeyPeek",      { M_CTRL | M_ALT, VK_F6 },         false },
     { "View: output/input/split",  "HotkeyView",       { M_CTRL | M_ALT, VK_F7 },         false },
-    { "Intensity: select pass",    "HotkeyIntPass",    { M_CTRL | M_ALT, VK_END },        false },
-    { "Intensity down",            "HotkeyIntDown",    { M_CTRL | M_ALT, VK_NEXT },       true  },
-    { "Intensity up",              "HotkeyIntUp",      { M_CTRL | M_ALT, VK_PRIOR },      true  },
-    { "Split seam left (+SHIFT)",  "HotkeySeamLeft",   { M_CTRL | M_ALT, VK_OEM_COMMA },  true  },
-    { "Split seam right (+SHIFT)", "HotkeySeamRight",  { M_CTRL | M_ALT, VK_OEM_PERIOD }, true  },
+    // HK11 (IN76): these five were END, PAGE DOWN, PAGE UP, comma and period -
+    // outside HK10's Ctrl/Alt + A-Z/F1-F12 rule. Adjacent F-keys keep the pairs.
+    // HK15 (IN79): F8 / F11 / F12 (IN76-78) were already registered by another
+    // program on the user's PC (HK1: "ALSO USED BY ANOTHER PROGRAM"). F1/F2 sit
+    // beside the seam keys F3/F4; F5 starts the next group.
+    { "Intensity: select pass",    "HotkeyIntPass",    { M_CTRL | M_ALT, VK_F5 },         false },
+    { "Intensity down",            "HotkeyIntDown",    { M_CTRL | M_ALT, VK_F1 },         true  },
+    { "Intensity up",              "HotkeyIntUp",      { M_CTRL | M_ALT, VK_F2 },         true  },
+    { "Split seam left (+SHIFT)",  "HotkeySeamLeft",   { M_CTRL | M_ALT, VK_F3 },         true  },
+    { "Split seam right (+SHIFT)", "HotkeySeamRight",  { M_CTRL | M_ALT, VK_F4 },         true  },
     { "FPS HUD",                   "HotkeyHud",        { M_CTRL | M_ALT, 'H' },           false },
     { "Frame generation on/off",   "HotkeyFrameGen",   { M_CTRL | M_ALT, 'G' },           false },
     { "HUD-less capture (probe)",  "HotkeyHudProbe",   { M_CTRL | M_ALT, 'J' },           false },
@@ -93,20 +99,39 @@ std::atomic<unsigned long long> g_hk_t[256] = {};
 // ever. A held key auto-repeats every few dozen ms after the first ~0.25-1 s,
 // so a key not seen going down for over 1.5 s is taken as released. Modifiers
 // do not repeat while another key is pressed, so they are checked as before.
+// KS4: the key's physical state WITHOUT ReShade's filter. ReShade hooks
+// user32!GetAsyncKeyState and answers 0 for every key while it blocks the
+// game's keyboard - which it does the whole time the MGPU panel is up. So
+// when the hook below misses a key (IN72, RoboCop: slider picked for 43 s, the
+// hook saw no arrow press at all), the old fallback could not see it either.
+// win32u!NtUserGetAsyncKeyState is the system call user32's function wraps;
+// ReShade does not hook it. Falls back to GetAsyncKeyState if absent.
+static SHORT raw_async(int vk)
+{
+    using fn_t = SHORT (WINAPI *)(int);
+    static fn_t fn = []() -> fn_t {
+        HMODULE m = GetModuleHandleW(L"win32u.dll");
+        if (m == nullptr) m = LoadLibraryW(L"win32u.dll");
+        fn_t f = m ? reinterpret_cast<fn_t>(GetProcAddress(m, "NtUserGetAsyncKeyState")) : nullptr;
+        return f != nullptr ? f : &GetAsyncKeyState;
+    }();
+    return fn(vk);
+}
+
 bool cap_key(int vk)
 {
     if (vk <= 0 || vk >= 256) return false;
     if (g_hk_down[vk].load(std::memory_order_relaxed) &&
         GetTickCount64() - g_hk_t[vk].load(std::memory_order_relaxed) < 1500ull)
         return true;
-    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+    return (raw_async(vk) & 0x8000) != 0;   // KS4
 }
 
 bool key(int vk)
 {
     if (vk > 0 && vk < 256 && g_swallowed[vk].load(std::memory_order_relaxed)) return true;
     if (vk > 0 && vk < 256 && g_hk_down[vk].load(std::memory_order_relaxed)) return true;
-    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+    return (raw_async(vk) & 0x8000) != 0;   // KS4: not ReShade's frozen answer
 }
 
 unsigned char mods_now()
@@ -228,9 +253,19 @@ void recheck_locked(bool log)
     if (bad != 0) mgpu::diag::warn(line); else mgpu::diag::info(line);
 }
 
+// HK12: every change of a binding - a new selection, a reset, a repair at
+// start - is written into mgpu.ini at once (the line is replaced in place;
+// later copies of it are dropped). It used to wait in the 400 ms write queue,
+// which a game closed hard in that moment would lose.
 void save(unsigned a)
 {
-    (void)mgpu::gpu1::ui_ini_write(DEFS[a].key, encode(g_bind[a]));
+    if (!mgpu::gpu1::ui_ini_write_now(DEFS[a].key, encode(g_bind[a])))
+    {
+        char l[160];
+        snprintf(l, sizeof l, "[MGPU][HK12] could not write %s to mgpu.ini - the change holds for this session only.",
+                 DEFS[a].key);
+        mgpu::diag::warn(l);
+    }
 }
 
 bool match(const binding &b, unsigned char m, bool allow_shift)
@@ -270,7 +305,10 @@ bool own_foreground()
 // front, and never injected keys (input replay).
 HHOOK g_kbhook = nullptr;
 std::atomic<DWORD> g_kb_tid{0};
-std::thread *g_kb_thread = nullptr;
+std::atomic<unsigned> g_arrow[3];   // KS3: LEFT, RIGHT (no CTRL/ALT), any arrow
+std::atomic<unsigned long long> g_esc_until{0};   // PO3: the panel was drawn - Esc is ours until then
+std::atomic<unsigned long long> g_hk_any_t[256];  // HK14: last key-down the hook saw (injected too)
+bool g_kb_started = false;   // TL2: the pinned hook thread was started
 binding g_guard[A_COUNT] = {};        // copy of the bindings the hook reads
 std::atomic<unsigned> g_guard_n{0};
 std::mutex g_guard_mx;
@@ -292,6 +330,17 @@ LRESULT CALLBACK kb_proc(int code, WPARAM wp, LPARAM lp)
         const DWORD vk = k->vkCode;
         const bool up = (k->flags & LLKHF_UP) != 0;
         const bool inj = (k->flags & LLKHF_INJECTED) != 0;
+        // KS3: count arrow presses (injected ones too - some keyboard software
+        // sends every key that way). A count cannot get stuck the way a held
+        // state can when a release is missed. With CTRL/ALT they belong to the
+        // split-view hotkeys and only count as "any".
+        if (!up && vk < 256) g_hk_any_t[vk].store(GetTickCount64(), std::memory_order_relaxed);   // HK14
+        if (!up && (vk == VK_LEFT || vk == VK_RIGHT))
+        {
+            g_arrow[2].fetch_add(1, std::memory_order_relaxed);
+            if (!g_hk_down[VK_CONTROL].load(std::memory_order_relaxed) && !g_hk_down[VK_MENU].load(std::memory_order_relaxed))
+                g_arrow[vk == VK_RIGHT ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+        }
         // HK7: while a hotkey is being captured, keys marked "injected" count too.
         // Some keyboard software (remappers, macro tools, Steam Input) sends every
         // key that way, and the hook used to ignore them - the capture then saw
@@ -320,6 +369,13 @@ LRESULT CALLBACK kb_proc(int code, WPARAM wp, LPARAM lp)
             if (up && g_swallowed[vk].load(std::memory_order_relaxed))
             {
                 g_swallowed[vk].store(false, std::memory_order_relaxed);
+                return 1;
+            }
+            // PO3: the Esc that closes the panel never reaches the game (key()
+            // still reads it as down through g_swallowed until it is released).
+            if (!up && vk == VK_ESCAPE && GetTickCount64() < g_esc_until.load(std::memory_order_relaxed) && own_foreground())
+            {
+                g_swallowed[vk].store(true, std::memory_order_relaxed);
                 return 1;
             }
             if (!up && g_cap.load() < 0 && own_foreground())
@@ -366,6 +422,8 @@ std::atomic<unsigned> g_ms_btn{0};
 const UINT WM_MS_ON  = WM_APP + 0x31;
 const UINT WM_MS_OFF = WM_APP + 0x32;
 const UINT WM_KB_REHOOK = WM_APP + 0x33;   // HK8
+const UINT WM_KB_PING = WM_APP + 0x35;     // HK14: is the hook thread answering?
+std::atomic<unsigned long long> g_kb_pong{0};   // HK14: tick of the last ping it answered
 
 // SV3: real input only, for the screen saver. Windows' own idle timer
 // (GetLastInputInfo) was reset every 45-65 s with nobody at the PC (2026-11-07):
@@ -444,6 +502,11 @@ void kb_main()
     }
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
     {
+        if (msg.hwnd == nullptr && msg.message == WM_KB_PING)   // HK14
+        {
+            g_kb_pong.store((unsigned long long)msg.wParam, std::memory_order_relaxed);
+            continue;
+        }
         // HK8: put the keyboard hook back. Windows removes a low-level hook
         // without telling anyone when it is slow to answer a few times.
         // Re-installed when the panel opens and when a capture starts.
@@ -494,6 +557,10 @@ void emergency_unhook()
 {
     if (g_kbhook) { UnhookWindowsHookEx(g_kbhook); g_kbhook = nullptr; }
     if (g_mshook) { UnhookWindowsHookEx(g_mshook); g_mshook = nullptr; }
+    if (g_acthook) { UnhookWindowsHookEx(g_acthook); g_acthook = nullptr; }   // TL2: SV3's hook too
+    // TL2: and let the (pinned) thread leave its message loop and drop its
+    // reference on the add-on.
+    if (const DWORD t = g_kb_tid.load()) PostThreadMessageW(t, WM_QUIT, 0, 0);
 }
 
 // PP3
@@ -512,6 +579,8 @@ bool panel_mouse_get(int *x, int *y, unsigned *btn, int *wheel)
     return true;
 }
 bool key_down(int vk) { return key(vk); }
+// KS4: public (outside the anonymous namespace - IN73 left it inside: LNK2019).
+bool raw_key(int vk) { return vk > 0 && vk < 256 && (raw_async(vk) & 0x8000) != 0; }
 bool real_input_ages(unsigned long long &key_ms, unsigned long long &mouse_ms)   // SV3
 {
     if (!g_act_hooked.load(std::memory_order_relaxed)) return false;
@@ -541,7 +610,21 @@ void read_overlay_key()
     g_overlay.mods = (unsigned char)((c ? M_CTRL : 0) | (al ? M_ALT : 0) | (s ? M_SHIFT : 0));
 }
 bool is_overlay(const binding &b) { return b.vk == g_overlay.vk && b.mods == g_overlay.mods; }
+bool overlay_key_has_shift() { return (g_overlay.mods & M_SHIFT) != 0; }
+int overlay_vk() { return g_overlay.vk; }
+void panel_escape_alive() { g_esc_until.store(GetTickCount64() + 250ull, std::memory_order_relaxed); }
+void arrow_counts(unsigned out[3]) { for (int i = 0; i < 3; ++i) out[i] = g_arrow[i].load(std::memory_order_relaxed); }
+void rehook_keyboard() { if (const DWORD t = g_kb_tid.load()) PostThreadMessageW(t, WM_KB_REHOOK, 0, 0); }
+bool kb_hook_state(unsigned long long &last_key_ms)
+{
+    const unsigned long long k = g_act_key.load(std::memory_order_relaxed);
+    last_key_ms = k ? GetTickCount64() - k : ~0ull;
+    return g_kbhook != nullptr;
+}
+bool in_front() { return own_foreground(); }
 
+static bool hk_key_ok(int vk);   // HK10, below
+bool fixed(unsigned a) { return a == A_TRANSIT || a == A_PEEK; }   // HK13
 void init()
 {
     std::lock_guard<std::mutex> lk(g_mx);
@@ -560,16 +643,153 @@ void init()
             mgpu::diag::warn(l);
         }
     }
+    // HK13: the fixed two are always their defaults (a value an earlier build
+    // saved for them is put back, in mgpu.ini too).
+    for (unsigned a = 0; a < A_COUNT; ++a)
+    {
+        if (!fixed(a)) continue;
+        if (g_bind[a].vk == DEFS[a].dflt.vk && g_bind[a].mods == DEFS[a].dflt.mods) continue;
+        char was[48], nm[48], l[220];
+        bind_name(g_bind[a], was, sizeof was);
+        g_bind[a] = DEFS[a].dflt;
+        save(a);
+        bind_name(g_bind[a], nm, sizeof nm);
+        snprintf(l, sizeof l, "[MGPU][HK13] %s is fixed at %s (was %s).", DEFS[a].label, nm, was);
+        mgpu::diag::warn(l);
+    }
+    // HK15: a binding still on one of this action's EARLIER defaults moves to
+    // the current default (if free) - nobody picks an old default on purpose.
+    {
+        struct old_def { unsigned a; binding b; };
+        static const old_def OLD[] = {
+            { A_INT_TARGET, { M_CTRL | M_ALT, VK_END } },  { A_INT_TARGET, { M_CTRL | M_ALT, VK_F8 } },
+            { A_INT_DOWN,   { M_CTRL | M_ALT, VK_NEXT } }, { A_INT_DOWN,   { M_CTRL | M_ALT, VK_F11 } },
+            { A_INT_UP,     { M_CTRL | M_ALT, VK_PRIOR } },{ A_INT_UP,     { M_CTRL | M_ALT, VK_F12 } },
+            { A_SEAM_L,     { M_CTRL | M_ALT, VK_OEM_COMMA } }, { A_SEAM_R, { M_CTRL | M_ALT, VK_OEM_PERIOD } },
+        };
+        for (const old_def &o : OLD)
+        {
+            binding &cb = g_bind[o.a];
+            if (cb.vk != o.b.vk || cb.mods != o.b.mods) continue;
+            bool free = true;
+            for (unsigned k = 0; k < A_COUNT; ++k)
+                if (k != o.a && g_bind[k].vk == DEFS[o.a].dflt.vk && g_bind[k].mods == DEFS[o.a].dflt.mods) free = false;
+            if (!free) continue;
+            char was[48], nm[48], l[220];
+            bind_name(cb, was, sizeof was);
+            cb = DEFS[o.a].dflt;
+            save(o.a);
+            bind_name(cb, nm, sizeof nm);
+            snprintf(l, sizeof l, "[MGPU][HK15] %s was on an earlier default, %s - now %s.", DEFS[o.a].label, was, nm);
+            mgpu::diag::warn(l);
+        }
+    }
+    // HK11: a binding saved by an earlier build outside the HK10 rule (Ctrl
+    // and/or Alt, no Shift, A-Z or F1-F12 - e.g. the old END / PAGE UP / comma
+    // defaults) goes to its default, if that is free; otherwise it stays.
+    for (unsigned a = 0; a < A_COUNT; ++a)
+    {
+        const binding &cb = g_bind[a];
+        const bool ok = hk_key_ok(cb.vk) && (cb.mods & (M_CTRL | M_ALT)) != 0 && (cb.mods & M_SHIFT) == 0;
+        if (ok) continue;
+        bool free = true;
+        for (unsigned k = 0; k < A_COUNT; ++k)
+            if (k != a && g_bind[k].vk == DEFS[a].dflt.vk && g_bind[k].mods == DEFS[a].dflt.mods) free = false;
+        if (!free) continue;
+        char was[48], nm[48], l[260];
+        bind_name(g_bind[a], was, sizeof was);
+        g_bind[a] = DEFS[a].dflt;
+        save(a);
+        bind_name(g_bind[a], nm, sizeof nm);
+        snprintf(l, sizeof l, "[MGPU][HK10] %s was %s, outside Ctrl/Alt + A-Z/F1-F12 - now %s.", DEFS[a].label, was, nm);
+        mgpu::diag::warn(l);
+    }
+    // HK10: duplicates saved by earlier builds (which took them): of each pair,
+    // the action that is NOT on its default goes back to its default, if that
+    // is free; otherwise it stays and is flagged as before.
+    for (unsigned a = 0; a < A_COUNT; ++a)
+        for (unsigned b = 0; b < A_COUNT; ++b)
+        {
+            if (b == a || g_bind[b].vk != g_bind[a].vk || g_bind[b].mods != g_bind[a].mods) continue;
+            const bool a_def = g_bind[a].vk == DEFS[a].dflt.vk && g_bind[a].mods == DEFS[a].dflt.mods;
+            if (a_def) continue;   // a keeps it; b is handled on its own turn
+            bool free = true;
+            for (unsigned k = 0; k < A_COUNT; ++k)
+                if (k != a && g_bind[k].vk == DEFS[a].dflt.vk && g_bind[k].mods == DEFS[a].dflt.mods) free = false;
+            if (!free) continue;
+            char was[48], nm[48], l[260];
+            bind_name(g_bind[a], was, sizeof was);
+            g_bind[a] = DEFS[a].dflt;
+            save(a);
+            bind_name(g_bind[a], nm, sizeof nm);
+            snprintf(l, sizeof l, "[MGPU][HK10] %s had %s, which \"%s\" also uses - back to its default %s.",
+                     DEFS[a].label, was, DEFS[b].label, nm);
+            mgpu::diag::warn(l);
+            break;
+        }
     g_inited = true;
     recheck_locked(true);
     guard_refresh_locked();   // HK2
-    if (g_kb_thread == nullptr)
+    if (!g_kb_started)
     {
-        g_kb_thread = new std::thread(kb_main);   // lives for the process; DllMain unhooks on unload
-        g_kb_thread->detach();
+        // TL2: pinned. It lives for the process and sits in GetMessage inside
+        // our code; a detached std::thread let ReShade unload the add-on
+        // under it. Pinned, the add-on stays loaded until the thread ends
+        // (process exit), and emergency_unhook's WM_QUIT lets it end cleanly.
+        g_kb_started = mgpu::start_pinned_thread([] { kb_main(); });
         mgpu::diag::info("[MGPU][HK2] hotkey keys are kept from the game (a CTRL/ALT combination of ours "
                          "never reaches it).");
     }
+}
+
+// ---- HK10: WHAT A HOTKEY MAY BE ----
+// REPORTED 2026-11-22 (IN74): a combination already used by another action was
+// taken anyway (flagged DUPLICATE, both then fired). Asked for: refuse it, and
+// allow only Ctrl and/or Alt with A-Z or F1-F12. Shift is not allowed (the
+// split-view seam keys add it themselves for the coarse step). Every capture
+// path - typed (hook or panel) and the mouse picker - goes through here.
+static bool hk_key_ok(int vk) { return (vk >= 'A' && vk <= 'Z') || (vk >= VK_F1 && vk <= VK_F12); }
+static char g_refuse[200] = "";                        // the last refusal, for the panel
+static std::atomic<unsigned long long> g_refuse_t{0};
+// nullptr = may be bound to `cap`; otherwise why not. Caller holds g_mx.
+static const char *refuse_locked(int cap, unsigned char mods, int vk, char *buf, size_t n)
+{
+    if (!hk_key_ok(vk)) return "only A-Z or F1-F12 can be a hotkey's key";
+    if ((mods & (M_CTRL | M_ALT)) == 0) return "a hotkey needs Ctrl and/or Alt";
+    if ((mods & M_SHIFT) != 0) return "Shift is not allowed in a hotkey";
+    if (is_overlay(binding{ mods, (unsigned char)vk })) return "that is ReShade's panel key";
+    for (unsigned a = 0; a < A_COUNT; ++a)
+        if ((int)a != cap && g_bind[a].vk == (unsigned char)vk && g_bind[a].mods == mods)
+        {
+            snprintf(buf, n, fixed(a) ? "reserved for \"%s\" (fixed)" : "already used by \"%s\"", DEFS[a].label);
+            return buf;
+        }
+    return nullptr;
+}
+// Says why (log at most every 3 s, panel text always) and returns true when refused.
+static bool refuse_capture(int cap, unsigned char mods, int vk)
+{
+    char buf[120];
+    const char *why;
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        why = refuse_locked(cap, mods, vk, buf, sizeof buf);
+        if (why == nullptr) return false;
+        char nm[48];
+        bind_name(binding{ mods, (unsigned char)vk }, nm, sizeof nm);
+        snprintf(g_refuse, sizeof g_refuse, "%s not taken: %s.", nm, why);
+    }
+    const unsigned long long now = GetTickCount64();
+    static std::atomic<unsigned long long> said{0};   // IN81: the hook path and the panel path both get here
+    unsigned long long was = said.load(std::memory_order_relaxed);
+    if ((was == 0 || now - was > 3000) && said.compare_exchange_strong(was, now))
+    {
+        char l[260];
+        snprintf(l, sizeof l, "[MGPU][HK10] %s The capture keeps waiting for another combination.", g_refuse);
+        mgpu::diag::warn(l);
+    }
+    g_refuse_t.store(now, std::memory_order_relaxed);
+    return true;
 }
 
 // HK7: the one place a captured combination becomes a binding.
@@ -592,6 +812,76 @@ void commit_capture(int cap, unsigned char mods, int vk, const char *src)
     snprintf(l, sizeof l, "[MGPU][HK1] %s is now %s (saved to mgpu.ini; seen by the %s).", DEFS[cap].label, nm, src);
     mgpu::diag::info(l);
     g_recheck.store(true);
+}
+
+// ---- HK14: IS THE KEYBOARD HOOK GETTING THE KEYS? ----
+// REPORTED 2026-11-22: CTRL+ALT+H reached the game, although HK2 keeps our
+// combinations from it - and that works only through the hook. The same day
+// (IN72) the hook saw no key at all for 70 s while the panel was up. So: for
+// the keys the mod uses, compare the key's real state (raw_async, past
+// ReShade's filter) with what the hook saw. A key that went down without the
+// hook seeing it since the last look is a MISS: said (first 8, with whether the
+// panel was up and when the hook thread last answered), and the hook is put
+// back (at most once a second). Every 2 s the hook thread is pinged, so a
+// thread that stopped answering is told apart from a hook Windows dropped.
+static void hook_watch()
+{
+    static const unsigned char keys[] = {
+        'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+        VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
+        VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_ESCAPE, VK_HOME };
+    static bool prev[256] = {};
+    static unsigned said = 0, misses = 0;
+    static unsigned long long last_rehook = 0, ping_t = 0, said_thread = 0, last_watch = 0;
+    const unsigned long long now = GetTickCount64();
+    // The key went down since the last look; the hook, called before Windows
+    // updates the key state, must have seen it after that look (50 ms slack).
+    // A stalled loop therefore cannot make a press look like a miss.
+    const unsigned long long since = last_watch > 50 ? last_watch - 50 : 0;
+    const bool first = (last_watch == 0);
+    last_watch = now;
+    const DWORD tid = g_kb_tid.load();
+    if (tid != 0 && now - ping_t >= 2000)
+    {
+        ping_t = now;
+        PostThreadMessageW(tid, WM_KB_PING, (WPARAM)now, 0);
+    }
+    const unsigned long long pong = g_kb_pong.load(std::memory_order_relaxed);
+    const bool thread_late = ping_t != 0 && pong + 3000 < ping_t && now - ping_t > 1000;
+    if (thread_late && (said_thread == 0 || now - said_thread > 30000))
+    {
+        said_thread = now;
+        char l[200];
+        snprintf(l, sizeof l, "[MGPU][HK14] the keyboard hook's thread has not answered for %llu ms - it is stuck, "
+                 "so the hook gets no keys.", pong ? now - pong : now - ping_t);
+        mgpu::diag::warn(l);
+    }
+    for (unsigned char vk : keys)
+    {
+        const bool d = (raw_async(vk) & 0x8000) != 0;
+        if (!first && d && !prev[vk] && !g_swallowed[vk].load(std::memory_order_relaxed) &&
+            g_hk_any_t[vk].load(std::memory_order_relaxed) < since)
+        {
+            ++misses;
+            if (said < 8)
+            {
+                ++said;
+                char nm[32], l[300];
+                key_name(vk, nm, sizeof nm);
+                snprintf(l, sizeof l, "[MGPU][HK14] the keyboard hook MISSED %s (Windows saw it go down, the hook did not; "
+                         "%u so far) - MGPU panel up: %s, hook thread last answered %llu ms ago. Re-installing the hook.",
+                         nm, misses, now < g_esc_until.load(std::memory_order_relaxed) + 500 ? "yes" : "no",
+                         pong ? now - pong : 0ull);
+                mgpu::diag::warn(l);
+            }
+            if (tid != 0 && now - last_rehook >= 1000)
+            {
+                last_rehook = now;
+                PostThreadMessageW(tid, WM_KB_REHOOK, 0, 0);
+            }
+        }
+        prev[vk] = d;
+    }
 }
 
 bool poll(presses &out)
@@ -641,6 +931,7 @@ bool poll(presses &out)
         g_down_coarse[0] = g_down_coarse[1] = false;
         return false;
     }
+    hook_watch();   // HK14: only with the game / bridge in front
 
     // ---- capture: the next combination pressed becomes the binding ----
     const int cap = g_cap.load();
@@ -667,18 +958,15 @@ bool poll(presses &out)
         }
         if (hit == 0) return false;
         if (hit == VK_ESCAPE) { g_cap.store(-1); return false; }
-        // HK4/HK5: ReShade's overlay key (it opens and closes this panel) is never a binding.
-        if (is_overlay(binding{ mods_now(), (unsigned char)hit }))
+        // HK4/HK5/HK10: ReShade's panel key, a combination in use, or one
+        // outside Ctrl/Alt + A-Z/F1-F12 is never a binding. Refused: wait for
+        // every key to be released, then capture again.
+        if (refuse_capture(cap, mods_now(), hit))
         {
-            static ULONGLONG said_ov = 0;   // HK6: say so, at most every 5 s
-            if (said_ov == 0 || GetTickCount64() - said_ov > 5000)
-            {
-                said_ov = GetTickCount64();
-                mgpu::diag::warn("[MGPU][HK6] that combination is ReShade's panel key - not taken. Select another below the list.");
-            }
+            g_cap_armed = false;
             return false;
         }
-        commit_capture(cap, mods_now(), hit, "keyboard hook");
+        commit_capture(cap, mods_now(), hit, "keyboard");   // IN81: the hook or the key state
         g_recheck.store(true);
         return false;
     }
@@ -716,6 +1004,14 @@ bool poll(presses &out)
 }
 
 unsigned count() { return A_COUNT; }
+const char *name_now(unsigned a)
+{
+    static thread_local char ring[8][48];
+    static thread_local unsigned i = 0;
+    char *b = ring[i++ & 7u];
+    name(a, b, 48);
+    return b;
+}
 
 const char *label(unsigned a) { return (a < A_COUNT) ? DEFS[a].label : ""; }
 
@@ -736,12 +1032,13 @@ int conflict(unsigned a)
 
 void begin_capture(unsigned a)
 {
-    if (a >= A_COUNT) return;
+    if (a >= A_COUNT || fixed(a)) return;   // HK13
     // HK6: start from a clean slate. Rebind is clicked with the mouse, so no
     // key should be held; a key the table still shows as down missed its
     // release (see cap_key) and would block the capture.
     for (int vk = 0; vk < 256; ++vk) g_hk_down[vk].store(false, std::memory_order_relaxed);
     g_cap_armed = false;
+    g_refuse_t.store(0, std::memory_order_relaxed);   // HK10
     if (const DWORD t = g_kb_tid.load()) PostThreadMessageW(t, WM_KB_REHOOK, 0, 0);   // HK8
     g_cap.store((int)a);
 }
@@ -753,16 +1050,20 @@ bool capture_from_panel(unsigned char mods, int vk)
     const int cap = g_cap.load();
     if (cap < 0 || cap >= (int)A_COUNT || vk <= 0 || vk >= 256 || is_modifier_or_mouse(vk)) return false;
     if (vk == VK_ESCAPE) { g_cap.store(-1); return false; }
-    if (is_overlay(binding{ (unsigned char)(mods & 7u), (unsigned char)vk }))
-    {
-        mgpu::diag::warn("[MGPU][HK6] that combination is ReShade's panel key - not taken. Select another below the list.");
-        return false;
-    }
+    if (refuse_capture(cap, (unsigned char)(mods & 7u), vk)) return false;   // HK10
     commit_capture(cap, (unsigned char)(mods & 7u), vk, "panel");
     return true;
 }
 
 int capturing() { return g_cap.load(); }
+bool capture_refusal(char *out, unsigned n)
+{
+    const unsigned long long t = g_refuse_t.load(std::memory_order_relaxed);
+    if (out == nullptr || n == 0 || t == 0 || GetTickCount64() - t > 6000 || g_cap.load() < 0) return false;
+    std::lock_guard<std::mutex> lk(g_mx);
+    snprintf(out, n, "%s", g_refuse);
+    return true;
+}
 
 void reset_defaults()
 {

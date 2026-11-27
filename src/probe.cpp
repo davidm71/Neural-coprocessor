@@ -34,6 +34,7 @@
 
 #include "adapter.hpp"
 #include "diag.hpp"
+#include "hotkeys.hpp"   // HK15: hud_probe.inl names the current hotkey
 #include "mgpu_ini_parser.hpp"
 #include "probe.hpp"
 #include "sl_probe.hpp"   // SL1
@@ -238,6 +239,7 @@ std::atomic<int> g_sfpath{-2};   // R180/R182: see the read below
 // here with every other key, and OFF by default: this one installs an import
 // hook, and an instrument that hooks must be asked for.
 std::atomic<int> g_sltags{0};
+std::atomic<int> g_uptap{0};    // UT1: UpscalerTap
 std::atomic<int> g_jitter{0};   // R104: 0 off, 1 apply, -1 apply negated
 std::atomic<int> g_evalcopy{0}; // R106: 0 barrier trigger, 1 evaluate trigger
 
@@ -3010,6 +3012,11 @@ int jitter_mode()
     return g_jitter.load(std::memory_order_relaxed);
 }
 
+int upscaler_tap()
+{
+    return g_uptap.load(std::memory_order_relaxed);
+}
+
 int eval_copy_mode()
 {
     return g_evalcopy.load(std::memory_order_relaxed);
@@ -3136,6 +3143,9 @@ mode mode_from_ini()
         int jv = (jk != nullptr && atoi(jk) != 0) ? 1 : 0;
         if (jv != 0 && ik != nullptr && atoi(ik) != 0) jv = -1;
         g_jitter.store(jv, std::memory_order_relaxed);
+        // UT1. UpscalerTap: 0 auto, 1 DLSS only, 2 XeSS, 3 FSR, -1 none.
+        const char *uk = mgpu::config::find(buf, strlen(buf), "UpscalerTap");
+        g_uptap.store(uk != nullptr ? atoi(uk) : 0, std::memory_order_relaxed);
     }
     {
         // R106. The copy's TRIGGER, not its source. Off by default because it

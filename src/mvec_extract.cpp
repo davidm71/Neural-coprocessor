@@ -7,11 +7,13 @@
 // and executed there, once per frame, with our own objects. One mutex guards
 // the candidate table; the report lines go through mgpu::diag (the queue).
 
+#include "d3dc.hpp"   // SC1
 #include "mvec_extract.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"   // ui_ini_read, ui_ini_write
 #include "calibrator.hpp"     // game_ngx_init_seen: a contract title never enters
 #include "probe.hpp"          // mvec_offer / mvec_defer (R280: two additive calls)
+#include "gpu_safety_d3d12.hpp"   // LR100: bounded drain + event-retention rule
 
 #include <reshade.hpp>
 #include <d3d12.h>
@@ -292,7 +294,7 @@ namespace
         g_api_dev = api_dev;
 
         // shader
-        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        HMODULE dc = mgpu::sys_d3dcompiler_module() /* SC1 */;
         pfn_d3dcompile compile = dc ? (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile") : nullptr;
         if (compile == nullptr) { mgpu::diag::error("[MGPU][R280] d3dcompiler_47 / D3DCompile not available - extraction off."); return false; }
         ID3DBlob *cs = nullptr, *err = nullptr;
@@ -381,8 +383,22 @@ namespace
 
     void release_objects()
     {
-        if (g_fence != nullptr && g_fence_ev != nullptr && g_fence_v != 0 && g_fence->GetCompletedValue() < g_fence_v)
-        { g_fence->SetEventOnCompletion(g_fence_v, g_fence_ev); WaitForSingleObject(g_fence_ev, 2000); }
+        // LR100: the shared bounded drain (2 s as before, its own event, the
+        // device asked for removal). If our last list cannot be confirmed
+        // finished, everything it uses is LEFT ALLOCATED, and g_fence_ev -
+        // which a timed-out per-frame wait may have left registered - is kept
+        // open: the driver may still set it.
+        if (g_fence != nullptr && g_fence_v != 0)
+        {
+            const mgpu::gpusafe::drain_r dr = mgpu::gpusafe::drain_fence_self(g_fence, g_fence_v, 2000, 0);
+            if (!dr.drained && !dr.removed)
+            {
+                mgpu::diag::warn("[MGPU][MV] release: our last vector copy did not finish within 2 s - its D3D12 "
+                                 "objects are left allocated rather than released while in use (LR100).");
+                g_list = nullptr; g_alloc[0] = g_alloc[1] = nullptr; g_heap = nullptr; g_pso = nullptr;
+                g_rs = nullptr; g_fence = nullptr; g_fence_ev = nullptr; g_staging = nullptr;
+            }
+        }
         if (g_list) { g_list->Release(); g_list = nullptr; }
         for (int i = 0; i < 2; ++i) if (g_alloc[i]) { g_alloc[i]->Release(); g_alloc[i] = nullptr; }
         if (g_heap) { g_heap->Release(); g_heap = nullptr; }
@@ -601,7 +617,17 @@ void on_finish_effects(void *reshade_command_list, void *reshade_command_queue)
     if (gq == nullptr) return;
     // the allocator of this parity must be free: wait for the fence of two frames ago
     if (g_fence_v >= 2 && g_fence->GetCompletedValue() < g_fence_v - 1)
-    { g_fence->SetEventOnCompletion(g_fence_v - 1, g_fence_ev); WaitForSingleObject(g_fence_ev, 20); }
+    {
+        g_fence->SetEventOnCompletion(g_fence_v - 1, g_fence_ev);
+        WaitForSingleObject(g_fence_ev, 20);
+        // LR100: a 20 ms timeout (or an early wake left by an earlier
+        // timed-out registration on this event) is not completion - and the
+        // allocator is RESET next. Still running: skip this frame's vector
+        // pass (the target keeps the previous frame's vectors), as the other
+        // early returns above do, rather than reset an allocator in use.
+        // A removed device reads UINT64_MAX and goes on as before.
+        if (g_fence->GetCompletedValue() < g_fence_v - 1) return;
+    }
     ID3D12CommandAllocator *al = g_alloc[g_parity]; g_parity ^= 1u;
     if (FAILED(al->Reset()) || FAILED(g_list->Reset(al, g_pso))) return;
 

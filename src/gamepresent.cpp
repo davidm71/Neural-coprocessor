@@ -36,18 +36,30 @@ std::atomic<bool> g_dead{false};                    // GP2: skipping off for the
 
 const unsigned long long WARMUP_MS = 10000ull;       // GP2: the picture runs this long before any skip
 const unsigned long long IDLE_MS = 250ull;
-unsigned g_latency = 2;                              // GamePresentLatency (1..3)
+std::atomic<unsigned> g_latency{2};                  // GamePresentLatency (1..3); GP3: atomic
 
 thread_local int t_depth = 0;                        // GP2: re-entry guard
 
-// Counters for the log (the game's present thread; read there too).
-unsigned long long g_skip = 0, g_pass_hidden = 0, g_pass_idle = 0, g_pass_warm = 0, g_pass_other = 0;
-unsigned long long g_timeouts = 0, g_timeouts_all = 0, g_reenter = 0;
-double g_wait_ms = 0.0, g_wait_max = 0.0;
-unsigned long long g_log_ms = 0;
-bool g_said_first = false;
-bool g_streak = false;                               // the last game Present was skipped
-unsigned long long g_ovr_at_start = 0;               // the hand-over's overrun count when skipping began
+// Counters for the log. GP3 (IN51 review): atomics. The game presents from one
+// thread, but the hooks sit in a vtable the bridge's own chain can share, so
+// another thread can pass through them (g_reenter), and a game that presents
+// from two threads would race plain counters. Relaxed: they are statistics.
+using acnt = std::atomic<unsigned long long>;
+acnt g_skip{0}, g_pass_hidden{0}, g_pass_idle{0}, g_pass_warm{0}, g_pass_other{0};
+acnt g_timeouts{0}, g_timeouts_all{0}, g_reenter{0};
+acnt g_wait_us{0}, g_wait_max_us{0};        // brake waits, microseconds
+acnt g_log_ms{0};
+std::atomic<bool> g_said_first{false};
+// GP3: calls inside hk_present / hk_present1 right now. unpatch waits for them
+// to leave before reporting the hooks gone, so teardown never races a call
+// still running our code. t_in: this thread's own share (it may unpatch from
+// inside a call and must not wait for itself).
+std::atomic<int> g_inflight{0};
+thread_local int t_in = 0;
+struct inflight { inflight() { ++t_in; g_inflight.fetch_add(1, std::memory_order_acq_rel); }
+                  ~inflight() { g_inflight.fetch_sub(1, std::memory_order_acq_rel); --t_in; } };
+std::atomic<bool> g_streak{false};   // TL1: atomic, detach() writes it too                               // the last game Present was skipped
+acnt g_ovr_at_start{0};                              // the hand-over's overrun count when skipping began
 
 void name_of(void *a, char *out, size_t n)
 {
@@ -92,19 +104,20 @@ void stop(const char *why)
 
 void log_window(unsigned long long now)
 {
-    if (g_log_ms == 0) { g_log_ms = now; return; }
-    if (now - g_log_ms < 30000ull) return;
-    g_log_ms = now;
+    unsigned long long last = g_log_ms.load(std::memory_order_relaxed);
+    if (last == 0) { g_log_ms.compare_exchange_strong(last, now); return; }
+    if (now - last < 30000ull) return;
+    if (!g_log_ms.compare_exchange_strong(last, now)) return;   // another thread took this window
+    const unsigned long long sk = g_skip.exchange(0), ph = g_pass_hidden.exchange(0), pi = g_pass_idle.exchange(0),
+                             pw = g_pass_warm.exchange(0), po = g_pass_other.exchange(0), to = g_timeouts.exchange(0),
+                             re = g_reenter.exchange(0), wu = g_wait_us.exchange(0), wm = g_wait_max_us.exchange(0);
     char l[520];
     snprintf(l, sizeof l, "[MGPU][GP2] last 30 s: game presents skipped %llu, let through %llu (picture not on screen "
              "%llu, bridge not presenting %llu, warming up %llu, other %llu) | brake waited %.2f ms on average, %.1f ms "
              "longest, timed out %llu | re-entered %llu%s.",
-             g_skip, g_pass_hidden + g_pass_idle + g_pass_warm + g_pass_other, g_pass_hidden, g_pass_idle, g_pass_warm,
-             g_pass_other, g_skip ? g_wait_ms / (double)g_skip : 0.0, g_wait_max, g_timeouts, g_reenter,
-             g_dead.load() ? " | STOPPED for this session" : "");
+             sk, ph + pi + pw + po, ph, pi, pw, po, sk ? (double)wu / 1000.0 / (double)sk : 0.0, (double)wm / 1000.0,
+             to, re, g_dead.load() ? " | STOPPED for this session" : "");
     mgpu::diag::info(l);
-    g_skip = g_pass_hidden = g_pass_idle = g_pass_warm = g_pass_other = g_timeouts = g_reenter = 0;
-    g_wait_ms = g_wait_max = 0.0;
 }
 
 // One game Present: true = it was skipped (the caller returns S_OK).
@@ -123,7 +136,7 @@ bool try_skip(UINT flags)
     // The brake: what the real Present would have waited for.
     unsigned long long ovr = 0;
     const double t0 = now_ms();
-    const int r = mgpu::gpu1::gp_brake(g_latency, 100u, &ovr);
+    const int r = mgpu::gpu1::gp_brake(g_latency.load(std::memory_order_relaxed), 100u, &ovr);
     const double w = now_ms() - t0;
     if (r == 2) { stop("a graphics device reported lost (a fence read 2^64-1)"); ++g_pass_other; return false; }
     if (r == 3) { ++g_pass_idle; g_streak = false; return false; }
@@ -134,15 +147,16 @@ bool try_skip(UINT flags)
         if (++g_timeouts_all >= 5) stop("the brake timed out 5 times (the render card fell more than 100 ms behind)");
         return false;
     }
-    if (!g_streak) { g_streak = true; g_ovr_at_start = ovr; }
-    else if (ovr > g_ovr_at_start) { stop("the frame hand-over overran while game presents were skipped"); ++g_pass_other; return false; }
+    if (!g_streak.load()) { g_streak = true; g_ovr_at_start.store(ovr); }
+    else if (ovr > g_ovr_at_start.load()) { stop("the frame hand-over overran while game presents were skipped"); ++g_pass_other; return false; }
 
     ++g_skip;
-    g_wait_ms += w;
-    if (w > g_wait_max) g_wait_max = w;
-    if (!g_said_first)
+    const unsigned long long wus = (unsigned long long)(w * 1000.0);
+    g_wait_us.fetch_add(wus, std::memory_order_relaxed);
+    unsigned long long mx = g_wait_max_us.load(std::memory_order_relaxed);
+    while (wus > mx && !g_wait_max_us.compare_exchange_weak(mx, wus, std::memory_order_relaxed)) {}
+    if (!g_said_first.exchange(true))
     {
-        g_said_first = true;
         mgpu::diag::info("[MGPU][GP2] first game Present skipped (after the 10 s warm-up): the game's own frames no "
                          "longer reach the screen while the neural picture is up. Check PresentMon: the game's swap "
                          "chain should show almost no presents, the bridge's its full rate.");
@@ -152,6 +166,7 @@ bool try_skip(UINT flags)
 
 HRESULT STDMETHODCALLTYPE hk_present(IDXGISwapChain *sc, UINT sync, UINT flags)
 {
+    inflight in;   // GP3
     present_fn o = g_o_present.load(std::memory_order_acquire);
     if (t_depth > 0) { ++g_reenter; return o(sc, sync, flags); }   // called from inside ourselves: straight through
     struct guard { guard() { ++t_depth; } ~guard() { --t_depth; } } gd;
@@ -161,11 +176,33 @@ HRESULT STDMETHODCALLTYPE hk_present(IDXGISwapChain *sc, UINT sync, UINT flags)
 
 HRESULT STDMETHODCALLTYPE hk_present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *pp)
 {
+    inflight in;   // GP3
     present1_fn o = g_o_present1.load(std::memory_order_acquire);
     if (t_depth > 0) { ++g_reenter; return o(sc, sync, flags, pp); }
     struct guard { guard() { ++t_depth; } ~guard() { --t_depth; } } gd;
     if ((void *)sc == g_game.load(std::memory_order_acquire) && try_skip(flags)) return S_OK;
     return o(sc, sync, flags, pp);
+}
+
+// AU3: once a vtable slot has pointed at hk_present / hk_present1, this module
+// stays loaded until the process exits. The in-flight count (GP3) covers a call
+// from its first line to its last, but not the instructions before the counter
+// goes up (a thread that read the slot just before it was put back) or after it
+// goes down (the epilogue and return), and the wait is bounded at 500 ms. A
+// pinned module makes all three harmless: the code those threads run can never
+// be unmapped under them. Only taken when the hook was actually installed
+// (GamePresentSkip=1, off by default). The add-on cannot then be unloaded
+// before the game exits - ReShade does not unload add-ons earlier anyway.
+void pin_self()
+{
+    static std::atomic<bool> pinned{false};
+    if (pinned.exchange(true)) return;
+    HMODULE h = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(&hk_present), &h))
+        mgpu::diag::info("[MGPU][GP2] add-on pinned in memory while its Present hooks may still be called (AU3).");
+    else
+        mgpu::diag::warn("[MGPU][GP2] could not pin the add-on in memory (AU3) - the bounded wait at unhook still applies.");
 }
 
 void unpatch_locked()
@@ -178,6 +215,11 @@ void unpatch_locked()
     else other = true;
     if (other) mgpu::diag::warn("[MGPU][GP2] something else hooked the swap chain on top of GP2 - its slots stay as they are.");
     g_vt = nullptr;
+    // GP3: new calls now go to the originals; wait (bounded - the brake caps a
+    // call at ~100 ms) for calls already inside our hooks to return.
+    for (int i = 0; i < 500 && g_inflight.load(std::memory_order_acquire) > t_in; ++i) Sleep(1);
+    if (g_inflight.load(std::memory_order_acquire) > t_in)
+        mgpu::diag::warn("[MGPU][GP2] a Present call was still inside the hook 500 ms after it was removed.");
 }
 
 } // namespace
@@ -189,7 +231,7 @@ bool on()
     {
         v = mgpu::gpu1::ui_ini_read("GamePresentSkip", 0) != 0 ? 1 : 0;
         int lat = mgpu::gpu1::ui_ini_read("GamePresentLatency", 2);
-        g_latency = (unsigned)(lat < 1 ? 1 : (lat > 3 ? 3 : lat));
+        g_latency.store((unsigned)(lat < 1 ? 1 : (lat > 3 ? 3 : lat)), std::memory_order_relaxed);
         g_on.store(v);
     }
     return v != 0;
@@ -239,6 +281,7 @@ void attach(IUnknown *game_swapchain)
             return;
         }
         g_vt = vt;
+        pin_self();   // AU3
     }
     g_streak = false;
     g_game.store(game_swapchain, std::memory_order_release);
@@ -253,7 +296,7 @@ void attach(IUnknown *game_swapchain)
              "finish the frame from %u frame(s) ago (GamePresentLatency). The back-buffer index is left alone. Stops "
              "for the session on a lost device, a hand-over overrun or 5 brake time-outs. Game chain 0x%p, %u "
              "buffers, flags 0x%X | vtable %s | Present was %s, Present1 was %s.",
-             g_latency, (void *)game_swapchain, d.BufferCount, d.Flags, c, a, b);
+             g_latency.load(), (void *)game_swapchain, d.BufferCount, d.Flags, c, a, b);
     mgpu::diag::warn(l);
 }
 

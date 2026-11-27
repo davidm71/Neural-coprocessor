@@ -64,5 +64,8 @@ bool around(long long a, long long b, ID3D12CommandQueue *self, overlap *out);
 // GT2: just before the bridge releases a queue: drops our references to it,
 // the samples on it, and the device context when its last queue goes.
 void forget(ID3D12CommandQueue *q);
+
+// XT1 (IN85, log only): what the timing code holds a reference to.
+void holds(const void *dev, const void *q, bool *has_dev, bool *has_q, int *queues);
 }
 }

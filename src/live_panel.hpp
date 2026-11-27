@@ -60,6 +60,39 @@ bool take_reopen();
     bool is_host(void *runtime);
     // R158's apply, the moment open_overlay is called on the GPU 1 side.
     void note_opened_on(void *runtime, bool open);
+    // PW1: BT5 (picture on top, DcompOverlay off) opened ReShade's overlay on the
+    // picture's runtime. The panel then gets its own window there too, as it
+    // does in DcompOverlay mode, instead of only a tab behind Home. nullptr /
+    // false: closed or the runtime is going away.
+    void set_picture_panel(void *runtime, bool open);
+
+    // PO1 "panel only" (PanelOnly=1, the default; needs PanelOverPicture=1):
+    // Home opens only the MGPU panel - ReShade's own menu stays closed (its
+    // open is vetoed) and the panel is drawn in its own window from the
+    // reshade_overlay event, which ReShade raises every frame either way.
+    // Shift+Home, or the panel's "ReShade menu" button, open ReShade's menu.
+    bool panel_only();
+    // Plain mode (no picture on top, no DcompOverlay): the runtime the panel is
+    // shown on, nullptr = closed.
+    void  po_set(void *runtime, bool open);
+    void *po_runtime();
+// HX1 (IN92b): true while the add-on itself is opening/closing an overlay
+// (its Esc close), so that toggle is not taken for a mirrored key press.
+bool self_toggle();
+    // Any panel-only window is up (any mode) - set by dllmain; Esc then calls
+    // the closer it registered (closes whichever mode's panel is open).
+    void po_mark(bool up);
+    bool po_up();
+    void set_po_closer(void (*fn)());
+    // PO2: Shift+overlay key, seen by the keyboard hook on the game's runtime
+    // (ReShade's ForceShortcutModifiers=1, its default, never reports it).
+    void set_po_shift(void (*fn)(reshade::api::effect_runtime *));
+    // PO4: every frame on the game's runtime (panel-only mode): Esc closes
+    // ReShade's menu, and the switch back to the MGPU panel runs here.
+    void set_po_tick(void (*fn)(reshade::api::effect_runtime *));
+    // The "ReShade menu" button: the next open on that runtime is not vetoed.
+    void po_allow_reshade_once();
+    bool po_take_allow();
 
     // The game chain's present, on its own thread. Blocks the game's input for
     // the next frame while the panel is live AND being drawn (R293).

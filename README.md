@@ -60,7 +60,10 @@ own risk.
 ## What you need
 
 - Two NVIDIA graphics cards. The second card runs DLSS Neural Rendering, which NVIDIA
-  documents as an RTX 50-series feature (RTX 40-series has been reported working).
+  documents as an RTX 50-series feature; an RTX 4090 has been reported working (Cyberpunk 2077).
+  **Use an RTX 50-series (or RTX 40-series) card as the second card.** On a card that cannot run it, the driver
+  refuses it ("FeatureNotSupported", 0xBAD00001) and you get the picture without neural
+  rendering; the installer's Check and the log both warn when no RTX 50- or 40-series card is found.
 - A monitor plugged into the **second** card. **Recommended: the card that renders the game
   runs headless** (no monitor), and your monitor hangs off the second card, which does the
   neural work, frame generation and the display.
@@ -96,6 +99,7 @@ described in `README.txt`.
    the second card skips game frames and motion judders.
 5. Press `CTRL+ALT+H` for the HUD. NR SKIP near 0 means the second card is keeping up.
 6. Set the game's resolution before the bridge starts; restart the game after changing it.
+   Changing DLSS quality or the DLSS model while playing is fine - the bridge follows it.
 
 ## Measured
 
@@ -115,7 +119,7 @@ Present to screen, G-SYNC active.
 
 ## Hotkeys
 
-All of them can be changed in the panel's hotkey section.
+All of them can be changed in the panel's hotkey section: Ctrl and/or Alt with A-Z or F1-F12, each combination used once.
 
 | Keys | Action |
 |---|---|
@@ -123,9 +127,9 @@ All of them can be changed in the panel's hotkey section.
 | CTRL+ALT+F10 | start the bridge by hand (with `AutoArm=0`) |
 | CTRL+ALT+F6 | hide / show the picture |
 | CTRL+ALT+F7 | view: output / input / split |
-| CTRL+ALT+, and . | move the split line (add SHIFT for big steps) |
-| CTRL+ALT+End | pick the pass the intensity keys change |
-| CTRL+ALT+PgDn / PgUp | intensity down / up |
+| CTRL+ALT+F3 / F4 | move the split line left / right (add SHIFT for big steps) |
+| CTRL+ALT+F5 | pick the pass the intensity keys change |
+| CTRL+ALT+F1 / F2 | intensity down / up |
 | CTRL+ALT+H | FPS HUD |
 | CTRL+ALT+G | frame generation on / off |
 | CTRL+ALT+P | screenshot |

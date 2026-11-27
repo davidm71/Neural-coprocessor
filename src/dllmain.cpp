@@ -40,6 +40,7 @@
 #include <cstdio>     // P1.6: snprintf. This file had no formatted logging before.
 #include <cstring>    // R137: strstr, to spot the depth tap by its effect name.
 #include <cwchar>     // R142: wcsrchr, to split our own module path for [R142].
+#include <cwctype>    // RS2: towlower
 #include <atomic>     // R138: the present counter and the said-once flags.
 
 // ---- R141: BUILD IDENTITY, SAID ONCE, FIRST ----
@@ -66,7 +67,13 @@
 #define MGPU_VERSION_STR "3.0"
 // VR2: the fork's build tag, shared by the R141 log line and the panel footer
 // so the two can never disagree. Bump it with every shipped change.
-#define MGPU_SOURCE_TAG "IN17"
+#define MGPU_SOURCE_TAG "LR106"
+// BV1: which of the two builds this is, in the R141 line and the panel footer.
+#ifdef MGPU_PRODUCTION
+#define MGPU_FLAVOUR "release"
+#else
+#define MGPU_FLAVOUR "diagnostic"
+#endif
 
 // TR3: the same identity for the tray icon's About box (tray.cpp).
 namespace mgpu
@@ -109,6 +116,10 @@ const char *about_build()   { return MGPU_SOURCE_TAG ", built " __DATE__; }
 #endif
 
 #include <reshade.hpp>
+#include "panel_theme.hpp"   // TH1
+#include "tstab.hpp"         // TC1
+#include "cpuprof.hpp"       // CP1
+#include "panel_anim.hpp"    // PA1
 
 #include "adapter.hpp"
 #include "diag.hpp"
@@ -125,6 +136,7 @@ const char *about_build()   { return MGPU_SOURCE_TAG ", built " __DATE__; }
 #include "sl_probe.hpp"   // SL1
 #include "worker.hpp"
 #include "hotkeys.hpp"   // HK1
+#include <cstdarg>        // HK15: tipf
 #include "capture.hpp"   // SS1 / VR1 / BM1
 #include "framewarp.hpp" // FW1
 #include "hdr.hpp"       // HD1
@@ -254,9 +266,69 @@ static void steam_appid_file_once()
     mgpu::diag::info(l);
 }
 
+// SW2. How much stack a game thread gives us. REPORTED 2026-11-18 (Rise of
+// the Tomb Raider): a stack overflow on the game's thread on the first frame
+// through ReShade, with nothing in the log. Some engines run rendering on
+// threads with small stacks; this writes, once per thread and event, the
+// thread's stack size and how much is left when our callback starts, and
+// warns again whenever less than 64 KB is left.
+static void sw2_stack(const char *where)
+{
+    thread_local unsigned t_said = 0;   // bit per call site
+    ULONG_PTR lo = 0, hi = 0;
+    GetCurrentThreadStackLimits(&lo, &hi);
+    const ULONG_PTR here = (ULONG_PTR)&lo;
+    const unsigned long long total = (unsigned long long)(hi - lo);
+    const unsigned long long left  = (unsigned long long)(here - lo);
+    unsigned bit = 1u;
+    for (const char *c = where; *c; ++c) bit = (bit * 31u) + (unsigned char)*c;
+    bit = 1u << (bit % 31u);
+    const bool first = (t_said & bit) == 0;
+    static std::atomic<unsigned> low_said{0};
+    const bool low = left < 64ull * 1024ull;
+    if (!first && !(low && low_said.fetch_add(1) < 5)) return;
+    t_said |= bit;
+    char l[300];
+    snprintf(l, sizeof l, "[MGPU][SW2] %s on thread %lu: stack %llu KB, %llu KB left%s", where,
+             GetCurrentThreadId(), total / 1024ull, left / 1024ull,
+             low ? " - LOW: a game thread this tight can overflow inside the mod or ReShade" : "");
+    if (low) mgpu::diag::warn(l); else mgpu::diag::info(l);
+}
+
+// RS3. ReShade's built-in "Effect Runtime Sync" add-on (source read:
+// crosire/reshade examples/15-effect_runtime_sync, BSD-3) is loaded in every
+// game but does NOTHING unless ReShade.ini says [ADDON] SyncEffectRuntimes=1
+// (ticked once in its settings, or default-on when a VR runtime DLL is
+// present). When on, every technique/uniform/effects-state change on one
+// runtime is repeated on all others - and the repeat fires the same event on
+// the other runtime, which repeats it back: game runtime -> bridge picture
+// runtime -> game runtime ... until the stack runs out (Rise of the Tomb
+// Raider, 2026-11-18). The add-on re-reads that key every time a runtime is
+// created, and ours registers before the game's swap chain exists, so writing
+// SyncEffectRuntimes=0 here switches it off for this very session - no
+// restart, and the add-on itself stays installed.
+static void rs3_stop_runtime_sync()
+{
+    bool sync = false;
+    const bool set = reshade::get_config_value(nullptr, "ADDON", "SyncEffectRuntimes", sync);
+    const bool vr = GetModuleHandleW(L"openvr_api.dll") != nullptr || GetModuleHandleW(L"openxr_loader.dll") != nullptr;
+    if ((set && !sync) || (!set && !vr))
+    {
+        mgpu::diag::info("[MGPU][RS2] ReShade's runtime sync is off (correct for the bridge).");
+        return;
+    }
+    reshade::set_config_value(nullptr, "ADDON", "SyncEffectRuntimes", false);
+    mgpu::diag::warn("[MGPU][RS2] ReShade's \"Effect Runtime Sync\" was set to synchronize runtimes "
+                     "(SyncEffectRuntimes=1 in ReShade.ini). With the bridge's picture window that loops "
+                     "forever and crashes the game, so it has been switched off (SyncEffectRuntimes=0) - "
+                     "this takes effect now, no restart needed.");
+}
+
 static void on_init_device(reshade::api::device *device)
 {
     steam_appid_file_once();   // SA1
+    if (device != nullptr && device->get_api() == reshade::api::device_api::d3d12)   // XT2 (IN88): diagnostic only
+        mgpu::calibrator::xt2_note_device(reinterpret_cast<void *>(static_cast<uintptr_t>(device->get_native())), device);
     // Every device event is logged; the first d3d12 one also captures the
     // provisional game LUID and builds the adapter table. No selection
     // here - brief rule 2 defers it to the swapchain-derived game LUID
@@ -423,8 +495,13 @@ static void mgpu_hud_transport_hook(void *cmd_list_native, unsigned long long re
     mgpu::gpu1::stream_hud_copy(cmd_list_native, resource);
 }
 
+static bool ex_is_game_device(reshade::api::device *d);   // EX1 (IN90), defined below
+
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
+    if (swapchain != nullptr && ex_is_game_device(swapchain->get_device()))   // EX1 (IN90): a game chain is alive
+        mgpu::gpu1::ex_note_chain(reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())),
+                                  swapchain->get_hwnd(), true, resize);
     if (swapchain != nullptr)   // SH1: the bridge's chain is the one on the selected bridge card
     {
         reshade::api::device *bd = swapchain->get_device();
@@ -651,6 +728,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             // how you deadlock a game at startup.
             //
             // Calib=0 returns immediately and touches nothing.
+            mgpu::calibrator::set_upscaler_tap(mgpu::probe::upscaler_tap());   // UT1: before install, which scans
             mgpu::calibrator::install(mgpu::probe::calib_mode());
             mgpu::calibrator::set_jitter_mode(mgpu::probe::jitter_mode());
 
@@ -1043,9 +1121,195 @@ static int mgpu_game_is_native(int *out_quality = nullptr)
 // buttons do. Read at the next start.
 // UI7: the tooltip of the control just drawn, shown on hover even when it is
 // greyed out. It wraps the control's call and returns what the control returned.
+static bool g_anim_on = false;   // PA1: PanelAnimations, set by the panel wrapper each frame
+
+// KS1: click a slider once, then LEFT / RIGHT nudge it one step at a time
+// (held: repeats after 0.35 s). The selected slider gets a teal outline; a
+// click anywhere else, or the slider not being drawn, lets it go. Keys come
+// from the mod's keyboard hook (hotkeys::key_down), which still sees them
+// while ReShade blocks the game's input under the panel. Int sliders step 1;
+// float sliders step by their format's last decimal (%.2f -> 0.01).
+static ImGuiID g_ks_id = 0;          // the selected slider
+static bool    g_ks_seen = false;    // drawn this frame
+static bool    g_ks_touch = false;   // a slider was clicked this frame
+static int     g_ks_dir = 0;         // this frame's nudge: -1, 0, +1
+// KS3: the nudge comes from COUNTING arrow presses in the keyboard hook (each
+// key-down, Windows' own key repeat included), not from polling whether a key
+// is held: IN71's test picked the slider with the hook installed and no nudge
+// ever landed. A count is never stuck and never misses a short tap.
+static unsigned g_ks_prev[3] = { 0, 0, 0 };
+static unsigned g_ks_seen_n[3] = { 0, 0, 0 };   // presses while the current slider is picked
+static unsigned g_ks_raw_n = 0;          // KS4: arrow presses seen in the key state (past ReShade's filter)
+static bool     g_ks_from_raw = false;   // KS4: a nudge came from the key state
+static void ks_release(const char *why);
+static void ks_frame_begin()
+{
+    g_ks_seen = false; g_ks_touch = false;
+    unsigned n[3];
+    mgpu::hotkeys::arrow_counts(n);
+    const int dl = (int)(n[0] - g_ks_prev[0]), dr = (int)(n[1] - g_ks_prev[1]), da = (int)(n[2] - g_ks_prev[2]);
+    for (int i = 0; i < 3; ++i) g_ks_prev[i] = n[i];
+    g_ks_dir = 0;
+    // The panel was not drawn for a while (closed): arrows pressed in the game
+    // meanwhile are not nudges, and the pick does not survive a close.
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    const bool gap = last != 0 && now - last > 250;
+    last = now;
+    if (gap && g_ks_id != 0) ks_release("the panel was closed");
+    if (gap) return;
+    // KS4: the second source - the keys' physical state, read past ReShade's
+    // filter. A press edge is one step; held, it repeats after 350 ms every
+    // 45 ms (6 s cutoff). Used for an arrow only while the hook has not
+    // delivered any arrow press for a second, so the two never double up.
+    static ULONGLONG hook_arrow_t = 0;
+    if (da != 0) hook_arrow_t = now;
+    const bool hook_quiet = now - hook_arrow_t > 1000;
+    int raw_steps = 0;
+    {
+        static int held = 0;                 // -1 LEFT, +1 RIGHT, 0 none
+        static ULONGLONG t0 = 0, next = 0;
+        const bool l = mgpu::hotkeys::raw_key(VK_LEFT), r = mgpu::hotkeys::raw_key(VK_RIGHT);
+        const bool mods = mgpu::hotkeys::raw_key(VK_CONTROL) || mgpu::hotkeys::raw_key(VK_MENU);
+        const int d = (l == r || mods) ? 0 : (r ? 1 : -1);
+        if (d != held)
+        {
+            held = d; t0 = now; next = now + 350;
+            raw_steps = d;
+            if (d != 0) ++g_ks_raw_n;
+        }
+        else if (d != 0 && now >= next && now - t0 < 6000)
+        {
+            next = now + 45;
+            raw_steps = d;
+        }
+    }
+    if (g_ks_id != 0)
+    {
+        g_ks_seen_n[0] += (unsigned)dl; g_ks_seen_n[1] += (unsigned)dr; g_ks_seen_n[2] += (unsigned)da;
+        g_ks_dir = dr - dl;
+        if (g_ks_dir == 0 && hook_quiet && raw_steps != 0) { g_ks_dir = raw_steps; g_ks_from_raw = true; }
+        if (g_ks_dir > 20) g_ks_dir = 20;
+        if (g_ks_dir < -20) g_ks_dir = -20;
+    }
+}
+static void ks_frame_end()
+{
+    if (ImGui::IsMouseClicked(0) && !g_ks_touch && g_ks_id != 0) ks_release("a click somewhere else");
+    else if (!g_ks_seen && g_ks_id != 0) ks_release("the slider was not drawn");
+}
+// After a slider: select on click, outline when selected, and the nudge.
+// KS2: one line when a slider is picked (and when its first nudge lands), so a
+// log shows whether the arrows reached it: the keyboard hook's state and how
+// long ago it last saw a real key. At most 40 lines a run.
+static int  g_ks_lines = 0;
+static bool g_ks_nudged = false;
+static int  g_ks_nudges = 0;   // KS3: applied while the current slider is picked
+static void ks_note(const char *what)
+{
+    if (g_ks_lines >= 40) return;
+    ++g_ks_lines;
+    unsigned long long lk = 0;
+    const bool hk = mgpu::hotkeys::kb_hook_state(lk);
+    char l[260];
+    if (lk == ~0ull)
+        snprintf(l, sizeof l, "[MGPU][KS1] %s - keyboard hook %s, it has seen no real key yet.", what, hk ? "installed" : "NOT installed");
+    else
+        snprintf(l, sizeof l, "[MGPU][KS1] %s - keyboard hook %s, last real key %llu ms ago.", what, hk ? "installed" : "NOT installed", lk);
+    mgpu::diag::info(l);
+}
+static int ks_after()
+{
+    const ImGuiID id = ImGui::GetItemID();
+    if (ImGui::IsItemActivated())
+    {
+        if (g_ks_id != id)
+        {
+            if (g_ks_id != 0) ks_release("another slider was picked");
+            g_ks_nudged = false; g_ks_nudges = 0; g_ks_raw_n = 0; g_ks_from_raw = false;
+            for (int i = 0; i < 3; ++i) g_ks_seen_n[i] = 0;
+            ks_note("slider picked for LEFT / RIGHT fine-tuning");
+        }
+        g_ks_id = id; g_ks_touch = true;
+    }
+    if (g_ks_id != id || id == 0) return 0;
+    g_ks_seen = true;
+    // KS4: an unmistakable "picked" mark - the thin teal outline vanished
+    // against the teal theme (IN72: "the only way to know it is selected is
+    // by pressing the mouse down"). A thick frame with a light fill - white
+    // since IN74 (asked for; amber in IN73).
+    const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(a.x - 2.0f, a.y - 2.0f), ImVec2(b.x + 2.0f, b.y + 2.0f), IM_COL32(255, 255, 255, 26), 3.0f);
+    dl->AddRect(ImVec2(a.x - 2.0f, a.y - 2.0f), ImVec2(b.x + 2.0f, b.y + 2.0f), IM_COL32(255, 255, 255, 255), 3.0f, 0, 2.5f);   // PO4: white, as asked
+    if (ImGui::IsItemActive()) return 0;   // still held with the mouse
+    if (g_ks_dir != 0) ++g_ks_nudges;
+    return g_ks_dir;
+}
+static void ks_release(const char *why)
+{
+    if (g_ks_lines < 40)
+    {
+        ++g_ks_lines;
+        char l[300];
+        snprintf(l, sizeof l, "[MGPU][KS1] slider let go (%s): while it was picked the keyboard hook saw %u LEFT, %u RIGHT "
+                 "(%u arrow presses in all, the rest with CTRL/ALT), the key state saw %u arrow press(es); %d nudge(s) "
+                 "applied%s.", why, g_ks_seen_n[0], g_ks_seen_n[1], g_ks_seen_n[2], g_ks_raw_n, g_ks_nudges,
+                 g_ks_from_raw ? " (some from the key state)" : "");
+        mgpu::diag::info(l);
+    }
+    g_ks_id = 0;
+}
+static bool ui_slider_int(const char *label, int *v, int lo, int hi, const char *fmt = "%d", ImGuiSliderFlags fl = 0)
+{
+    bool ch = ImGui::SliderInt(label, v, lo, hi, fmt, fl);
+    const int d = ks_after();
+    if (d != 0 && !g_ks_nudged) { g_ks_nudged = true; ks_note("first arrow-key nudge applied"); }
+    if (d != 0)
+    {
+        const int nv = (*v + d < lo) ? lo : (*v + d > hi) ? hi : *v + d;
+        if (nv != *v) { *v = nv; ch = true; }
+    }
+    return ch;
+}
+static bool ui_slider_float(const char *label, float *v, float lo, float hi, const char *fmt = "%.3f", ImGuiSliderFlags fl = 0)
+{
+    bool ch = ImGui::SliderFloat(label, v, lo, hi, fmt, fl);
+    const int d = ks_after();
+    if (d != 0 && !g_ks_nudged) { g_ks_nudged = true; ks_note("first arrow-key nudge applied"); }
+    if (d != 0)
+    {
+        float step = (hi - lo) / 100.0f;
+        if (fmt != nullptr)
+            if (const char *dot = strstr(fmt, "%."))
+                if (dot[2] >= '0' && dot[2] <= '9' && dot[3] == 'f')
+                { step = 1.0f; for (int i = 0; i < dot[2] - '0'; ++i) step *= 0.1f; }
+        float nv = *v + (float)d * step;
+        nv = (float)((double)lround((double)nv / step) * step);   // land on the grid the label shows
+        if (nv < lo) nv = lo;
+        if (nv > hi) nv = hi;
+        if (nv != *v) { *v = nv; ch = true; }
+    }
+    return ch;
+}
+// HK15: text with the CURRENT hotkeys in it (tips and notes used to name the
+// defaults, wrong once a key was rebound). A small ring of buffers, panel only.
+static const char *tipf(const char *fmt, ...)
+{
+    static char ring[6][640];
+    static unsigned i = 0;
+    char *b = ring[i++ % 6u];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, 640, fmt, ap);
+    va_end(ap);
+    return b;
+}
+static const char *hkn(unsigned a) { return mgpu::hotkeys::name_now(a); }
 static bool ui_tip(bool r, const char *t)
 {
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", t);
+    mgpu::anim::note_item(g_anim_on, r);   // PA1: the click ripple
     return r;
 }
 
@@ -1058,7 +1322,7 @@ static bool draw_custom_scale_slider(const char *id)
         if (g_custom_pct < 33 || g_custom_pct > 90) g_custom_pct = 67;
     }
     bool wrote = false;
-    if (ui_tip(ImGui::SliderInt(id, &g_custom_pct, 33, 90, "%d%%"), "Neural rendering runs at this share of the display resolution and is\nenlarged back. Lower is faster; 85-90% keeps nearly all of NR's detail."))
+    if (ui_tip(ui_slider_int(id, &g_custom_pct, 33, 90, "%d%%"), "Neural rendering runs at this share of the display resolution and is\nenlarged back. Lower is faster; 85-90% keeps nearly all of NR's detail."))
     {
         mgpu::gpu1::ui_ini_write("SRScale", g_custom_pct);
         mgpu::gpu1::ui_ini_write("SRMvLowRes", 1);
@@ -1070,7 +1334,8 @@ static bool draw_custom_scale_slider(const char *id)
         bool dr = mgpu::gpu1::ui_dr_on();
         // DR5/DR6: it measures frame generation's delivery - NVIDIA's or AMD's.
         const int dr_fg = mgpu::gpu1::ui_frame_gen();
-        const bool dr_usable = dr_fg == 4 || dr_fg == 3;
+        const bool dr_rc = mgpu::gpu1::ui_res_changed();   // RC1: no FG until restart
+        const bool dr_usable = (dr_fg == 4 || dr_fg == 3) && !dr_rc;
         char idc[48]; snprintf(idc, sizeof idc, "Dynamic##dr%s", id);
         ImGui::BeginDisabled(!dr_usable);
         if (ImGui::Checkbox(idc, &dr)) mgpu::gpu1::ui_set_dr_on(dr);
@@ -1081,7 +1346,8 @@ static bool draw_custom_scale_slider(const char *id)
         if (!dr_usable)
         {
             ImGui::SameLine();
-            ImGui::TextDisabled("Needs NVIDIA or AMD frame generation - fixed scale above in use.");
+            ImGui::TextDisabled(dr_rc ? "Needs frame generation - off until the game restarts (resolution changed)."
+                                      : "Needs NVIDIA or AMD frame generation - fixed scale above in use.");
         }
         if (dr && dr_usable)
         {
@@ -1120,14 +1386,41 @@ static bool draw_custom_scale_slider(const char *id)
             }
             int lo = mgpu::gpu1::ui_dr_min(), hi = mgpu::gpu1::ui_dr_max();
             char idl[48]; snprintf(idl, sizeof idl, "Lowest##drl%s", id);
-            if (ui_tip(ImGui::SliderInt(idl, &lo, 33, 90, "%d%%"), "The lowest scale dynamic resolution may go down to.")) mgpu::gpu1::ui_set_dr_min(lo > hi ? hi : lo);
+            if (ui_tip(ui_slider_int(idl, &lo, 33, 90, "%d%%"), "The lowest scale dynamic resolution may go down to.")) mgpu::gpu1::ui_set_dr_min(lo > hi ? hi : lo);
             char idh[48]; snprintf(idh, sizeof idh, "Highest##drh%s", id);
-            if (ui_tip(ImGui::SliderInt(idh, &hi, 33, 90, "%d%%"), "The highest scale it may go up to. The reduced textures are made at this\nsize, so raising it takes effect at the next start.")) mgpu::gpu1::ui_set_dr_max(hi < lo ? lo : hi);
+            if (ui_tip(ui_slider_int(idh, &hi, 33, 90, "%d%%"), "The highest scale it may go up to. The reduced textures are made at this\nsize, so raising it takes effect at the next start.")) mgpu::gpu1::ui_set_dr_max(hi < lo ? lo : hi);
             const int al = mgpu::gpu1::ui_dr_alloc();
             if (al > 0 && hi > al)
                 ImGui::TextDisabled("Above %d%% after the next start.", al);
+            // NB1: a ceiling on NR's own GPU time per real frame.
+            int bud = mgpu::gpu1::ui_dr_budget();
+            char idb[48]; snprintf(idb, sizeof idb, "NR time budget##drb%s", id);
+            if (ui_tip(ui_slider_int(idb, &bud, 0, 30, bud == 0 ? "off" : "%d ms"),
+                       "The most GPU time neural rendering alone may take per real frame on the\n"
+                       "neural card. Over it, the scale steps down (2-6 points, 4 s apart); it steps\n"
+                       "up only with 10% of the budget to spare. Off: the other rules alone."))
+                mgpu::gpu1::ui_set_dr_budget(bud);
+            if (bud > 0 && mgpu::gpu1::ui_nb_nr_ms() < 0.0f)   // NB3
+                ImGui::TextDisabled("No NR timing yet - the budget acts once NR has been measured (GPU timestamps).");
         }
         ImGui::EndDisabled();
+        {   // NB1: what the card spends, measured (GPU timestamps), whatever the settings.
+            const float nrm = mgpu::gpu1::ui_nb_nr_ms(), fgm = mgpu::gpu1::ui_nb_fg_ms();
+            if (nrm >= 0.0f || fgm >= 0.0f)
+            {
+                char nb[96] = "";
+                if (nrm >= 0.0f && fgm >= 0.0f) snprintf(nb, sizeof nb, "GPU time per real frame: NR %.2f ms, FG stage %.2f ms", nrm, fgm);
+                else if (nrm >= 0.0f) snprintf(nb, sizeof nb, "GPU time per real frame: NR %.2f ms", nrm);
+                else snprintf(nb, sizeof nb, "GPU time per real frame: FG stage %.2f ms", fgm);
+                ImGui::TextDisabled("%s", nb);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Measured on the neural card with GPU timestamps.\n"
+                                      "NR: its downscale and passes only.\n"
+                                      "FG stage: every frame generation command in the neural stage's list -\n"
+                                      "the generator's own evaluates plus the composition. Not the model's\n"
+                                      "inference time alone, and not work a library queues elsewhere.");
+            }
+        }
     }
     return wrote;
 }
@@ -1144,7 +1437,7 @@ static void draw_scaler_controls()
     if (ui_tip(ImGui::RadioButton("NIS##sc", &sc, 3), "NVIDIA Image Scaling: edge-aware enlargement with sharpening.")) mgpu::gpu1::ui_set_scaler(3);
     int shp = mgpu::gpu1::ui_scaler_sharp();
     ImGui::BeginDisabled(sc < 2);
-    if (ui_tip(ImGui::SliderInt("Sharpness##sc", &shp, 0, 100, "%d%%"), "How much sharpening FSR 1 or NIS adds while enlarging.")) mgpu::gpu1::ui_set_scaler_sharp(shp);
+    if (ui_tip(ui_slider_int("Sharpness##sc", &shp, 0, 100, "%d%%"), "How much sharpening FSR 1 or NIS adds while enlarging.")) mgpu::gpu1::ui_set_scaler_sharp(shp);
     // MAS1: motion-adaptive sharpening (live).
     bool mas = mgpu::gpu1::ui_scaler_mas() != 0;
     if (ImGui::Checkbox("Less sharpening in motion##mas", &mas)) mgpu::gpu1::ui_set_scaler_mas(mas ? 1 : 0);
@@ -1154,7 +1447,7 @@ static void draw_scaler_controls()
     if (mas)
     {
         int mm = mgpu::gpu1::ui_scaler_mas_motion();
-        if (ui_tip(ImGui::SliderInt("Sharpening kept in motion##mas", &mm, 0, 100, "%d%%"), "The share of the sharpening kept on fast-moving areas.\nStill areas always get all of it."))
+        if (ui_tip(ui_slider_int("Sharpening kept in motion##mas", &mm, 0, 100, "%d%%"), "The share of the sharpening kept on fast-moving areas.\nStill areas always get all of it."))
             mgpu::gpu1::ui_set_scaler_mas_motion(mm);
     }
     ImGui::EndDisabled();
@@ -1209,6 +1502,7 @@ static void ui_scope_end()
 static bool ui_section(int id, const char *title, const char *summary)
 {
     ui_scope_end();
+    mgpu::anim::section_end();   // PA1: the previous section's fade ends before this header
     if (g_ui_open < 0)
         g_ui_open = mgpu::gpu1::ui_ini_read("UiOpen", UI_OPEN_DEFAULT);
     const bool was = ((g_ui_open >> id) & 1) != 0;
@@ -1217,6 +1511,7 @@ static bool ui_section(int id, const char *title, const char *summary)
     char lab[96];
     snprintf(lab, sizeof lab, "%s###mgpu_sec%d", title, id);
     const bool open = ImGui::CollapsingHeader(lab);
+    mgpu::anim::section(g_anim_on, id, open, was);   // PA1: ripple on click; a newly opened body fades in
     if (summary != nullptr && summary[0] != '\0')
     {
         char cap[128];   // UI7: starts with a capital, like every label
@@ -1242,7 +1537,7 @@ static bool ui_section(int id, const char *title, const char *summary)
     return open;
 }
 
-static void draw_mgpu_overlay(reshade::api::effect_runtime *)
+static void draw_mgpu_overlay_body(reshade::api::effect_runtime *)
 {
     // UX1: with the panel in its own window, ReShade's docked tab only points there.
     if (mgpu::live_panel::own_window_shown() && !mgpu::live_panel::drawing_own())
@@ -1377,13 +1672,13 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (ui_tip(ImGui::RadioButton("C", &style_i, 2), "Style C: a second alternative neural rendering style.")) mgpu::gpu1::ui_set_tuning_value(3, 2.0f);
 
         float tone = st.tone_strength;
-        if (ui_tip(ImGui::SliderFloat("Tone", &tone, 0.0f, 2.0f, "%.2f"), "Local tone strength: local contrast, which reads as ambient-occlusion-like\nshading. Lower it if colours look washed or flat. 1.00 = default."))
+        if (ui_tip(ui_slider_float("Tone", &tone, 0.0f, 2.0f, "%.2f"), "Local tone strength: local contrast, which reads as ambient-occlusion-like\nshading. Lower it if colours look washed or flat. 1.00 = default."))
             mgpu::gpu1::ui_set_tuning_value(0, tone);
         float structure = st.structure_strength;
-        if (ui_tip(ImGui::SliderFloat("Structure", &structure, 0.0f, 2.0f, "%.2f"), "Local structure strength: how strongly fine detail is rebuilt.\n1.00 = default."))
+        if (ui_tip(ui_slider_float("Structure", &structure, 0.0f, 2.0f, "%.2f"), "Local structure strength: how strongly fine detail is rebuilt.\n1.00 = default."))
             mgpu::gpu1::ui_set_tuning_value(1, structure);
         float skin = st.skin_strength;
-        if (ui_tip(ImGui::SliderFloat("Skin", &skin, 0.0f, 2.0f, "%.2f"), "Structure strength on skin. Lower keeps faces closer to the game's own.\n1.00 = default."))
+        if (ui_tip(ui_slider_float("Skin", &skin, 0.0f, 2.0f, "%.2f"), "Structure strength on skin. Lower keeps faces closer to the game's own.\n1.00 = default."))
             mgpu::gpu1::ui_set_tuning_value(2, skin);
         bool mask = st.auto_mask;
         if (ui_tip(ImGui::Checkbox("Auto mask", &mask), "NR's automatic mask (UseAutoMask in NVIDIA's DLSS-NR guide)."))
@@ -1444,7 +1739,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (ui_tip(ImGui::RadioButton("Back-loaded", &pr, 2), "Lighter early passes, stronger later ones."))  mgpu::gpu1::ui_set_preset(2);
 
         float all = st.intensity[0];
-        if (ui_tip(ImGui::SliderFloat("All passes", &all, 0.0f, 2.0f, "%.2f"), "The strength of every pass at once. 1.00 = NR's normal strength."))
+        if (ui_tip(ui_slider_float("All passes", &all, 0.0f, 2.0f, "%.2f"), "The strength of every pass at once. 1.00 = NR's normal strength."))
             mgpu::gpu1::ui_set_intensity(0, all);
         // FV4: with foveation "centre 2x" the centre's second pass uses pass 2's
         // intensity, so its slider shows at x1 too.
@@ -1454,7 +1749,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             char lab[32];
             snprintf(lab, sizeof lab, (i >= st.passes) ? "Pass 2 (centre 2x)" : "Pass %u", i + 1);
             float v = st.intensity[i];
-            if (ui_tip(ImGui::SliderFloat(lab, &v, 0.0f, 2.0f, "%.2f"), "The strength of this pass alone."))
+            if (ui_tip(ui_slider_float(lab, &v, 0.0f, 2.0f, "%.2f"), "The strength of this pass alone."))
                 mgpu::gpu1::ui_set_intensity(i + 1, v);
         }
         if (st.passes == 1)
@@ -1463,10 +1758,51 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         // CS1: Color Strength. Live; written to mgpu.ini as ColorStrength.
         {
             float cs = mgpu::gpu1::ui_color_strength();
-            if (ui_tip(ImGui::SliderFloat("Color strength", &cs, 0.0f, 1.0f, "%.2f"), "1.00 = the neural colours. Lower keeps NR's lighting but brings back the\ngame's own hue and saturation (skin, cloth, foliage)."))
+            if (ui_tip(ui_slider_float("Color strength", &cs, 0.0f, 1.0f, "%.2f"), "1.00 = the neural colours. Lower keeps NR's lighting but brings back the\ngame's own hue and saturation (skin, cloth, foliage)."))
                 mgpu::gpu1::ui_set_color_strength(cs);
             ImGui::TextDisabled("1.00 = the neural colours. Lower keeps its lighting but restores");
             ImGui::TextDisabled("the game's own hue and saturation (skin, cloth, foliage).");
+        }
+
+        // TC1: temporal stabilisation. Live; written to mgpu.ini.
+        ImGui::SeparatorText("Temporal Stabilization");
+        {
+            int tm = mgpu::tstab::mode();
+            bool ch = false;
+            ch |= ui_tip(ImGui::RadioButton("Off##tc", &tm, 0), "No history, no GPU work.");
+            ImGui::SameLine();
+            ch |= ui_tip(ImGui::RadioButton("Observe##tc", &tm, 1), "Builds the history and measures the shimmer - the picture is NOT changed.\nUse it to get a baseline before turning stabilization on.");
+            ImGui::SameLine();
+            ch |= ui_tip(ImGui::RadioButton("Stabilize##tc", &tm, 2), "Blends each real NR frame with its own motion-compensated history.\nRuns before frame generation, once per real frame.");
+            if (ch) { mgpu::tstab::set_mode(tm); (void)mgpu::gpu1::ui_ini_write("TemporalStab", tm); }
+            if (tm != 0)
+            {
+                int ts = mgpu::tstab::strength();
+                if (ui_tip(ui_slider_int("Strength##tc", &ts, 0, 100, "%d%%"), "The most history any pixel gets (100% = 90%). DLSS-NR is already\ntemporal: keep this low; high values smear moving detail."))
+                {
+                    mgpu::tstab::set_strength(ts);
+                    (void)mgpu::gpu1::ui_ini_write("TemporalStabStrength", ts);
+                }
+                bool dbg = mgpu::tstab::debug() != 0;
+                if (ui_tip(ImGui::Checkbox("Show rejected history##tc", &dbg), "Red: reprojected off-screen. Green: depth mismatch (disocclusion).\nBlue: colour outside the neighbourhood. Grey: history weight."))
+                {
+                    mgpu::tstab::set_debug(dbg ? 1 : 0);
+                    (void)mgpu::gpu1::ui_ini_write("TemporalStabDebug", dbg ? 1 : 0);
+                }
+                const mgpu::tstab::stats ts2 = mgpu::tstab::snapshot();
+                if (ts2.failed)
+                    ImGui::TextDisabled("Turned itself off for this run - see [MGPU][TC1] in the log.");
+                else if (!ts2.active || ts2.frames == 0)
+                    ImGui::TextDisabled("Waiting for the stream (starts with the next real frame).");
+                else
+                {
+                    ImGui::TextDisabled("GPU %.3f ms   shimmer %.2f   changed %.2f   history %.0f%%",
+                                        (double)ts2.gpu_ms, (double)ts2.shimmer, (double)ts2.changed, (double)ts2.weight);
+                    ImGui::TextDisabled("Rejected: off-screen %.1f%%  depth %.1f%%  colour %.1f%%   resets %u, cuts %u",
+                                        (double)ts2.rej_off, (double)ts2.rej_depth, (double)ts2.rej_color, ts2.resets, ts2.cuts);
+                    ImGui::TextDisabled("Numbers refresh every 10 s. Lower shimmer = steadier picture.");
+                }
+            }
         }
     }
 
@@ -1482,12 +1818,28 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     if (ui_section(SEC_FG, "Frame Generation", sm))
     // ---- FG1: frame generation, its own section so it is easy to find ----
     {
+        // RC1: the game changed resolution after the stream started - frame
+        // generation has no motion vectors until a restart, so the section is
+        // greyed out under one line saying so (nowhere else on screen).
+        // LR1 (LR97): only for a change the bridge could NOT follow (most DLSS
+        // quality and model changes are followed live and never show this),
+        // and a format-only change is named as one.
+        const bool rc_lock = mgpu::gpu1::ui_res_changed();
+        if (rc_lock)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
+            ImGui::TextWrapped("%s", mgpu::gpu1::ui_res_change_kind() == 2
+                                         ? "MOTION VECTOR FORMAT CHANGE DETECTED - PLEASE RESTART GAME FOR FG"
+                                         : "RESOLUTION CHANGE DETECTED - PLEASE RESTART GAME FOR FG");
+            ImGui::PopStyleColor();
+            ImGui::BeginDisabled();
+        }
         const int fgm = mgpu::gpu1::ui_frame_gen();
         bool fg_on = (fgm != 0);
-        if (ui_tip(ImGui::Checkbox("Frame generation", &fg_on), "Makes in-between frames on the second GPU from the game's motion vectors\nand depth, so the render card does no extra work. Also CTRL+ALT+G."))
+        if (ui_tip(ImGui::Checkbox("Frame generation", &fg_on), tipf("Makes in-between frames on the second GPU from the game's motion vectors\nand depth, so the render card does no extra work. Also %s.", hkn(mgpu::hotkeys::A_FRAMEGEN))))
             mgpu::gpu1::ui_set_frame_gen(fg_on ? mgpu::gpu1::ui_frame_gen_last() : 0);
         ImGui::SameLine();
-        ImGui::TextDisabled("(live - also CTRL+ALT+G in game)");
+        ImGui::TextDisabled("(live - also %s in game)", hkn(mgpu::hotkeys::A_FRAMEGEN));
         // TF3: the Limiter caps the game on its own, with any generator and
         // any multiplier - or with frame generation off.
         {
@@ -1497,7 +1849,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::BeginDisabled(!cap_on);
             int cap = mgpu::gpu1::ui_tf_cap();
             ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
-            if (ui_tip(ImGui::SliderInt("##tfcap", &cap, 20, 240, "%d fps"), "The game's frame-rate cap.")) mgpu::gpu1::ui_set_tf_cap(cap);
+            if (ui_tip(ui_slider_int("##tfcap", &cap, 20, 240, "%d fps"), "The game's frame-rate cap.")) mgpu::gpu1::ui_set_tf_cap(cap);
             ImGui::EndDisabled();
             if (cap_on)
             {
@@ -1557,7 +1909,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 const float w = ImGui::GetFontSize() * 12.0f;
                 int tgt = mgpu::gpu1::ui_tf_target();
                 ImGui::SetNextItemWidth(w);
-                if (ui_tip(ImGui::SliderInt("Target##tf", &tgt, 30, s_hz > 30 ? (s_hz > 480 ? 480 : s_hz) : 480, "%d fps"), "The frame rate to show. The multiplier is picked from the game's measured\nframe rate and re-picked when it changes."))
+                if (ui_tip(ui_slider_int("Target##tf", &tgt, 30, s_hz > 30 ? (s_hz > 480 ? 480 : s_hz) : 480, "%d fps"), "The frame rate to show. The multiplier is picked from the game's measured\nframe rate and re-picked when it changes."))
                     mgpu::gpu1::ui_set_tf_target(tgt);
                 if (!mgpu::gpu1::ui_tf_cap_on())
                     ImGui::TextDisabled("Limiter off: the multiplier follows the game's own frame rate.");
@@ -1657,7 +2009,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 if (dyn)
                 {
                     int tg = mgpu::gpu1::ui_fg_dyn_target();
-                    if (ui_tip(ImGui::SliderInt("Shown fps##dmf", &tg, 60, 360, "%d fps"), "The frame rate the dynamic multiplier aims to show.")) mgpu::gpu1::ui_set_fg_dyn_target(tg);
+                    if (ui_tip(ui_slider_int("Shown fps##dmf", &tg, 60, 360, "%d fps"), "The frame rate the dynamic multiplier aims to show.")) mgpu::gpu1::ui_set_fg_dyn_target(tg);
                     // FC1: frame spacing - the original per-pair spacing (default) or the
                     // even frame clock (FGClock=1). Live; either can be picked at any time.
                     int fc = mgpu::gpu1::ui_fg_clock() ? 1 : 0;
@@ -1807,7 +2159,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         {
             const int hs = mgpu::hudprobe::state();
             ImGui::BeginDisabled(hs != 0);
-            if (ui_tip(ImGui::Button("Capture HUD-less candidates (CTRL+ALT+J)"), "Saves candidate scene images without the HUD to mgpu\\hudprobe, for\nfinding the HUD-less picture in a new game."))
+            if (ui_tip(ImGui::Button(tipf("Capture HUD-less candidates (%s)###hlcap", hkn(mgpu::hotkeys::A_HUDPROBE))), "Saves candidate scene images without the HUD to mgpu\\hudprobe, for\nfinding the HUD-less picture in a new game."))
                 mgpu::hudprobe::request_capture();
             ImGui::EndDisabled();
             ImGui::SameLine();
@@ -1819,7 +2171,11 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                                     mgpu::hudprobe::last_capture_images());
         }
         // UI6: the less-used choices, folded.
+#ifndef MGPU_PRODUCTION
         if (ui_tip(ImGui::TreeNode("More Frame Generation Options##fgmore"), "FG Lite, the frame generation DLL and motion view."))
+#else
+        if (ui_tip(ImGui::TreeNode("More Frame Generation Options##fgmore"), "FG Lite and the frame generation DLL."))   // MV1
+#endif
         {
             // FL1
             static int fgl = -1, fgs = -1;
@@ -1831,11 +2187,13 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (ui_tip(ImGui::Checkbox("Use mgpu\\nvngx_dlssg.dll", &own), "Loads mgpu\\nvngx_dlssg.dll ahead of the driver's copy, so a newer DLL can\nbe used. Applies on the next launch.")) { fgs = own ? 1 : 0; mgpu::gpu1::ui_set_fg_source(fgs); }
             ImGui::EndDisabled();
             ImGui::TextDisabled(fgm == 4 ? "Both apply on the next launch." : "These two are for NVIDIA DLSS FG.");
+#ifndef MGPU_PRODUCTION   // MV1: a diagnostic tool - not in the release build
             bool mv = (fgm == 2);
             ImGui::BeginDisabled(fgm == 3 || fgm == 4);
             if (ui_tip(ImGui::Checkbox("Motion view (debug: shows the motion vectors instead)", &mv), "Debug: shows the motion vectors instead of the picture (BUILT-IN only)."))
                 mgpu::gpu1::ui_set_frame_gen(mv ? 2 : 1);
             ImGui::EndDisabled();
+#endif
             ImGui::TreePop();
         }
         ImGui::EndDisabled();
@@ -1847,6 +2205,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (fgm != 4)
             ImGui::TextDisabled("One in-between frame per NR frame from the game's motion vectors. "
                                 "Adds about half a frame of latency.");
+        if (rc_lock) ImGui::EndDisabled();
     }
 
     // ---- FW1: Frame Warp. Live; every control writes mgpu.ini.
@@ -1859,7 +2218,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         static int fws = -1;
         if (fws < 0 || !ImGui::IsAnyItemActive()) fws = mgpu::framewarp::scale();
         float fwsf = (float)fws / 1000.0f;
-        if (ui_tip(ImGui::SliderFloat("Degrees per mouse count##fw", &fwsf, 0.001f, 0.500f, "%.3f",
+        if (ui_tip(ui_slider_float("Degrees per mouse count##fw", &fwsf, 0.001f, 0.500f, "%.3f",
                                ImGuiSliderFlags_Logarithmic), "How far the camera turns per mouse count, in degrees.\nAuto-calibrate learns it."))
         {
             fws = (int)(fwsf * 1000.0f + 0.5f);
@@ -1868,7 +2227,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         }
         static int fwp = -1;
         if (fwp < 0 || !ImGui::IsAnyItemActive()) fwp = mgpu::framewarp::strength();
-        if (ImGui::SliderInt("Strength (%)##fw", &fwp, 0, 100))
+        if (ui_slider_int("Strength (%)##fw", &fwp, 0, 100))
             mgpu::framewarp::set_strength(fwp);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("How much of the delay to make up. Higher = snappier turns, more edge stretch.");
@@ -1877,7 +2236,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             mgpu::framewarp::set_invert_y(fwi);
         static int fwl = -1;
         if (fwl < 0 || !ImGui::IsAnyItemActive()) fwl = mgpu::framewarp::lead_ms();
-        if (ui_tip(ImGui::SliderInt("Extra lead (ms)##fw", &fwl, 0, 60), "Shifts a little further ahead than the measured delay."))
+        if (ui_tip(ui_slider_int("Extra lead (ms)##fw", &fwl, 0, 60), "Shifts a little further ahead than the measured delay."))
             mgpu::framewarp::set_lead_ms(fwl);
         char fwst[200];
         mgpu::framewarp::status(fwst, sizeof fwst);
@@ -1993,7 +2352,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (pb < 0) { pb = mgpu::gpu1::ui_ini_read("PresentBuffers", 6); if (pb < 2) pb = 2; if (pb > 6) pb = 6; }
             int v = pb;
             ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
-            if (ui_tip(ImGui::SliderInt("Window buffers##pb", &v, 2, 6), "How many buffers the bridge window cycles through.\nMore smooth out Windows' Present stalls; 6 is the default.\nRestart to apply.") &&
+            if (ui_tip(ui_slider_int("Window buffers##pb", &v, 2, 6), "How many buffers the bridge window cycles through.\nMore smooth out Windows' Present stalls; 6 is the default.\nRestart to apply.") &&
                 v != pb && mgpu::gpu1::ui_ini_write("PresentBuffers", v))
                 pb = v;
             ImGui::SameLine();
@@ -2070,7 +2429,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 static int age = -1;
                 if (age < 0 || (st.armed && !ImGui::IsAnyItemActive()))
                     age = st.armed ? (int)st.ll_age : mgpu::gpu1::ui_ini_read("LateLatchAge", 2);
-                ui_tip(ImGui::SliderInt("Max age (frames)", &age, 0, 4, "%d", ImGuiSliderFlags_AlwaysClamp), "The oldest a prefetched frame may be when it is used. 2 recommended.");
+                ui_tip(ui_slider_int("Max age (frames)", &age, 0, 4, "%d", ImGuiSliderFlags_AlwaysClamp), "The oldest a prefetched frame may be when it is used. 2 recommended.");
                 if (ImGui::IsItemDeactivatedAfterEdit())
                 {
                     mgpu::gpu1::ui_set_late_latch_age((unsigned)age);
@@ -2122,16 +2481,16 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         char pkf[48];
         if (pk == 0) snprintf(pkf, sizeof pkf, "monitor's (%d nits)", mgpu::hdr::peak_in_use());
         else snprintf(pkf, sizeof pkf, "%%d nits");
-        if (ImGui::SliderInt("Peak##hd", &pk, 0, 2000, pkf)) mgpu::hdr::set_peak(pk < 100 ? 0 : pk);
+        if (ui_slider_int("Peak##hd", &pk, 0, 2000, pkf)) mgpu::hdr::set_peak(pk < 100 ? 0 : pk);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brightest highlight. Far left = what the monitor reports.");
         int pw = mgpu::hdr::paper_white();
-        if (ImGui::SliderInt("Paper white##hd", &pw, 80, 500, "%d nits")) mgpu::hdr::set_paper_white(pw);
+        if (ui_slider_int("Paper white##hd", &pw, 80, 500, "%d nits")) mgpu::hdr::set_paper_white(pw);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brightness of white walls, paper and menus.");
         int hl = mgpu::hdr::highlights();
-        if (ImGui::SliderInt("Highlights##hd", &hl, 0, 100, "%d%%")) mgpu::hdr::set_highlights(hl);
+        if (ui_slider_int("Highlights##hd", &hl, 0, 100, "%d%%")) mgpu::hdr::set_highlights(hl);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("How far bright areas (sky, lights, fire) reach toward the peak.");
         int sa = mgpu::hdr::saturation();
-        if (ui_tip(ImGui::SliderInt("Saturation##hd", &sa, 50, 150, "%d%%"), "Colour saturation of the HDR picture. 100% = unchanged.")) mgpu::hdr::set_saturation(sa);
+        if (ui_tip(ui_slider_int("Saturation##hd", &sa, 50, 150, "%d%%"), "Colour saturation of the HDR picture. 100% = unchanged.")) mgpu::hdr::set_saturation(sa);
         ImGui::EndDisabled();
         const char *why = mgpu::hdr::status();
         if (why[0] != '\0') ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s", why);
@@ -2153,10 +2512,10 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         ImGui::SameLine();
         if (ui_tip(ImGui::RadioButton("Split", &pm, 2), "Input left of the seam, output right, same frame."))  mgpu::gpu1::ui_set_present_mode(2);
         float sp = st.split_pos;
-        if (ui_tip(ImGui::SliderFloat("Seam", &sp, 0.0f, 1.0f, "%.2f"), "Where the split view divides. CTRL+ALT+, and . move it (SHIFT = coarse)."))
+        if (ui_tip(ui_slider_float("Seam", &sp, 0.0f, 1.0f, "%.2f"), tipf("Where the split view divides. %s and %s move it (SHIFT = coarse).", hkn(mgpu::hotkeys::A_SEAM_L), hkn(mgpu::hotkeys::A_SEAM_R))))
             mgpu::gpu1::ui_set_split_pos(sp);
         ImGui::TextDisabled("Split: input left of the seam, output right, same frame.");
-        ImGui::TextDisabled("CTRL+ALT+, and . move it with no overlay open (SHIFT = coarse); see Hotkeys.");
+        ImGui::TextDisabled("%s and %s move it with no overlay open (SHIFT = coarse); see Hotkeys.", hkn(mgpu::hotkeys::A_SEAM_L), hkn(mgpu::hotkeys::A_SEAM_R));
         // ST1: the status lines on the FPS HUD (StatusHud in mgpu.ini). Live.
         {
             bool sh = mgpu::gpu1::ui_status_hud();
@@ -2166,18 +2525,18 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (ImGui::Checkbox("Log bus traffic", &bh)) mgpu::gpu1::ui_set_bus_hud(bh);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Writes the bus traffic (GB/s sent and received) to ReShade.log every 10 s.\n"
-                                  "It is shown live on the ADVANCED FPS HUD (third press of CTRL+ALT+H).");
+                                  "It is shown live on the ADVANCED FPS HUD (third press of %s).", hkn(mgpu::hotkeys::A_FPS_HUD));
             ImGui::TextDisabled("Neural state, neural frames, last NGX result, frame generator, hook.");
-            ImGui::TextDisabled("Shown under the FPS lines; CTRL+ALT+H hides the whole HUD.");
+            ImGui::TextDisabled("Shown under the FPS lines; %s hides the whole HUD.", hkn(mgpu::hotkeys::A_FPS_HUD));
         }
         // CK1: clock and stopwatch, top-right.
         {
             bool ck = mgpu::gpu1::ui_clock();
-            if (ui_tip(ImGui::Checkbox("Clock", &ck), "A clock at the top right. CTRL+ALT+C.")) mgpu::gpu1::ui_set_clock(ck);
+            if (ui_tip(ImGui::Checkbox("Clock", &ck), tipf("A clock at the top right. %s.", hkn(mgpu::hotkeys::A_CLOCK)))) mgpu::gpu1::ui_set_clock(ck);
             ImGui::SameLine();
             bool sw = mgpu::gpu1::ui_stopwatch();
-            if (ui_tip(ImGui::Checkbox("Stopwatch", &sw), "A stopwatch at the top right, starting at 0. CTRL+ALT+S.")) mgpu::gpu1::ui_set_stopwatch(sw);
-            ImGui::TextDisabled("Top-right. CTRL+ALT+C / CTRL+ALT+S (see Hotkeys). Stopwatch starts at 0.");
+            if (ui_tip(ImGui::Checkbox("Stopwatch", &sw), tipf("A stopwatch at the top right, starting at 0. %s.", hkn(mgpu::hotkeys::A_STOPWATCH)))) mgpu::gpu1::ui_set_stopwatch(sw);
+            ImGui::TextDisabled("Top-right. %s / %s (see Hotkeys). Stopwatch starts at 0.", hkn(mgpu::hotkeys::A_CLOCK), hkn(mgpu::hotkeys::A_STOPWATCH));
         }
         // SV1: screen saver.
         {
@@ -2213,13 +2572,13 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                    : mgpu::capture::sweep_state() != 0 ? "sweep running"
                    : mgpu::capture::bench_state() != 0 ? "benchmark running" : ""))
     {
-        if (ui_tip(ImGui::Button("Screenshot"), "Saves a PNG of what the bridge shows to mgpu\\captures. CTRL+ALT+P.")) mgpu::capture::request_screenshot();
+        if (ui_tip(ImGui::Button("Screenshot"), tipf("Saves a PNG of what the bridge shows to mgpu\\captures. %s.", hkn(mgpu::hotkeys::A_SCREENSHOT)))) mgpu::capture::request_screenshot();
         ImGui::SameLine();
         const int rs = mgpu::capture::recording_state();
-        if (ui_tip(ImGui::Button(rs != 0 ? "Stop recording" : "Record video"), "Records an MP4 (H.264 on the second GPU's encoder) with the game's\naudio. CTRL+ALT+R.")) mgpu::capture::toggle_recording();
+        if (ui_tip(ImGui::Button(rs != 0 ? "Stop recording" : "Record video"), tipf("Records an MP4 (H.264 on the second GPU's encoder) with the game's\naudio. %s.", hkn(mgpu::hotkeys::A_RECORD)))) mgpu::capture::toggle_recording();
         ImGui::SameLine();
         const int bs = mgpu::capture::bench_state();
-        if (ui_tip(ImGui::Button(bs != 0 ? "Stop benchmark" : "Run benchmark"), "A timed run: average fps, 1% and 0.1% lows, pacing and the latency the\nmod adds, saved to mgpu\\benchmarks\\results.csv. CTRL+ALT+B.")) mgpu::capture::toggle_benchmark();
+        if (ui_tip(ImGui::Button(bs != 0 ? "Stop benchmark" : "Run benchmark"), tipf("A timed run: average fps, 1%% and 0.1%% lows, pacing and the latency the\nmod adds, saved to mgpu\\benchmarks\\results.csv. %s.", hkn(mgpu::hotkeys::A_BENCH)))) mgpu::capture::toggle_benchmark();
         ImGui::SameLine();
         if (ui_tip(ImGui::Button("Open folder"), "Opens the folder where screenshots, videos and benchmarks are saved."))
         {
@@ -2230,7 +2589,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         ImGui::TextDisabled("Takes what the bridge shows: neural output and generated frames (FPS HUD optional).");
 
         int rsec = mgpu::capture::record_seconds();
-        if (ui_tip(ImGui::SliderInt("Video length limit (s, 0 = until stopped)", &rsec, 0, 600), "Recording stops after this many seconds. 0 = until stopped."))
+        if (ui_tip(ui_slider_int("Video length limit (s, 0 = until stopped)", &rsec, 0, 600), "Recording stops after this many seconds. 0 = until stopped."))
             mgpu::capture::set_record_seconds(rsec);
         int rf = mgpu::capture::record_fps();
         ImGui::TextUnformatted("video frame rate:");
@@ -2257,9 +2616,9 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (ui_tip(ImGui::Checkbox("Video includes the FPS HUD", &rh), "Draws the FPS HUD into videos.")) mgpu::capture::set_record_hud(rh);
 
         int bsec = mgpu::capture::bench_seconds();
-        if (ui_tip(ImGui::SliderInt("Benchmark length (s)", &bsec, 5, 300), "How long the measured part of a benchmark runs.")) mgpu::capture::set_bench_seconds(bsec);
+        if (ui_tip(ui_slider_int("Benchmark length (s)", &bsec, 5, 300), "How long the measured part of a benchmark runs.")) mgpu::capture::set_bench_seconds(bsec);
         int bd = mgpu::capture::bench_delay();
-        if (ui_tip(ImGui::SliderInt("Benchmark countdown (s)", &bd, 0, 10), "Seconds before measuring starts, to close the panel and get ready.")) mgpu::capture::set_bench_delay(bd);
+        if (ui_tip(ui_slider_int("Benchmark countdown (s)", &bd, 0, 10), "Seconds before measuring starts, to close the panel and get ready.")) mgpu::capture::set_bench_delay(bd);
         // BM3: the sweep
         {
             const bool swr = mgpu::capture::sweep_state() != 0;
@@ -2267,9 +2626,9 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             char bl[64];
             if (swr) snprintf(bl, sizeof bl, "Stop sweep (%d/%d)###swb", stp + 1 > stps ? stps : stp + 1, stps);
             else     snprintf(bl, sizeof bl, "Run sweep###swb");
-            if (ui_tip(ImGui::Button(bl), "Runs the benchmark once per configuration below, round after round, and\n"
+            if (ui_tip(ImGui::Button(bl), tipf("Runs the benchmark once per configuration below, round after round, and\n"
                        "writes one table to mgpu\\benchmarks\\MGPU_sweep_*.txt. Your settings are not\n"
-                       "changed (mgpu.ini is left alone and they come back at the end). CTRL+ALT+W."))
+                       "changed (mgpu.ini is left alone and they come back at the end). %s.", hkn(mgpu::hotkeys::A_SWEEP))))
                 mgpu::capture::toggle_sweep();
             ImGui::SameLine();
             static char sl[400] = {};
@@ -2280,33 +2639,36 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (ui_tip(ImGui::InputText("##swl", sl, sizeof sl, ImGuiInputTextFlags_EnterReturnsTrue),
                        "Configurations, comma separated: generator:LIMITERxMULTIPLIER.\n"
                        "amd = AMD FSR 3 (2-4x), nv = NVIDIA DLSS FG (2-6x). Press Enter to save.\n"
-                       "Example: amd:40x4,amd:50x3,nv:40x4,nv:50x3"))
+                       "Optional neural resolution per configuration: @60 holds 60%, @dyn runs\n"
+                       "dynamic resolution, @b8 dynamic with an 8 ms NR time budget.\n"
+                       "Example: amd:40x4,amd:50x3,nv:40x4,nv:50x3 or nv:40x4@60,nv:40x4@dyn,nv:40x4@b8"))
                 sl_bad = !mgpu::capture::set_sweep_list(sl);
             if (sl_bad) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "not saved - check it"); }
             int sws = mgpu::capture::sweep_seconds();
-            if (ui_tip(ImGui::SliderInt("Sweep: measured per step (s)", &sws, 5, 120), "Seconds measured per configuration per round.\nWith input replay on, each step replays the path instead."))
+            if (ui_tip(ui_slider_int("Sweep: measured per step (s)", &sws, 5, 120), "Seconds measured per configuration per round.\nWith input replay on, each step replays the path instead."))
                 mgpu::capture::set_sweep_seconds(sws);
             int swt = mgpu::capture::sweep_settle();
-            if (ui_tip(ImGui::SliderInt("Sweep: settle after a switch (s)", &swt, 2, 30), "Seconds after each switch that are not measured, so the new\ngenerator and dynamic resolution can settle."))
+            if (ui_tip(ui_slider_int("Sweep: settle after a switch (s)", &swt, 2, 30), "Seconds after each switch that are not measured, so the new\ngenerator and dynamic resolution can settle."))
                 mgpu::capture::set_sweep_settle(swt);
             int swn = mgpu::capture::sweep_rounds();
-            if (ui_tip(ImGui::SliderInt("Sweep: rounds", &swn, 1, 10), "How many times the whole list runs. Rounds are merged per configuration;\nmore rounds = fairer when the scene changes (a fly-through benchmark)."))
+            if (ui_tip(ui_slider_int("Sweep: rounds", &swn, 1, 10), "How many times the whole list runs. Rounds are merged per configuration;\nmore rounds = fairer when the scene changes (a fly-through benchmark)."))
                 mgpu::capture::set_sweep_rounds(swn);
             int swnr = mgpu::capture::sweep_nr();   // BM5
-            if (ui_tip(ImGui::SliderInt("Sweep: hold neural resolution (%)", &swnr, 0, 90, swnr == 0 ? "off (dynamic)" : "%d%%"),
+            if (ui_tip(ui_slider_int("Sweep: hold neural resolution (%)", &swnr, 0, 90, swnr == 0 ? "off (dynamic)" : "%d%%"),
                        "Holds dynamic resolution at this % for the whole sweep, so every configuration is\n"
                        "compared at the same picture quality and no step inherits the scale the one before\n"
                        "left. 0 = leave it dynamic. It is let go when the sweep ends."))
                 mgpu::capture::set_sweep_nr(swnr);
         }
         bool br = mgpu::capture::bench_replay();
-        if (ui_tip(ImGui::Checkbox("Use input replay (repeatable runs)", &br), "Every benchmark replays the recorded keyboard and mouse path, so runs\ncan be compared. Single-player games only.")) mgpu::capture::set_bench_replay(br);
+        if (ui_tip(ImGui::Checkbox("Use input replay (repeatable runs)", &br), "Every benchmark replays the recorded keyboard and mouse path, so runs\ncan be compared. Single-player games only.\n"
+                                                                          "The countdown waits until this overlay is closed; Esc, the mouse\nor opening the overlay stops a replay.")) mgpu::capture::set_bench_replay(br);
         double ps = 0.0; unsigned pe = 0;
         if (mgpu::replay::has_path(&ps, &pe))
             ImGui::TextDisabled("Input path for this game: %.1f s, %u events. With replay on, the run lasts as long as the path.", ps, pe);
         else
             ImGui::TextDisabled("No input path recorded for this game yet.");
-        if (ui_tip(ImGui::Button(mgpu::replay::recording() ? "Stop recording input path" : "Record input path"), "Records a keyboard and mouse path for benchmark replay. CTRL+ALT+I."))
+        if (ui_tip(ImGui::Button(mgpu::replay::recording() ? "Stop recording input path" : "Record input path"), tipf("Records a keyboard and mouse path for benchmark replay. %s.", hkn(mgpu::hotkeys::A_PATH))))
             mgpu::replay::toggle_record();
         ImGui::TextDisabled("Best with the hotkey: start, close this overlay, walk or pan, press it again.");
         ImGui::TextDisabled("Turn off Windows \"Enhance pointer precision\" so mouse turns repeat exactly.");
@@ -2491,20 +2853,27 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 
             ImGui::BeginDisabled(!m_sr);
 
-            ImGui::TextUnformatted("Preset");
-            ImGui::SameLine();
-            if (ui_tip(ImGui::RadioButton("Title default##p", m_preset == 0), "The preset the DLSS DLL picks for this game."))
+            // SP1 (IN96): the preset row named the models, not only their
+            // letters - the user asked what K/L/M were. Two rows so the
+            // longer labels fit the panel's width. Same values, same key.
+            ImGui::TextUnformatted("Model (preset)");
+            if (ui_tip(ImGui::RadioButton("Title default##p", m_preset == 0),
+                       "Whatever DLSS picks for this game."))
             { m_preset = 0;  mgpu::gpu1::ui_ini_write("SRPreset", 0); }
             ImGui::SameLine();
-            if (ui_tip(ImGui::RadioButton("K##p", m_preset == 11), "DLSS preset K. A DLL without it uses its own."))
+            if (ui_tip(ImGui::RadioButton("K - Transformer##p", m_preset == 11),
+                       "DLSS 4 model: sharp and steady in motion.\nA good all-round choice."))
             { m_preset = 11; mgpu::gpu1::ui_ini_write("SRPreset", 11); }
-            ImGui::SameLine();
-            if (ui_tip(ImGui::RadioButton("L##p", m_preset == 12), "DLSS preset L. A DLL without it uses its own."))
+            if (ui_tip(ImGui::RadioButton("L - Transformer 2 (Ultra Perf.)##p", m_preset == 12),
+                       "Second-generation model, tuned for Ultra Performance.\nThe heaviest to run."))
             { m_preset = 12; mgpu::gpu1::ui_ini_write("SRPreset", 12); }
             ImGui::SameLine();
-            if (ui_tip(ImGui::RadioButton("M##p", m_preset == 13), "DLSS preset M. A DLL without it uses its own."))
+            if (ui_tip(ImGui::RadioButton("M - Transformer 2 (Perf.)##p", m_preset == 13),
+                       "Second-generation model, tuned for Performance."))
             { m_preset = 13; mgpu::gpu1::ui_ini_write("SRPreset", 13); }
-            ImGui::TextDisabled("A DLL that lacks the preset asked for uses its own instead.");
+            ImGui::TextDisabled("Takes effect at the next game start. A DLSS file without the model uses its own.");
+            if (mgpu::gpu1::ui_rs_recon() != 0)
+                ImGui::TextDisabled("Not used now: Rebuild is 'residual', so DLSS on this card does not enlarge the picture.");
 
             // ---- MATCH GAME, BEFORE THE MODE ROW ----
             //
@@ -2661,7 +3030,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             {
                 static int ps = -1;
                 if (ps < 0) ps = (st.sr_scale_pct > 0) ? (int)st.sr_scale_pct : 67;
-                if (ui_tip(ImGui::SliderInt("Resolution scale##pre", &ps, 33, 90, "%d%%"), "The share of the display resolution neural rendering runs at. Needed at\nDLAA. Restart to apply."))
+                if (ui_tip(ui_slider_int("Resolution scale##pre", &ps, 33, 90, "%d%%"), "The share of the display resolution neural rendering runs at. Needed at\nDLAA. Restart to apply."))
                     (void)mgpu::gpu1::ui_ini_write("SRScale", ps);
                 ImGui::TextDisabled("Saved as SRScale; restart to apply. Needed at DLAA.");
             }
@@ -2675,7 +3044,8 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             {
                 const float dn = mgpu::gpu1::ui_dr_now();
                 const int fgx = mgpu::gpu1::ui_frame_gen();   // DR6: AMD too
-                const bool dr_live = mgpu::gpu1::ui_dr_on() && dn > 0.0f && (fgx == 4 || fgx == 3);
+                const bool dr_live = mgpu::gpu1::ui_dr_on() && dn > 0.0f && (fgx == 4 || fgx == 3)
+                                     && !mgpu::gpu1::ui_res_changed();   // RC1
                 double pct = 0.0;
                 if (dr_live) pct = dn;
                 else if (st.sr_scale_pct != 0u) pct = (double)st.sr_scale_pct;
@@ -3205,7 +3575,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (ui_tip(ImGui::RadioButton("Performance", want_q == 0), "50% of the display.")) { want_q = 0; want_s = 50; }
             {   // RS1: any scale, not only the three DLSS steps
                 int sc = (want_s > 0) ? want_s : 67;
-                if (ui_tip(ImGui::SliderInt("Resolution scale", &sc, 33, 90, "%d%%"), "Any scale from 33% to 90% of the display.")) want_s = sc;
+                if (ui_tip(ui_slider_int("Resolution scale", &sc, 33, 90, "%d%%"), "Any scale from 33% to 90% of the display.")) want_s = sc;
             }
             // V18. THE MODE NOW SETS R, WHICH IS WHAT MAKES IT MEAN ANYTHING.
             // Without this the buttons changed only the model's internal mode
@@ -3297,13 +3667,13 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                     if (fm == 2)
                     {
                         int fb = mgpu::gpu1::ui_fov_band();
-                        if (ui_tip(ImGui::SliderInt("Height##fv", &fb, 30, 90, "%d%%"), "Band height, as a share of the picture's height.")) mgpu::gpu1::ui_set_fov_band(fb);
+                        if (ui_tip(ui_slider_int("Height##fv", &fb, 30, 90, "%d%%"), "Band height, as a share of the picture's height.")) mgpu::gpu1::ui_set_fov_band(fb);
                         // FV3: where the band sits. 0 top, 50 middle, 100 bottom.
                         ImGui::SetCursorPosX(x0 + lab_w);
                         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
                         int bpv = mgpu::gpu1::ui_fov_bpos();
                         const char *bpf = bpv == 0 ? "top" : bpv == 50 ? "middle" : bpv == 100 ? "bottom" : "%d";
-                        if (ui_tip(ImGui::SliderInt("Position##fv", &bpv, 0, 100, bpf), "Band position: 0 top, 50 middle, 100 bottom.")) mgpu::gpu1::ui_set_fov_bpos(bpv);
+                        if (ui_tip(ui_slider_int("Position##fv", &bpv, 0, 100, bpf), "Band position: 0 top, 50 middle, 100 bottom.")) mgpu::gpu1::ui_set_fov_bpos(bpv);
                         ImGui::SetCursorPosX(x0 + lab_w);
                         bool fw = mgpu::gpu1::ui_fov_fullw();
                         if (ui_tip(ImGui::Checkbox("Full width on ultrawide##fv", &fw), "Lets the band run the full width on 21:9 and wider monitors (racing\ngames). Otherwise it stops at 16:9.")) mgpu::gpu1::ui_set_fov_fullw(fw);
@@ -3311,12 +3681,12 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                     else
                     {
                         int fp = mgpu::gpu1::ui_fov_pct();
-                        if (ui_tip(ImGui::SliderInt("Size##fv", &fp, 30, 90, "%d%%"), "Centre box size, as a share of each side.")) mgpu::gpu1::ui_set_fov_pct(fp);
+                        if (ui_tip(ui_slider_int("Size##fv", &fp, 30, 90, "%d%%"), "Centre box size, as a share of each side.")) mgpu::gpu1::ui_set_fov_pct(fp);
                     }
                     ImGui::SetCursorPosX(x0 + lab_w);
                     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
                     int ff = mgpu::gpu1::ui_fov_feather();
-                    if (ui_tip(ImGui::SliderInt("Soft edge##fv", &ff, 0, 50, "%d%%"), "Width of the blend at the box's edge.")) mgpu::gpu1::ui_set_fov_feather(ff);
+                    if (ui_tip(ui_slider_int("Soft edge##fv", &ff, 0, 50, "%d%%"), "Width of the blend at the box's edge.")) mgpu::gpu1::ui_set_fov_feather(ff);
                     if (fm == 3)
                     {
                         ImGui::SetCursorPosX(x0 + lab_w);
@@ -3392,7 +3762,9 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     snprintf(sm, sizeof sm, "%u actions", mgpu::hotkeys::count());
     if (ui_section(SEC_HK, "Hotkeys", sm))
     {
-        ImGui::TextDisabled("Click a hotkey, then select the new combination below the list.");
+        ImGui::TextDisabled("Click a hotkey, then press the new combination (or select it below the list).");
+        ImGui::TextDisabled("Allowed: Ctrl and/or Alt with A-Z or F1-F12, not already in use.");
+        ImGui::TextDisabled("Fixed: CTRL+ALT+F10 starts the bridge, CTRL+ALT+F6 hides / shows the picture.");
         ImGui::TextDisabled("They work only while the game or the bridge window is in front.");
         const int cap = mgpu::hotkeys::capturing();
         // HK7: the panel's own keyboard (ImGui) is a second source for the
@@ -3436,6 +3808,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         float lw = 0.0f;
         for (unsigned i = 0; i < mgpu::hotkeys::count(); ++i)
         {
+            if (mgpu::hotkeys::fixed(i)) continue;   // HK13
             const float w = ImGui::CalcTextSize(mgpu::hotkeys::label(i)).x;
             if (w > lw) lw = w;
         }
@@ -3447,6 +3820,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::TableSetupColumn("##c", ImGuiTableColumnFlags_WidthStretch);
             for (unsigned i = 0; i < mgpu::hotkeys::count(); ++i)
             {
+                if (mgpu::hotkeys::fixed(i)) continue;   // HK13: CTRL+ALT+F10 / F6 are fixed, not listed
                 char nm[48], lab[96];
                 mgpu::hotkeys::name(i, nm, sizeof nm);
                 snprintf(lab, sizeof lab, "%s##hk%u", (cap == (int)i) ? "Select below..." : nm, i);
@@ -3481,20 +3855,13 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (cap >= 0)
         {
             struct kn { const char *name; int vk; };
+            // HK10: only A-Z and F1-F12 (with Ctrl and/or Alt) can be a hotkey.
             static const kn keys[] = {
                 {"A",'A'},{"B",'B'},{"C",'C'},{"D",'D'},{"E",'E'},{"F",'F'},{"G",'G'},{"H",'H'},{"I",'I'},{"J",'J'},
                 {"K",'K'},{"L",'L'},{"M",'M'},{"N",'N'},{"O",'O'},{"P",'P'},{"Q",'Q'},{"R",'R'},{"S",'S'},{"T",'T'},
                 {"U",'U'},{"V",'V'},{"W",'W'},{"X",'X'},{"Y",'Y'},{"Z",'Z'},
-                {"0",'0'},{"1",'1'},{"2",'2'},{"3",'3'},{"4",'4'},{"5",'5'},{"6",'6'},{"7",'7'},{"8",'8'},{"9",'9'},
                 {"F1",VK_F1},{"F2",VK_F2},{"F3",VK_F3},{"F4",VK_F4},{"F5",VK_F5},{"F6",VK_F6},{"F7",VK_F7},{"F8",VK_F8},
                 {"F9",VK_F9},{"F10",VK_F10},{"F11",VK_F11},{"F12",VK_F12},
-                {"Insert",VK_INSERT},{"Delete",VK_DELETE},{"Home",VK_HOME},{"End",VK_END},{"Page Up",VK_PRIOR},
-                {"Page Down",VK_NEXT},{"Up",VK_UP},{"Down",VK_DOWN},{"Left",VK_LEFT},{"Right",VK_RIGHT},
-                {",",VK_OEM_COMMA},{".",VK_OEM_PERIOD},{"/",VK_OEM_2},{";",VK_OEM_1},{"'",VK_OEM_7},{"[",VK_OEM_4},
-                {"]",VK_OEM_6},{"\\",VK_OEM_5},{"-",VK_OEM_MINUS},{"=",VK_OEM_PLUS},{"`",VK_OEM_3},
-                {"Num 0",VK_NUMPAD0},{"Num 1",VK_NUMPAD1},{"Num 2",VK_NUMPAD2},{"Num 3",VK_NUMPAD3},{"Num 4",VK_NUMPAD4},
-                {"Num 5",VK_NUMPAD5},{"Num 6",VK_NUMPAD6},{"Num 7",VK_NUMPAD7},{"Num 8",VK_NUMPAD8},{"Num 9",VK_NUMPAD9},
-                {"Pause",VK_PAUSE},
             };
             static int pk_for = -1, pk_key = 0;
             static bool pk_c = true, pk_a = true, pk_s = false;
@@ -3505,8 +3872,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::SameLine();
             ui_tip(ImGui::Checkbox("Alt##hkp", &pk_a), "Hold Alt as part of the combination.");
             ImGui::SameLine();
-            ui_tip(ImGui::Checkbox("Shift##hkp", &pk_s), "Hold Shift as part of the combination.");
-            ImGui::SameLine();
+            pk_s = false;   // HK10: Shift is not allowed
             ImGui::SetNextItemWidth(ImGui::CalcTextSize("Page Down").x + ImGui::GetFrameHeight() * 2.0f);
             if (ImGui::BeginCombo("##hkpk", keys[pk_key].name))
             {
@@ -3522,7 +3888,12 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::SameLine();
             if (ui_tip(ImGui::Button("Cancel##hkp"), "Keeps the hotkey as it was.")) mgpu::hotkeys::cancel_capture();
             if (!pk_c && !pk_a)
-                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "Without Ctrl or Alt the game sees this key too.");
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "Tick Ctrl and/or Alt - a hotkey needs at least one.");
+            {   // HK10: why the last combination was not taken (typed or picked)
+                char rf[200];
+                if (mgpu::hotkeys::capture_refusal(rf, sizeof rf))
+                    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s Try another.", rf);
+            }
         }
         if (ui_tip(ImGui::Button("Reset hotkeys to defaults"), "Puts every hotkey back to its default.")) mgpu::hotkeys::reset_defaults();
     }
@@ -3775,8 +4146,8 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (g1[0] == 0) snprintf(g1, sizeof g1, "%s", mgpu::adapter::topology_block(nullptr) != 0 ? "none" : "not chosen yet");
         ImGui::TextDisabled("GPU 0 (Renderer): %s | GPU 1 (MGpu): %s", g0[0] ? g0 : "not known yet", g1);
     }
-    ImGui::TextDisabled("Atomic MGPU Bridge %s (davidm71) | build %s | %s %s",
-                        MGPU_VERSION_STR, MGPU_SOURCE_TAG, __DATE__, __TIME__);
+    ImGui::TextDisabled("Atomic MGPU Bridge %s (davidm71) | build %s, %s | %s %s",
+                        MGPU_VERSION_STR, MGPU_SOURCE_TAG, MGPU_FLAVOUR, __DATE__, __TIME__);
     ImGui::TextDisabled("Something wrong? Send ReShade.log from the game's exe folder to:");
     ImGui::TextDisabled("github.com/davidm71/Neural-coprocessor");
 
@@ -3787,6 +4158,79 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         g_ui_dirty = false;
         (void)mgpu::gpu1::ui_ini_write("UiOpen", g_ui_open);
     }
+}
+
+// TH1: the panel's own colours (panel_theme.hpp), pushed around the whole
+// panel so no early return can leave one pushed. The child window carries the
+// background, because ReShade has already drawn its own by the time this runs.
+static void po_open_reshade_menu(reshade::api::effect_runtime *rt);   // PO1, below
+// PO4 (explained at po_close_reshade_menu):
+static std::atomic<void *> g_rs_menu{nullptr};    // the runtime ReShade's own menu is open on
+static std::atomic<bool>   g_po_switch{false};    // close ReShade's menu, then open the panel by itself
+static void draw_mgpu_overlay(reshade::api::effect_runtime *rt)
+{
+    mgpu::cpuprof::scope cp_panel(mgpu::cpuprof::PANEL);   // CP1
+    static const int theme = mgpu::gpu1::ui_ini_read("PanelTheme", 2);
+    static const bool anim = mgpu::gpu1::ui_ini_read("PanelAnimations", 1) != 0;   // PA1
+    g_anim_on = anim;
+    if (theme == 2) mgpu::theme::apply_global();   // TH2: ReShade's own windows in the same colours
+    // PA1: the fade (alpha pushed) and the slide (indent) of an opening panel.
+    const float slide = mgpu::anim::frame_begin(anim);
+    const int n = theme != 0 ? mgpu::theme::push_content() : 0;
+    ImGui::BeginChild("##mgpu_theme", ImVec2(0.0f, 0.0f), ImGuiChildFlags_AlwaysUseWindowPadding);
+    // WH1: the child is what scrolls now, so the panel's own window hands it the wheel.
+    if (mgpu::live_panel::drawing_own()) mgpu::live_panel::wheel_here();
+    if (slide > 0.5f) ImGui::Indent(slide);
+    {   // PA1 banner; PO1: with the panel shown on its own, a "ReShade menu"
+        // button at the bar's right end opens ReShade's own menu.
+        // PO4: inside ReShade's menu (panel-only mode) the same button reads
+        // "MGPU only" and goes back to the panel by itself.
+        const bool po_alone = mgpu::live_panel::drawing_own() && mgpu::live_panel::po_up();
+        const bool po_back  = !po_alone && mgpu::live_panel::panel_only() &&
+                              g_rs_menu.load(std::memory_order_relaxed) != nullptr;
+        const bool po = po_alone || po_back;
+        const char *bl = po_alone ? "ReShade" : "MGPU only";
+        const float bw = po ? ImGui::CalcTextSize(bl).x + 20.0f : 0.0f;   // 10 px padding each side
+        const ImVec2 tr = mgpu::anim::banner(anim, mgpu::gpu1::ui_bridge_state(), MGPU_SOURCE_TAG,
+                                             po ? bw + 6.0f : 0.0f);
+        if (po)
+        {
+            const ImVec2 after = ImGui::GetCursorScreenPos();
+            // PO2: a real button - filled, square, white 1 px border.
+            ImGui::SetCursorScreenPos(ImVec2(tr.x - bw - 4.0f, tr.y + 3.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 2.0f));
+            ImGui::PushStyleColor(ImGuiCol_Button,        IM_COL32(32, 118, 178, 255));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(52, 146, 210, 255));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  IM_COL32(24, 92, 140, 255));
+            ImGui::PushStyleColor(ImGuiCol_Border,        IM_COL32(255, 255, 255, 255));
+            ImGui::PushStyleColor(ImGuiCol_BorderShadow,  IM_COL32(0, 0, 0, 0));
+            ImGui::PushStyleColor(ImGuiCol_Text,          IM_COL32(255, 255, 255, 255));
+            const bool hit = ImGui::Button(bl);
+            ImGui::PopStyleColor(6);
+            ImGui::PopStyleVar(3);
+            if (hit && po_alone) po_open_reshade_menu(rt);
+            if (hit && po_back) g_po_switch.store(true, std::memory_order_relaxed);   // PO4: runs on the game's thread
+            if (po_back && ImGui::IsItemHovered())
+                ImGui::SetTooltip("Closes ReShade's menu and shows the MGPU panel by itself.\n"
+                                  "Shift+Home does the same; Esc just closes ReShade's menu.");
+            else if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Opens ReShade's own menu (effects, add-ons, settings).\n"
+                                  "Shift+Home does the same. PanelOnly=0 in mgpu.ini goes back\n"
+                                  "to the panel inside ReShade's menu.");
+            ImGui::SetCursorScreenPos(after);
+        }
+    }
+    ks_frame_begin();   // KS1
+    draw_mgpu_overlay_body(rt);
+    ks_frame_end();
+    mgpu::anim::section_end();
+    mgpu::anim::ripple_draw(anim);
+    if (slide > 0.5f) ImGui::Unindent(slide);
+    ImGui::EndChild();
+    if (n != 0) ImGui::PopStyleColor(n);
+    if (anim) ImGui::PopStyleVar();   // the fade pushed by frame_begin
 }
 #endif
 
@@ -3886,6 +4330,7 @@ static std::atomic<bool> g_ov_echo_bridge{false};
 // R138). init_effect_runtime fires for every runtime either way.
 static void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 {
+    sw2_stack("init_effect_runtime");   // SW2
     if (runtime == nullptr) return;
     reshade::api::device *dev = runtime->get_device();
     if (dev == nullptr || dev->get_api() != reshade::api::device_api::d3d12) return;
@@ -3909,9 +4354,60 @@ static void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 // stale pointer here is a real hazard rather than a tidiness question. Cleared
 // by identity: whichever slot holds this pointer loses it, and the pending
 // value goes with it so a resize cannot deliver a toggle to a dead runtime.
+// EX1 (IN90): is this the GAME's device (not the bridge card's)? D3D11 is
+// always the game's (the bridge is D3D12). D3D12: the game's adapter when
+// known; otherwise anything but the selected bridge card. Destroy/init events
+// only - never per frame.
+static bool ex_is_game_device(reshade::api::device *d)
+{
+    if (d == nullptr) return false;
+    if (d->get_api() == reshade::api::device_api::d3d11) return true;
+    if (d->get_api() != reshade::api::device_api::d3d12) return false;
+    auto *d12 = reinterpret_cast<ID3D12Device *>(static_cast<uintptr_t>(d->get_native()));
+    if (d12 == nullptr) return false;
+    mgpu::adapter::selection_result sel;
+    mgpu::adapter::get_selection(sel);
+    const LUID l = d12->GetAdapterLuid();
+    if (sel.game_luid_known) return l.LowPart == sel.game_luid.LowPart && l.HighPart == sel.game_luid.HighPart;
+    if (sel.valid) return !(l.LowPart == sel.selected_luid.LowPart && l.HighPart == sel.selected_luid.HighPart);
+    return false;   // nothing known yet: not evidence either way
+}
+// EX1: evaluate at a destroy event; on "closing", signal the bridge thread's
+// ordered teardown (fg present -> stream -> GPU 1). Signal only - the game's
+// thread never waits here.
+static void ex_evaluate(bool game_queue_released)
+{
+    if (mgpu::gpu1::ex_check(game_queue_released))
+        mgpu::worker::stop();
+}
+
+// XT1 (IN85, log only) + EX1 evidence: the game releasing a queue.
+static void on_destroy_command_queue(reshade::api::command_queue *queue)
+{
+    if (queue == nullptr || queue->get_device() == nullptr) return;
+    reshade::api::device *qd = queue->get_device();
+    const bool game_dev = ex_is_game_device(qd);
+    if (qd->get_api() == reshade::api::device_api::d3d12)
+    {
+        void *qn = reinterpret_cast<void *>(static_cast<uintptr_t>(queue->get_native()));
+        // XT2 (diagnostic builds): this dying queue still holds its device until
+        // its Release ends (ReShade 6.8), so the device count is safe to read.
+        mgpu::calibrator::xt2_read_if_device(reinterpret_cast<void *>(static_cast<uintptr_t>(qd->get_native())));
+        mgpu::gpu1::exit_trace("destroy_command_queue", qn, true, nullptr);
+    }
+    ex_evaluate(game_dev);
+}
+
 static void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
 {
     if (runtime == nullptr) return;
+    mgpu::gpu1::exit_trace("destroy_effect_runtime (ReShade's 'Destroyed runtime environment')",
+                           nullptr, false, runtime->get_hwnd());   // XT1 (IN85): log only
+    ex_evaluate(false);   // EX1 (IN90)
+    {   // PO4: ReShade's menu cannot be open on a runtime that is going away
+        void *exp = (void *)runtime;
+        g_rs_menu.compare_exchange_strong(exp, nullptr, std::memory_order_relaxed);
+    }
     mgpu::live_panel::runtime_destroyed(runtime);   // PP1; off: returns at once
     // R160. The POINTER is left alone and only the pending state is dropped.
     //
@@ -3937,6 +4433,7 @@ static void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
         g_ov_pend_bridge.store(-1, std::memory_order_relaxed);
         g_ov_echo_bridge.store(false, std::memory_order_relaxed);
     }
+    mgpu::live_panel::set_picture_panel(r, false);   // PW1: never drawn on a runtime that is going away
 }
 
 //
@@ -3949,9 +4446,249 @@ static void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
 // the bridge's window from the desktop while the game is presenting disturbs
 // the game's own overlay. DcompOverlay=1 does not have this problem because
 // unrooting a visual is not the same operation as hiding a window.
+// ---- PO1: PANEL ONLY (PanelOnly=1, the default; needs PanelOverPicture=1) ----
+//
+// Home shows the MGPU panel by itself: ReShade's open on the game's runtime is
+// refused (the API's own way: return true from reshade_open_overlay) and the
+// panel is drawn in its own window from reshade_overlay, which ReShade raises
+// every frame whether its menu is open or not. Where the panel is shown is
+// the same as before: on the neural picture (DcompOverlay), on the picture's
+// runtime (BT5, picture on top), otherwise on the game's runtime.
+// Not taken over, so they behave exactly as before: every close, our own
+// re-opens (echo), Shift+Home and the panel's "ReShade menu" button (they open
+// ReShade's menu with the panel in it), and any case where the panel cannot be
+// shown on its own (no picture runtime yet, the picture not on screen).
+static void po_close_all()
+{
+    if (!mgpu::live_panel::po_up()) return;
+    mgpu::live_panel::po_mark(false);
+    mgpu::live_panel::po_set(nullptr, false);
+    if (mgpu::gpu1::dcomp_overlay_mode() && mgpu::live_panel::live()) mgpu::live_panel::set_live(false);
+    if (mgpu::gpu1::bw_active() && mgpu::gpu1::bw_panel())
+    {
+        mgpu::gpu1::bw_set_panel(false);
+        mgpu::live_panel::set_picture_panel(nullptr, false);
+    }
+    mgpu::diag::info("[MGPU][PO1] panel closed; the game's input is released.");
+}
+
+// The banner button (from the panel's own draw on runtime rt) and Shift+Home
+// (PO2, from the game's runtime, rt = the game's runtime): ReShade's own menu,
+// opened the way Home opened it before PO1, the MGPU panel inside it.
+// ---- PO4: GETTING OUT OF RESHADE'S MENU ----
+// REPORTED 2026-11-22 (RoboCop, IN73): once ReShade's menu was open the only way
+// out was Home, then Home again for the MGPU panel. Now: Esc closes ReShade's
+// menu (ReShade itself has no Esc for it, and on the picture it never has the
+// keyboard focus anyway); Shift+Home, or the "MGPU only" button on the panel
+// inside it, closes it and opens the MGPU panel by itself.
+// (g_rs_menu and g_po_switch are declared above draw_mgpu_overlay, which reads them.)
+static std::atomic<unsigned long long> g_po_back_until{0};   // waiting for the close to land (ms)
+static std::atomic<bool>   g_po_own_once{false};  // the next open is ours even with Shift still held
+
+// Game thread only. Closes ReShade's menu the way the mode closes it: on the
+// game's own runtime directly; on the picture / neural picture as Home does
+// (the hand-over toggles it shut). po_allow: Shift may be held (Shift+Home).
+static void po_close_reshade_menu(reshade::api::effect_runtime *grt)
+{
+    void *m = g_rs_menu.load(std::memory_order_relaxed);
+    if (m == nullptr || grt == nullptr) return;
+    if (m == (void *)grt) grt->open_overlay(false, reshade::api::input_source::keyboard);
+    else
+    {
+        mgpu::live_panel::po_allow_reshade_once();
+        grt->open_overlay(true, reshade::api::input_source::keyboard);
+    }
+}
+
+static void po_open_reshade_menu_why(reshade::api::effect_runtime *rt, const char *why)
+{
+    void *b = g_rt_bridge.load(std::memory_order_relaxed);
+    const bool dmode = mgpu::gpu1::dcomp_overlay_mode();
+    const bool dc = dmode && b != nullptr && mgpu::gpu1::dcomp_visual_rooted();
+    const bool bt = !dmode && mgpu::gpu1::bw_active() && b != nullptr &&
+                    (mgpu::gpu1::bw_on_top() || mgpu::gpu1::bw_panel());
+    if (!mgpu::live_panel::po_up())   // ReShade's menu already open the old way: leave it
+    {
+        if (dc && mgpu::live_panel::live()) return;
+        if (bt && mgpu::gpu1::bw_panel()) return;
+    }
+    po_close_all();
+    g_ov_source.store((int)reshade::api::input_source::keyboard, std::memory_order_relaxed);
+    if (dc)        // on the neural picture
+    {
+        mgpu::live_panel::set_live(true);
+        g_ov_pend_bridge.store(1, std::memory_order_relaxed);
+    }
+    else if (bt)   // on the picture's runtime
+    {
+        mgpu::gpu1::bw_set_panel(true);
+        g_ov_pend_bridge.store(1, std::memory_order_relaxed);
+    }
+    else if (rt != nullptr)   // the game's runtime, on its own thread: open it directly
+    {
+        mgpu::live_panel::po_allow_reshade_once();
+        rt->open_overlay(true, reshade::api::input_source::keyboard);
+    }
+    char l[200];
+    snprintf(l, sizeof l, "[MGPU][PO1] %s: ReShade's own menu opened (the MGPU panel is in it).", why);
+    mgpu::diag::info(l);
+}
+static void po_open_reshade_menu(reshade::api::effect_runtime *rt) { po_open_reshade_menu_why(rt, "\"ReShade\" button"); }
+static void po_shift_home(reshade::api::effect_runtime *rt)
+{
+    // PO4: Shift+Home toggles - from ReShade's menu back to the MGPU panel.
+    if (g_rs_menu.load(std::memory_order_relaxed) != nullptr && !mgpu::live_panel::po_up())
+    {
+        g_po_switch.store(true, std::memory_order_relaxed);
+        return;
+    }
+    po_open_reshade_menu_why(rt, "Shift+Home");
+}
+
+// PO4: every frame on the game's runtime (its own thread), panel-only mode.
+static void po_tick(reshade::api::effect_runtime *grt)
+{
+    const unsigned long long now = GetTickCount64();
+    // Esc closes ReShade's menu (not during a hotkey capture - Esc cancels it there).
+    static int esc_prev = 0;
+    const int esc = mgpu::hotkeys::key_down(VK_ESCAPE) ? 1 : 0;
+    if (esc != 0 && esc_prev == 0 && g_rs_menu.load(std::memory_order_relaxed) != nullptr &&
+        !mgpu::live_panel::po_up() && mgpu::hotkeys::capturing() < 0)
+    {
+        po_close_reshade_menu(grt);
+        mgpu::diag::info("[MGPU][PO4] Esc: ReShade's menu closed.");
+    }
+    esc_prev = esc;
+    // Shift+Home / the "MGPU only" button: close ReShade's menu, then open the
+    // panel by itself once the close has landed (2 s at most).
+    if (g_po_switch.exchange(false, std::memory_order_relaxed))
+    {
+        po_close_reshade_menu(grt);
+        g_po_back_until.store(now + 2000ull, std::memory_order_relaxed);
+    }
+    const unsigned long long until = g_po_back_until.load(std::memory_order_relaxed);
+    if (until != 0)
+    {
+        const bool closed = g_rs_menu.load(std::memory_order_relaxed) == nullptr &&
+                            !(mgpu::gpu1::bw_active() && mgpu::gpu1::bw_panel()) &&
+                            !(mgpu::gpu1::dcomp_overlay_mode() && mgpu::live_panel::live());
+        if (closed)
+        {
+            g_po_back_until.store(0, std::memory_order_relaxed);
+            g_po_own_once.store(true, std::memory_order_relaxed);            // Shift may still be down
+            grt->open_overlay(true, reshade::api::input_source::keyboard);   // po_handle: the panel by itself
+            mgpu::diag::info("[MGPU][PO4] ReShade's menu closed - back to the MGPU panel by itself.");
+        }
+        else if (now > until) g_po_back_until.store(0, std::memory_order_relaxed);
+    }
+}
+
+// True = handled here (the open is refused). False = the code below decides.
+static bool po_handle(reshade::api::effect_runtime *runtime, bool open)
+{
+    if (runtime == nullptr || !open || !mgpu::live_panel::panel_only()) return false;
+    void *g = g_rt_game.load(std::memory_order_relaxed);
+    void *b = g_rt_bridge.load(std::memory_order_relaxed);
+    void *r = runtime;
+    if (g != nullptr && r != g) return false;                                 // only the key on the game's runtime
+    if (g_ov_echo_game.load(std::memory_order_relaxed)) return false;         // our own re-open
+    if (mgpu::live_panel::po_take_allow()) return false;                      // the banner button
+    // Shift+Home: refused here - PO2 opens ReShade's menu from the keyboard hook
+    // (with ForceShortcutModifiers=0 ReShade also reports it; this keeps it to one open).
+    if (!g_po_own_once.exchange(false, std::memory_order_relaxed) &&   // PO4: the switch back
+        !mgpu::hotkeys::overlay_key_has_shift() && mgpu::hotkeys::key_down(VK_SHIFT)) return true;
+
+    if (mgpu::gpu1::dcomp_overlay_mode())
+    {
+        if (b == nullptr || !mgpu::gpu1::dcomp_visual_rooted()) return false;   // no picture: as before
+        if (mgpu::live_panel::live() && !mgpu::live_panel::po_up()) return false;   // ReShade's menu is up: Home closes it as before
+        if (mgpu::live_panel::live()) { po_close_all(); return true; }
+        mgpu::live_panel::set_live(true);
+        mgpu::live_panel::note_opened_on(mgpu::live_panel::host_target(b), true);
+        mgpu::live_panel::po_mark(true);
+        mgpu::diag::info("[MGPU][PO1] panel opened by itself on the neural picture (ReShade's menu stays "
+                         "closed; Shift+Home opens it). The game's input is blocked while it is drawn.");
+        return true;
+    }
+    if (mgpu::gpu1::bw_active() && b != nullptr && (mgpu::gpu1::bw_on_top() || mgpu::gpu1::bw_panel()))
+    {
+        if (mgpu::gpu1::bw_panel() && !mgpu::live_panel::po_up()) return false;   // ReShade's menu is up: as before
+        if (mgpu::gpu1::bw_panel()) { po_close_all(); return true; }
+        mgpu::gpu1::bw_set_panel(true);   // the picture window takes the mouse; the game's input is blocked
+        mgpu::live_panel::set_picture_panel(b, true);
+        mgpu::live_panel::po_mark(true);
+        mgpu::diag::info("[MGPU][PO1] panel opened by itself on the picture (ReShade's menu stays closed; "
+                         "Shift+Home opens it).");
+        return true;
+    }
+    // Plain: on the game's own runtime.
+    if (mgpu::live_panel::po_runtime() == r) { po_close_all(); return true; }
+    mgpu::live_panel::po_set(r, true);
+    mgpu::live_panel::po_mark(true);
+    mgpu::diag::info("[MGPU][PO1] panel opened by itself (ReShade's menu stays closed; Shift+Home opens it).");
+    return true;
+}
+
+static bool on_reshade_open_overlay_impl(reshade::api::effect_runtime *runtime, bool open,
+                                         reshade::api::input_source source);
+// PO4: the wrapper notes where ReShade's own menu is open (the change goes
+// through whenever the handler does not refuse it).
 static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool open,
                                     reshade::api::input_source source)
 {
+    const bool refused = on_reshade_open_overlay_impl(runtime, open, source);
+    if (!refused && runtime != nullptr)
+    {
+        if (open) g_rs_menu.store((void *)runtime, std::memory_order_relaxed);
+        else
+        {
+            void *exp = (void *)runtime;
+            g_rs_menu.compare_exchange_strong(exp, nullptr, std::memory_order_relaxed);
+        }
+        mgpu::gpu1::ui_rs_menu(g_rs_menu.load(std::memory_order_relaxed) != nullptr);   // LR106: input replay
+    }
+    return refused;
+}
+static bool on_reshade_open_overlay_impl(reshade::api::effect_runtime *runtime, bool open,
+                                         reshade::api::input_source source)
+{
+    // HX1: in the bridge-window mode the picture's window is never activated,
+    // so ReShade toggling its overlay THERE by itself is a mirror of a press
+    // the game's runtime also gets. Halo: Campaign Evolved (GDK) delivered
+    // Home to both, the picture's first: it opened the panel, the game's then
+    // closed it (a flash on every press).
+    // IN92 refused only a keyboard toggle with the key still held; IN93 only a
+    // keyboard toggle. Neither fired: ReShade 6.8 (runtime_gui.cpp, draw_gui)
+    // tags a key-triggered toggle with the window's last NAVIGATION source -
+    // MOUSE on the picture, whose panel is only ever used with the mouse. And
+    // ReShade toggles by itself only on the overlay key, Esc or the gamepad
+    // combination - all mirrored here. So (IN94) every toggle on the picture's
+    // runtime is refused unless it is the add-on's own: the echo of a change it
+    // asked for, or its Esc close (live_panel::self_toggle()). The game's
+    // runtime handles the press, as in every earlier game; the add-on handles
+    // Esc for ReShade's menu on the picture (PO4).
+    if (runtime != nullptr &&
+        !mgpu::gpu1::dcomp_overlay_mode() && mgpu::gpu1::bw_active() &&
+        (void *)runtime == g_rt_bridge.load(std::memory_order_relaxed) &&
+        g_rt_game.load(std::memory_order_relaxed) != nullptr &&
+        !g_ov_echo_bridge.load(std::memory_order_relaxed) &&
+        !mgpu::live_panel::self_toggle())
+    {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 3)
+        {
+            char l[260];
+            snprintf(l, sizeof l, "[MGPU][HX1] ReShade on the picture tried to %s its overlay by itself (tagged %s) - "
+                     "a mirrored press (the picture never has the keyboard); ignored there, the game's runtime "
+                     "handles it.", open ? "open" : "close",
+                     source == reshade::api::input_source::keyboard ? "keyboard"
+                     : source == reshade::api::input_source::mouse ? "mouse"
+                     : source == reshade::api::input_source::gamepad ? "gamepad" : "other");
+            mgpu::diag::info(l);
+        }
+        return true;
+    }
+    if (po_handle(runtime, open)) return true;   // PO1
     if (mgpu::gpu1::dcomp_overlay_mode())
     {
         // PP1: PanelOverPicture (upstream 0.4.0, NO1950). Off: the two shipped
@@ -4015,9 +4752,15 @@ static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool 
         if (r == b && g_ov_echo_bridge.exchange(false, std::memory_order_relaxed))
         {
             mgpu::gpu1::bw_set_panel(open);
+            mgpu::live_panel::set_picture_panel(r, open);   // PW1: the panel's own window on the picture
             return false;
         }
-        if (r == b) { mgpu::gpu1::bw_set_panel(open); return false; }   // closed from the panel itself
+        if (r == b)   // closed from the panel itself
+        {
+            mgpu::gpu1::bw_set_panel(open);
+            mgpu::live_panel::set_picture_panel(r, open);   // PW1
+            return false;
+        }
         if (r == g && b != nullptr && (mgpu::gpu1::bw_on_top() || mgpu::gpu1::bw_panel()))
         {
             if (!open) return false;
@@ -4207,6 +4950,7 @@ static void on_present(reshade::api::command_queue *queue,
                        const reshade::api::rect *, const reshade::api::rect *,
                        uint32_t, const reshade::api::rect *)
 {
+    sw2_stack("present");   // SW2
     if (queue == nullptr) return;
     // SO2: a present reached - the milestone a Steam overlay step-over is judged
     // by. One relaxed atomic per frame; the device check runs only for a few
@@ -4276,6 +5020,7 @@ static void on_present(reshade::api::command_queue *queue,
 
                 // PP1: the game's input is blocked while the panel is drawn over
                 // the picture (R293 guard inside); this is the game chain's Present.
+                if (p_is_game) mgpu::gpu1::rc2_poll();   // RC2
                 if (p_is_game)
                     mgpu::live_panel::block_game_input(
                         (reshade::api::effect_runtime *)g_rt_game.load(std::memory_order_relaxed));
@@ -4297,7 +5042,15 @@ static void on_present(reshade::api::command_queue *queue,
                 {
                     if (!p_is_game && live_mode && rt == mgpu::live_panel::host_target(nullptr) &&
                         mgpu::live_panel::take_reopen())
-                        pend.store(1, std::memory_order_relaxed);   // UI4: as if the overlay key were pressed
+                    {
+                        if (mgpu::live_panel::po_up())   // PO1: back by itself, ReShade's menu stays closed
+                        {
+                            mgpu::live_panel::set_live(true);
+                            mgpu::live_panel::note_opened_on((void *)rt, true);
+                        }
+                        else
+                            pend.store(1, std::memory_order_relaxed);   // UI4: as if the overlay key were pressed
+                    }
                     const int want = pend.exchange(-1, std::memory_order_relaxed);
                     if (want >= 0)
                     {
@@ -4445,6 +5198,7 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
                                       reshade::api::resource_view rtv,
                                       reshade::api::resource_view rtv_srgb)
 {
+    sw2_stack("finish_effects");   // SW2
     (void)rtv_srgb;
     if (runtime == nullptr || cmd_list == nullptr) return;
 
@@ -4892,12 +5646,26 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
 // release it when THAT chain goes (the bridge's own chain is resized at arm).
 static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
-    (void)resize;
+    // EX1 (IN90): game chains tracked by identity; then evaluate. XT2: a dying
+    // chain still holds its queue, which holds the device (ReShade 6.8).
+    if (swapchain != nullptr && ex_is_game_device(swapchain->get_device()))
+    {
+        if (swapchain->get_device()->get_api() == reshade::api::device_api::d3d12)
+            mgpu::calibrator::xt2_read_if_device(
+                reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_device()->get_native())));
+        mgpu::gpu1::ex_note_chain(reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())),
+                                  swapchain->get_hwnd(), false, resize);
+    }
+    if (swapchain != nullptr)   // XT1 (IN85): log only
+        mgpu::gpu1::exit_trace(resize ? "destroy_swapchain (resize)" : "destroy_swapchain",
+                               reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())), true,
+                               swapchain->get_hwnd());
     if (swapchain != nullptr && mgpu::gamepresent::on())   // GP1: only acts on the chain it attached to
         mgpu::gamepresent::detach(reinterpret_cast<IUnknown *>(static_cast<uintptr_t>(swapchain->get_native())));
     if (mgpu::dx11probe::on() && swapchain != nullptr &&
         mgpu::dx11probe::is_chain(reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native()))))
         mgpu::dx11probe::shutdown();
+    ex_evaluate(false);   // EX1 (IN90)
 }
 
 // T3 instrumentation: in a clean run, no destroy_device with the game's
@@ -4908,6 +5676,10 @@ static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize
 // worker::stop for why nothing here waits).
 static void on_destroy_device(reshade::api::device *device)
 {
+    if (device != nullptr && device->get_api() == reshade::api::device_api::d3d12)   // XT1 (IN85): log only
+        mgpu::gpu1::exit_trace("destroy_device", reinterpret_cast<void *>(static_cast<uintptr_t>(device->get_native())),
+                               true, nullptr);
+    if (device != nullptr) mgpu::calibrator::xt2_forget_device(device);   // XT2 (IN88)
     mgpu::adapter::log_device_luid("destroy_device", device);
     // R227: the D3D11 game device going away is the DX11 producer's teardown
     // point, mirroring the D3D12 game-device teardown below: the stream
@@ -4970,6 +5742,55 @@ static void on_destroy_device(reshade::api::device *device)
     }
 }
 
+#if defined(MGPU_HAVE_IMGUI)
+// SU1 (IN95): one line in ReShade's own fps-counter box ("OSD" widget - ReShade
+// draws it inside that window, same corner, under the fps line), on the GAME's
+// runtime only, while the bridge is starting. ReShade pops the counter's colour
+// and size before add-on widgets, so they are pushed again from ReShade.ini
+// (ColFPSText, FPSScale, FPSPosition - read once a second, not every frame).
+static void draw_mgpu_osd(reshade::api::effect_runtime *rt)
+{
+    if (rt == nullptr || (void *)rt != g_rt_game.load(std::memory_order_relaxed)) return;
+    char t[160];
+    if (!mgpu::gpu1::startup_hud_text(t, sizeof t)) return;
+    static float col[4] = { 1.0f, 1.0f, 0.784314f, 1.0f };
+    static float scale = 1.0f;
+    static int pos = 1;
+    static unsigned long long read_ms = 0;
+    const unsigned long long now = GetTickCount64();
+    if (now - read_ms > 1000ull)
+    {
+        read_ms = now;
+        char v[96] = {}; size_t vn = sizeof v;
+        if (reshade::get_config_value(rt, "STYLE", "ColFPSText", v, &vn))
+        {
+            float c[4] = { col[0], col[1], col[2], col[3] };
+            if (sscanf_s(v, "%f,%f,%f,%f", &c[0], &c[1], &c[2], &c[3]) >= 3)
+            {
+                for (int i = 0; i < 4; ++i) col[i] = c[i];
+                if (col[3] <= 0.0f) col[3] = 1.0f;   // as ReShade does
+            }
+        }
+        float sc = scale;
+        if (reshade::get_config_value(rt, "STYLE", "FPSScale", sc) && sc > 0.1f && sc < 10.0f) scale = sc;
+        int p = pos;
+        if (reshade::get_config_value(rt, "OVERLAY", "FPSPosition", p) && p >= 0 && p <= 3) pos = p;
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(col[0], col[1], col[2], col[3]));
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * scale);
+    if (pos % 2)   // right-aligned like ReShade's own lines
+    {
+        const float w = ImGui::GetContentRegionAvail().x;
+        const float tw = ImGui::CalcTextSize(t).x;
+        if (w > tw) ImGui::SetCursorPosX(w - tw + ImGui::GetStyle().ItemSpacing.x);
+    }
+    ImGui::TextUnformatted(t);
+    ImGui::PopFont();
+    ImGui::PopStyleColor();
+}
+
+#endif
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 {
     switch (fdwReason)
@@ -4994,6 +5815,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         reshade::log::message(reshade::log::level::info,
             "[MGPU][T1] Atomic MGPU Bridge add-on registered - stock ReShade, add-on API version "
             MGPU_STR(RESHADE_API_VERSION));
+        rs3_stop_runtime_sync();   // RS3
         // SLT3: must be in place before the engine resolves Streamline, so it
         // runs here. Does nothing unless mgpu.ini says SLTags=3.
         mgpu::sltags::early_install(hModule);
@@ -5008,7 +5830,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
             // R141. Before anything else this add-on says, say what it is.
             char v[420];
             snprintf(v, sizeof v,
-                     "[MGPU][R141] Atomic MGPU Bridge %s | source " MGPU_SOURCE_TAG " | built %s %s | add-on API 20. IDENTIFY EVERY "
+                     "[MGPU][R141] Atomic MGPU Bridge %s | source " MGPU_SOURCE_TAG " | " MGPU_FLAVOUR " build | built %s %s | add-on API 20. IDENTIFY EVERY "
                      "LOG BY THIS LINE. ReShade's own 'Registered add-on' line carries "
                      "v0.0.0.0 because that field has never been filled in, which is why "
                      "reports have had to quote the file size in bytes instead. If this line "
@@ -5026,6 +5848,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);           // R242
         // T3: device lifecycle instrumentation + teardown trigger.
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
+        reshade::register_event<reshade::addon_event::destroy_command_queue>(on_destroy_command_queue);   // XT1
         // P1.5: capture one real frame. Registered last because it is the only
         // subscription that acts on the game's own command list.
         reshade::register_event<reshade::addon_event::reshade_finish_effects>(
@@ -5052,17 +5875,21 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // same thread the probe's own register_event calls belong on anyway.
 #if defined(MGPU_HAVE_IMGUI)
         reshade::register_overlay("Atomic MGPU Bridge", draw_mgpu_overlay);
+        reshade::register_overlay("OSD", draw_mgpu_osd);   // SU1 (IN95): start-up stage in ReShade's fps box
         mgpu::live_panel::set_drawer(draw_mgpu_overlay);   // UX1
+        mgpu::live_panel::set_po_closer(po_close_all);     // PO1: ESC
+        mgpu::live_panel::set_po_shift(po_shift_home);     // PO2: Shift+Home
+        mgpu::live_panel::set_po_tick(po_tick);            // PO4: Esc / switch back
         reshade::log::message(reshade::log::level::info,
             "[MGPU][P6.4] overlay panel registered - open the ReShade overlay (Home) over the "
             "BRIDGE window to get passes, the neural on/off and the intensity sliders. The "
-            "intensity hotkeys (CTRL+ALT+END / PAGE UP / PAGE DOWN by default) still work and drive the same values.");
+            "intensity hotkeys (CTRL+ALT+F5 / F1 / F2 by default) still work and drive the same values.");
 #else
         reshade::log::message(reshade::log::level::warning,
             "[MGPU][P7.1] NO OVERLAY PANEL IN THIS BUILD - imgui.h was not on the include path "
             "when this compiled, and reshade.hpp only wires up the ImGui function table when "
             "IMGUI_VERSION_NUM is defined ahead of it. Nothing else is affected: use the "
-            "intensity hotkeys (CTRL+ALT+END / PAGE UP / PAGE DOWN by default), which drive exactly the same values. To get the "
+            "intensity hotkeys (CTRL+ALT+F5 / F1 / F2 by default), which drive exactly the same values. To get the "
             "panel, put ImGui 1.92.5's imgui.h and imconfig.h (tag 3912b3d, the commit ReShade "
             "18deaa52 pins at deps/imgui) somewhere on the include path. A target_include_"
             "directories line pointing at a directory that does not exist is silently ignored "
@@ -5125,6 +5952,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         }
 #if defined(MGPU_HAVE_IMGUI)
         reshade::unregister_overlay("Atomic MGPU Bridge", draw_mgpu_overlay);
+        reshade::unregister_overlay("OSD", draw_mgpu_osd);   // SU1
 #endif
         // P9.1 before worker::stop: unregistering our events while the game
         // thread may still raise them is the one ordering that matters here,

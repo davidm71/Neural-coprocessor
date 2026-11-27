@@ -7,6 +7,7 @@
   cmake --build build --config Release). It collects:
 
     AtomicMGPU-Setup.exe                     the installer (from the build)
+    mgpu-report.bat                          problem report helper (versions + SHA-256)
     nvngx.dll_mgpu_bridge.addon64            the add-on (from the build, renamed)
     mgpu.ini, gpu1.ini, ReShade2.ini         from assets\
     README.txt, LICENSE
@@ -73,6 +74,7 @@ New-Item -ItemType Directory -Force -Path $out, (Join-Path $out "reshade-shaders
 
 # ---- the release set ----
 Copy-Item $setup.FullName (Join-Path $out "AtomicMGPU-Setup.exe")
+Copy-Item (Join-Path $root "installer\mgpu-report.bat") (Join-Path $out "mgpu-report.bat")   # RP2: problem report helper
 Copy-Item $addon.FullName (Join-Path $out "nvngx.dll_mgpu_bridge.addon64")
 foreach ($f in "assets\mgpu.ini", "assets\gpu1.ini", "assets\ReShade2.ini", "assets\README.txt", "LICENSE") {
     Copy-Item $f $out

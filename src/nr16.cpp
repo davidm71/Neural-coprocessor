@@ -2,6 +2,7 @@
 // nr16.hpp for what it is for and the contract it keeps. Everything here runs
 // on the bridge thread.
 
+#include "d3dc.hpp"   // SC1
 #include "nr16.hpp"
 
 #include <atomic>
@@ -152,7 +153,7 @@ HRESULT make_tex16(ID3D12Device *dev, unsigned w, unsigned h, ID3D12Resource **o
 bool build_kernels(ID3D12Device *dev)
 {
     char line[900];
-    HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+    HMODULE dc = mgpu::sys_d3dcompiler_module() /* SC1 */;
     pfn_d3dcompile compile = (dc != nullptr)
                                ? (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile") : nullptr;
     if (compile == nullptr)

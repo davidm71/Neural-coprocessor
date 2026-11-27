@@ -56,6 +56,8 @@
 // nvsdk_ngx_d3d12.h does not exist in that tree; the D3D12 entry points are
 // declared in nvsdk_ngx.h itself. Same include this project already uses.
 #include "../ext/ngx/nvsdk_ngx.h"
+#include "ffx/ffx_api.h"        // UT1
+#include "ffx/ffx_upscale.h"    // UT1
 
 namespace mgpu
 {
@@ -362,6 +364,46 @@ void latch_scene_handle(unsigned long long hv)
 }
 
 // The evaluate-side test. Replaces a single == against g_sr_handle.
+// UH1. REPORTED 2026-11-17 (Shadow of the Tomb Raider, IN30): the game made
+// its DLSS feature before our hook was in place (sr-handle=UNFILTERED,
+// creates=0), so R106b refused every evaluate copy (eval-skips climbing,
+// eval-copies=0) and frame generation had no motion vectors all session.
+// R106b's danger is TWO features (Plague Tale: super sampling + frame
+// generation) both reaching the copy. That is measurable without
+// CreateFeature: if only ONE handle has been evaluating - 120 evaluates in a
+// row, no other handle seen in the last 300 frames - it is the scene feature.
+// A second handle turns this off again at once.
+std::atomic<unsigned long long> g_uh_handle{0};
+unsigned long long g_uh_last_frame = 0, g_uh_conflict_frame = 0, g_uh_count = 0;
+bool g_uh_said = false;
+
+bool uh_single_handle_ok(unsigned long long hv, unsigned long long fr)
+{
+    if (hv == 0ull) return false;
+    const unsigned long long cur = g_uh_handle.load(std::memory_order_relaxed);
+    if (cur != hv)
+    {
+        if (cur != 0ull && fr < g_uh_last_frame + 60ull)
+            g_uh_conflict_frame = fr;            // two handles alive together
+        g_uh_handle.store(hv, std::memory_order_relaxed);
+        g_uh_count = 0;
+    }
+    g_uh_last_frame = fr;
+    ++g_uh_count;
+    const bool ok = g_uh_count >= 120ull &&
+                    (g_uh_conflict_frame == 0ull || fr > g_uh_conflict_frame + 300ull);
+    if (ok && !g_uh_said)
+    {
+        g_uh_said = true;
+        char l[260];
+        std::snprintf(l, sizeof l, "[MGPU][UH1] the game made its DLSS before the bridge was hooked in, but only one "
+                      "DLSS feature is running (handle 0x%llx, %llu evaluates in a row): copying its motion vectors "
+                      "from the evaluate.", hv, g_uh_count);
+        mgpu::diag::info(l);
+    }
+    return ok;
+}
+
 bool is_latched_scene_handle(unsigned long long hv)
 {
     if (hv == 0ull) return false;                 // R180: never match the free marker
@@ -427,6 +469,11 @@ void decode_flags(unsigned int fl, table &t)
 // costs one frame of staleness. A writer that waits costs the game.
 std::atomic<unsigned> g_seq{0};
 table g_tbl{};
+
+// UT1 (see the XeSS/FSR block further down).
+std::atomic<int> g_ut_mode{0};
+std::atomic<unsigned long long> g_ut_last_ngx{0};     // our frame at the last DLSS capture
+std::atomic<int> g_ut_src{0};   // 0 none 1 dlss 2 xess 3 fsr (last published)
 
 double g_qpc_to_ns = 0.0;
 
@@ -581,6 +628,8 @@ void capture(const NVSDK_NGX_Parameter *p)
         }
     }
 
+    g_ut_last_ngx.store(t.frame ? t.frame : 1ull, std::memory_order_relaxed);   // UT1
+    g_ut_src.store(1, std::memory_order_relaxed);
     g_captures.fetch_add(1, std::memory_order_relaxed);
     g_cost_ns.fetch_add((unsigned long long)((double)(qpc() - t0) * g_qpc_to_ns),
                         std::memory_order_relaxed);
@@ -594,12 +643,15 @@ HMODULE ngx_module();
 
 // ---- THE HOOKS ----
 
+static void xt2_from_cmdlist(ID3D12GraphicsCommandList *cl);   // XT2 (IN87), defined below
+
 NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
                                           const NVSDK_NGX_Handle *h,
                                           const NVSDK_NGX_Parameter *p,
                                           void *cb)
 {
     g_evals.fetch_add(1, std::memory_order_relaxed);
+    xt2_from_cmdlist(cl);   // XT2 (IN87): one load after the first call; nothing in production builds
 
     const int m = g_mode.load(std::memory_order_relaxed);
     if (m != 0)
@@ -617,9 +669,24 @@ NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
         // matter. Live mode never stops, which is the whole point: a
         // resolution or DLSS preset change destroys these resources and
         // recreates them, and a handle latched across that is a dead pointer.
+        // RV3: "DLSS is talking" means the scene feature evaluated - even when
+        // latch mode (below) stops reading it - so auto (UpscalerTap=0) never
+        // hands the table to XeSS/FSR while DLSS is the game's upscaler.
+        if (take)
+        {
+            const unsigned long long fr = g_frames.load(std::memory_order_relaxed);
+            g_ut_last_ngx.store(fr ? fr : 1ull, std::memory_order_relaxed);
+        }
+
         if (take && m == 1 &&
             (g_tbl.have & (KEY_MVEC | KEY_MV_SCALE)) == (KEY_MVEC | KEY_MV_SCALE))
             take = false;
+
+        // UT1: UpscalerTap=2/3 hands the table to XeSS/FSR alone.
+        {
+            const int utm = g_ut_mode.load(std::memory_order_relaxed);
+            if (utm == 2 || utm == 3) take = false;
+        }
 
         if (take)
         {
@@ -662,8 +729,9 @@ NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
                 // The rule is unchanged - an unidentified handle still copies
                 // nothing - only the set of identified handles grew.
                 const bool sr_ok =
-                    g_handle_known.load(std::memory_order_relaxed) &&
-                    is_latched_scene_handle((unsigned long long)(uintptr_t)h);
+                    g_handle_known.load(std::memory_order_relaxed)
+                        ? is_latched_scene_handle((unsigned long long)(uintptr_t)h)
+                        : uh_single_handle_ok((unsigned long long)(uintptr_t)h, fr);   // UH1
 
                 if (!sr_ok || g_eval_last_frame == fr)
                 {
@@ -928,8 +996,9 @@ NVSDK_NGX_Result NVSDK_CONV hook_evaluate11(ID3D11DeviceContext *ctx,
             {
                 const unsigned long long fr = g_frames.load(std::memory_order_relaxed);
                 const bool sr_ok =
-                    g_handle_known.load(std::memory_order_relaxed) &&
-                    is_latched_scene_handle((unsigned long long)(uintptr_t)h);
+                    g_handle_known.load(std::memory_order_relaxed)
+                        ? is_latched_scene_handle((unsigned long long)(uintptr_t)h)
+                        : uh_single_handle_ok((unsigned long long)(uintptr_t)h, fr);   // UH1
                 if (!sr_ok || g_eval_last_frame == fr)
                 {
                     g_eval_skips.fetch_add(1, std::memory_order_relaxed);
@@ -1075,6 +1144,200 @@ MGPU_NGX_OBSERVE(hook_initpid11,  g_real_initpid11,  NAME_INITPID11)
 MGPU_NGX_OBSERVE(hook_shutdown11, g_real_shutdown11, NAME_SHUTDOWN11)
 MGPU_NGX_OBSERVE(hook_shutdown111,g_real_shutdown111,NAME_SHUTDOWN111)
 #undef MGPU_NGX_OBSERVE
+
+// ---- XT2 (IN86, diagnostic builds only): THE GAME'S NGX INIT/SHUTDOWN ON D3D12 ----
+//
+// At exit no game ever releases its D3D12 device while the add-on is loaded
+// (RoboCop does without it). Suspect: NGX keeps the game's device. These
+// pass-through hooks - the R236 forwarder, nothing changed, no R239 counters
+// touched - log each of the game's D3D12 NGX Init/Shutdown calls with the
+// device it passed and that device's reference count before and after, so
+// the log shows whether NGX takes a reference at Init and gives it back at
+// Shutdown.
+#if !defined(MGPU_PRODUCTION) || !MGPU_PRODUCTION
+#define MGPU_XT2 1
+#else
+#define MGPU_XT2 0
+#endif
+const char *const NAME_INIT12      = "NVSDK_NGX_D3D12_Init";
+const char *const NAME_INITEXT12   = "NVSDK_NGX_D3D12_Init_Ext";
+const char *const NAME_INITPID12   = "NVSDK_NGX_D3D12_Init_with_ProjectID";
+const char *const NAME_SHUTDOWN12  = "NVSDK_NGX_D3D12_Shutdown";
+const char *const NAME_SHUTDOWN112 = "NVSDK_NGX_D3D12_Shutdown1";
+pf_any7 g_real_init12 = nullptr, g_real_initext12 = nullptr, g_real_initpid12 = nullptr,
+        g_real_shutdown12 = nullptr, g_real_shutdown112 = nullptr;
+// IN90: PASSIVE. No reference is held and no thread runs (IN86-IN89 held one
+// and could end the device's life on their own thread; the uninstall wait did
+// not guarantee that thread had left this DLL). The wrapper pointer is kept
+// WITHOUT a reference and read only at moments when something else provably
+// holds the device: inside the game's own NGX calls, inside the destroy event
+// of a queue or swap chain on that device (ReShade 6.8 releases their device
+// reference after the event), and while the add-on still holds its own.
+std::atomic<void *> g_game_dev12{nullptr};        // ReShade's wrapper - NOT referenced
+std::atomic<void *> g_game_dev12_native{nullptr}; // the device underneath, to match holders
+std::atomic<long>   g_game_dev12_refs{-3};        // last reading (whole count)
+std::atomic<int>    g_xt2_lines{0};
+std::atomic<bool>   g_xt2_held{false};   // a device is tracked (first source wins)
+
+// ---- IN88: from ReShade's device object to ReShade's device WRAPPER ----
+// ReShade 6.8 (source/d3d12/d3d12_device.hpp):
+//   class D3D12Device final : public ID3D12Device15, public reshade::d3d12::device_impl
+// The api::device ReShade hands add-ons is the device_impl part; the wrapper
+// - the COM object the game holds - begins one pointer before it. That is a
+// layout fact, so it is CHECKED before use: both parts' tables must lie in
+// the same module (ReShade's), and the candidate must answer QueryInterface
+// for ReShade's own D3D12Device id with itself. Any doubt: not used.
+const GUID XT2_RESHADE_D3D12DEVICE = { 0x2523AFF4, 0x978B, 0x4939, { 0xBA, 0x16, 0x8E, 0xE8, 0x76, 0xA4, 0xCB, 0x2A } };
+struct xt2_dev { void *native; void *api; };
+xt2_dev g_xt2_devs[8] = {};
+std::mutex g_xt2_devs_cs;
+
+static bool xt2_same_module(const void *a, const void *b)
+{
+    HMODULE ma = nullptr, mb = nullptr;
+    const DWORD fl = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    if (!GetModuleHandleExW(fl, (LPCWSTR)a, &ma) || !GetModuleHandleExW(fl, (LPCWSTR)b, &mb)) return false;
+    return ma != nullptr && ma == mb;
+}
+// No C++ objects in here (SEH; MSVC C2712).
+static void *xt2_wrapper_of(void *api)
+{
+    void *res = nullptr;
+    if (api == nullptr) return nullptr;
+    void *cand = (char *)api - sizeof(void *);
+    __try
+    {
+        const void *vt_api = *(void *const *)api;
+        const void *vt_c   = *(void *const *)cand;
+        if (xt2_same_module(vt_api, vt_c))
+        {
+            void *out = nullptr;
+            if (SUCCEEDED(((IUnknown *)cand)->QueryInterface(XT2_RESHADE_D3D12DEVICE, &out)) && out != nullptr)
+            {
+                if (out == cand) res = cand;
+                ((IUnknown *)out)->Release();
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        res = nullptr;
+    }
+    return res;
+}
+// The wrapper for `d`: `d` itself if it already is ReShade's wrapper, else the
+// wrapper whose device underneath is `d`. nullptr if neither can be shown.
+static void *xt2_to_wrapper(void *d, void **native_out)
+{
+    if (d == nullptr) return nullptr;
+    void *api = nullptr, *nat = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_xt2_devs_cs);
+        for (const xt2_dev &e : g_xt2_devs)
+        {
+            if (e.api == nullptr) continue;
+            if (e.native == d || (char *)e.api - sizeof(void *) == (char *)d) { api = e.api; nat = e.native; break; }
+        }
+    }
+    void *w = xt2_wrapper_of(api);
+    if (native_out) *native_out = (w != nullptr) ? nat : nullptr;
+    return w;
+}
+
+// Called only from inside the game's own NGX call (Init, or a DLSS evaluate):
+// the game holds the device for the duration, so the wrapper check's
+// QueryInterface and the first read cannot meet a count of zero.
+static void xt2_hold(void *dev)
+{
+    if (dev == nullptr || g_xt2_held.load(std::memory_order_acquire)) return;
+    void *nat = nullptr;
+    void *w = xt2_to_wrapper(dev, &nat);
+    char l[300];
+    if (w == nullptr)
+    {
+        snprintf(l, sizeof l, "[MGPU][XT2] the device %p could NOT be matched to ReShade's wrapper - not tracked "
+                 "(the count would be the wrong one).", dev);
+        mgpu::diag::info(l);
+        return;
+    }
+    if (g_xt2_held.exchange(true, std::memory_order_acq_rel)) return;
+    g_game_dev12_native.store(nat, std::memory_order_release);
+    g_game_dev12.store(w, std::memory_order_release);
+    const long n = probe_refs(w);
+    g_game_dev12_refs.store(n, std::memory_order_release);
+    snprintf(l, sizeof l, "[MGPU][XT2] the device %p resolves to ReShade's wrapper %p (checked: ReShade's table, answers "
+             "ReShade's id). Tracked passively - no reference held, no thread - count now %ld.", dev, w, n);
+    mgpu::diag::info(l);
+}
+
+static void xt2_say(const char *name, bool before, void *dev, bool remembered, long refs_before, long refs_after,
+                    unsigned long long r)
+{
+    if (g_xt2_lines.fetch_add(1, std::memory_order_relaxed) >= 40) return;
+    char l[400];
+    if (before)
+        snprintf(l, sizeof l, "[MGPU][XT2] GAME %s entered - device %p%s, refs=%ld", name, dev,
+                 remembered ? " (the one from its Init)" : "", refs_before);
+    else
+        snprintf(l, sizeof l, "[MGPU][XT2] GAME %s returned 0x%08llX - device %p refs %ld -> %ld%s", name, r, dev,
+                 refs_before, refs_after,
+                 (refs_before >= 0 && refs_after >= 0 && refs_after != refs_before)
+                     ? (refs_after > refs_before ? " (NGX took a reference)" : " (NGX gave a reference back)") : "");
+    mgpu::diag::info(l);
+}
+// XT2 (IN87). RoboCop's NGX Init never came through the hooks (resolved before
+// they were in), but every DLSS evaluate does - with the GAME's command list,
+// whose GetDevice names the device object the game holds. Once, on the first
+// evaluate, if Init did not already start the watch.
+std::atomic<bool> g_xt2_cl_tried{false};
+static void xt2_from_cmdlist(ID3D12GraphicsCommandList *cl)
+{
+#if MGPU_XT2
+    if (cl == nullptr || g_xt2_cl_tried.load(std::memory_order_relaxed)) return;
+    if (g_xt2_cl_tried.exchange(true, std::memory_order_acq_rel)) return;
+    if (g_xt2_held.load(std::memory_order_acquire)) return;
+    ID3D12Device *d = nullptr;
+    if (FAILED(cl->GetDevice(IID_PPV_ARGS(&d))) || d == nullptr) return;
+    char l[220];
+    snprintf(l, sizeof l, "[MGPU][XT2] the game's device, from its first DLSS evaluate's command list: %p "
+             "(its NGX Init was not seen) - the watch starts on it.", (void *)d);
+    mgpu::diag::info(l);
+    xt2_hold(d);        // the game is recording into a list on it: it holds it
+    d->Release();       // our GetDevice reference; the watch has its own
+#else
+    (void)cl;
+#endif
+}
+
+// DEV: the device argument, or 0 for Shutdown(void) - then the one the game
+// passed to its Init is read instead. IS_INIT: remember the device.
+#define MGPU_NGX_OBSERVE12(FN, REALPTR, NAME, DEV, IS_INIT)                                            \
+    unsigned long long NVSDK_CONV FN(unsigned long long a, unsigned long long b, unsigned long long c,  \
+                                     unsigned long long d, unsigned long long e, unsigned long long f,  \
+                                     unsigned long long g)                                              \
+    {                                                                                                   \
+        /* IN90: only a device the GAME passed into this call is read - the game */                     \
+        /* holds it for the call. Shutdown(void) passes none: logged, not read.   */                    \
+        void *dev = (void *)(uintptr_t)(DEV);                                                           \
+        const bool remembered = false;                                                                  \
+        const long rb = (dev != nullptr) ? probe_refs(dev) : -1;                                        \
+        xt2_say(NAME, true, dev, remembered, rb, 0, 0ull);                                              \
+        if (REALPTR == nullptr) return (unsigned long long)NVSDK_NGX_Result_Fail;                       \
+        const unsigned long long r = REALPTR(a, b, c, d, e, f, g);                                      \
+        const long ra = (dev != nullptr && rb > 0) ? probe_refs(dev) : -1;                              \
+        if (IS_INIT && dev != nullptr) xt2_hold(dev);                                                   \
+        xt2_say(NAME, false, dev, remembered, rb, ra, r);                                               \
+        return r;                                                                                       \
+    }
+// Device argument position: Init(appId, path, DEVICE, ...), Init_Ext(appId,
+// path, DEVICE, ...), Init_with_ProjectID(id, engine, ver, path, DEVICE, ...),
+// Shutdown1(DEVICE), Shutdown(void).
+MGPU_NGX_OBSERVE12(hook_init12,      g_real_init12,      NAME_INIT12,      c, true)
+MGPU_NGX_OBSERVE12(hook_initext12,   g_real_initext12,   NAME_INITEXT12,   c, true)
+MGPU_NGX_OBSERVE12(hook_initpid12,   g_real_initpid12,   NAME_INITPID12,   e, true)
+MGPU_NGX_OBSERVE12(hook_shutdown12,  g_real_shutdown12,  NAME_SHUTDOWN12,  0ull, false)
+MGPU_NGX_OBSERVE12(hook_shutdown112, g_real_shutdown112, NAME_SHUTDOWN112, a, false)
+#undef MGPU_NGX_OBSERVE12
 
 // ---- R245: the nvapi trace (TraceNvapi=1), see calibrator.hpp ----
 std::atomic<int> g_trace_nvapi{0};
@@ -1284,6 +1547,592 @@ void *__cdecl hook_nvapi_qi(unsigned int id)
     return p;
 }
 
+// ---------------------------------------------------------------------------
+// UT1. TWO MORE DOORS IN: XeSS AND FSR 3.1.
+//
+// Everything above reads what the game hands DLSS. A game that offers XeSS or
+// FSR hands the SAME facts to Intel's or AMD's upscaler - the colour, the
+// depth, the motion vectors, their scale, the jitter - through a documented
+// struct. These taps read that struct and publish it into the very same table
+// the DLSS tap fills, so everything downstream (the vector copy, the depth
+// path, the scale and jitter overrides) works without knowing which door the
+// facts came through.
+//
+// The rule that keeps this safe: only the GAME's upscaler is wrapped. We look
+// the module up by handle (libxess.dll, amd_fidelityfx_dx12.dll,
+// amd_fidelityfx_upscaler_dx12.dll, amd_fidelityfx_loader_dx12.dll), never
+// patch our own module, never patch anything loaded from the mgpu folder, and
+// on the FSR side only the UPSCALE dispatch is read - every other dispatch
+// (including frame generation) passes straight through untouched.
+//
+// Priority (UpscalerTap= in mgpu.ini): 0 auto = DLSS first; XeSS/FSR are used
+// only while DLSS has said nothing for 120 frames. 1 = DLSS only (the old
+// behaviour). 2 = XeSS only. 3 = FSR only. -1 = none of the new taps.
+//
+// Struct layouts: FSR from AMD's ffx_upscale.h (vendored, MIT). XeSS mirrors
+// Intel's public xess_d3d12.h (SDK 2.x/3.x, MIT); the static_asserts pin the
+// offsets that matter.
+// ---------------------------------------------------------------------------
+std::atomic<unsigned long long> g_ut_xess_evals{0}, g_ut_ffx_evals{0};
+std::atomic<unsigned long long> g_ut_xess_pub{0}, g_ut_ffx_pub{0}, g_ut_copies{0};
+unsigned long long g_ut_last_copy_frame = ~0ull;
+
+struct ut_xess_coord { uint32_t x, y; };
+struct ut_xess_exec
+{
+    ID3D12Resource *pColorTexture, *pVelocityTexture, *pDepthTexture,
+                   *pExposureScaleTexture, *pResponsivePixelMaskTexture, *pOutputTexture;
+    float jitterOffsetX, jitterOffsetY, exposureScale;
+    uint32_t resetHistory, inputWidth, inputHeight;
+    ut_xess_coord inputColorBase, inputMotionVectorBase, inputDepthBase,
+                  inputResponsiveMaskBase, reserved0, outputColorBase;
+    ID3D12DescriptorHeap *pDescriptorHeap;
+    uint32_t descriptorHeapOffset;
+};
+static_assert(offsetof(ut_xess_exec, jitterOffsetX) == 48, "xess exec layout");
+static_assert(offsetof(ut_xess_exec, inputWidth) == 64, "xess exec layout");
+static_assert(offsetof(ut_xess_exec, inputMotionVectorBase) == 80, "xess exec layout");
+static_assert(offsetof(ut_xess_exec, pDescriptorHeap) == 120, "xess exec layout");
+struct ut_xess_init
+{
+    uint32_t outW, outH;
+    int32_t quality;
+    uint32_t initFlags;
+    // remaining fields are not read
+};
+typedef int (*pf_xess_exec)(void *, ID3D12GraphicsCommandList *, const ut_xess_exec *);
+typedef int (*pf_xess_init)(void *, const ut_xess_init *);
+typedef int (*pf_xess_vs)(void *, float, float);
+pf_xess_exec g_real_xess_exec = nullptr;
+pf_xess_init g_real_xess_init = nullptr;
+pf_xess_vs   g_real_xess_vs   = nullptr;
+std::atomic<unsigned> g_xess_flags{0};
+std::atomic<unsigned> g_xess_out_w{0}, g_xess_out_h{0};
+std::atomic<float> g_xess_vsx{1.0f}, g_xess_vsy{1.0f};
+
+typedef ffxReturnCode_t (*pf_ffx_create)(ffxContext *, ffxCreateContextDescHeader *, const ffxAllocationCallbacks *);
+typedef ffxReturnCode_t (*pf_ffx_dispatch)(ffxContext *, const ffxDispatchDescHeader *);
+pf_ffx_create   g_real_ffx_create   = nullptr;
+pf_ffx_dispatch g_real_ffx_dispatch = nullptr;
+std::atomic<unsigned> g_ffx_flags{0};
+std::atomic<bool> g_ffx_flags_known{false};
+
+HMODULE g_ut_xess_mod = nullptr;
+HMODULE g_ut_ffx_mod  = nullptr;
+bool    g_ut_said_xess = false, g_ut_said_ffx = false;
+
+const wchar_t *const kUtFfxNames[] = { L"amd_fidelityfx_dx12.dll",
+                                       L"amd_fidelityfx_upscaler_dx12.dll",
+                                       L"amd_fidelityfx_loader_dx12.dll" };
+
+bool ut_from_mgpu_folder(HMODULE m)
+{
+    wchar_t p[MAX_PATH * 2] = {};
+    if (m == nullptr || GetModuleFileNameW(m, p, MAX_PATH * 2) == 0) return true;
+    for (wchar_t *c = p; *c; ++c) if (*c >= L'A' && *c <= L'Z') *c = (wchar_t)(*c + 32);
+    return std::wcsstr(p, L"\\mgpu\\") != nullptr;
+}
+
+bool ut_is_xess_mod(HMODULE m) { return m != nullptr && m == g_ut_xess_mod; }
+bool ut_is_ffx_mod(HMODULE m)
+{
+    if (m == nullptr) return false;
+    if (m == g_ut_ffx_mod) return true;
+    for (const wchar_t *n : kUtFfxNames)
+    {
+        HMODULE h = GetModuleHandleW(n);
+        if (h == m) return !ut_from_mgpu_folder(h);
+    }
+    return false;
+}
+
+// Should an external source publish right now?
+bool ut_may_publish(int src /*2 xess, 3 fsr*/)
+{
+    const int m = g_ut_mode.load(std::memory_order_relaxed);
+    if (m < 0 || m == 1) return false;
+    if (m == 2 || m == 3) return m == src;
+    // auto: DLSS wins while it is talking
+    const unsigned long long f = g_frames.load(std::memory_order_relaxed);
+    const unsigned long long l = g_ut_last_ngx.load(std::memory_order_relaxed);
+    return l == 0ull || f > l + 120ull;
+}
+
+void ut_publish(const table &t, int src)
+{
+    g_seq.fetch_add(1u, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_release);
+    g_tbl = t;
+    std::atomic_thread_fence(std::memory_order_release);
+    g_seq.fetch_add(1u, std::memory_order_release);
+    g_captures.fetch_add(1, std::memory_order_relaxed);
+    g_ut_src.store(src, std::memory_order_relaxed);
+}
+
+// The same once-per-frame vector copy the DLSS tap does, with the state the
+// upscaler's own contract says the buffer is in.
+void ut_copy(ID3D12GraphicsCommandList *cl, ID3D12Resource *mv, D3D12_RESOURCE_STATES before)
+{
+    if (cl == nullptr || mv == nullptr || g_mvec_hook_fn == nullptr) return;
+    if (before == (D3D12_RESOURCE_STATES)0xFFFFFFFF) return;   // RV3: state not known - copy nothing
+    // UT4. On auto (MvecFromEval=2) the copy from the upscaler call used to
+    // wait for R118, which arms only when the barrier route has copied
+    // NOTHING. RoboCop with XeSS: the barrier route caught 3 frames in 4 and
+    // missed the rest, so R118 never armed, the XeSS tap copied 0 vectors, and
+    // NVIDIA frame generation made nothing on half the frames. The game's
+    // XeSS/FSR call is the vectors' own contract - the same evidence R118
+    // waits for - so on auto it switches the evaluate copy on at once.
+    // MvecFromEval=0 still means never.
+    if (g_eval_copy_mode.load(std::memory_order_relaxed) == 2)
+    {
+        g_eval_copy_mode.store(1, std::memory_order_relaxed);
+        mgpu::diag::info("[MGPU][UT4] motion vectors are now copied at the game's own XeSS/FSR call, the moment "
+                         "it hands them over (MvecFromEval=2 auto -> on). MvecFromEval=0 turns this off.");
+    }
+    if (g_eval_copy_mode.load(std::memory_order_relaxed) != 1) return;
+    const unsigned long long fr = g_frames.load(std::memory_order_relaxed);
+    if (g_ut_last_copy_frame == fr) return;
+    g_ut_last_copy_frame = fr;
+
+    const bool need = (before != D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource   = mv;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    if (need)
+    {
+        b.Transition.StateBefore = before;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        cl->ResourceBarrier(1, &b);
+    }
+    g_mvec_hook_fn((void *)cl, (unsigned long long)(uintptr_t)mv);
+    if (need)
+    {
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter  = before;
+        cl->ResourceBarrier(1, &b);
+    }
+    g_ut_copies.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ---- XeSS ----
+int hook_xess_init(void *ctx, const ut_xess_init *ip)
+{
+    if (ip != nullptr)
+    {
+        g_xess_flags.store(ip->initFlags, std::memory_order_relaxed);
+        g_xess_out_w.store(ip->outW, std::memory_order_relaxed);
+        g_xess_out_h.store(ip->outH, std::memory_order_relaxed);
+        char l[200];
+        std::snprintf(l, sizeof l, "[MGPU][UT1] game created a XeSS upscaler: output %ux%u flags=0x%x",
+                      ip->outW, ip->outH, ip->initFlags);
+        mgpu::diag::info(l);
+    }
+    return g_real_xess_init ? g_real_xess_init(ctx, ip) : -1;
+}
+
+int hook_xess_vs(void *ctx, float x, float y)
+{
+    g_xess_vsx.store(x, std::memory_order_relaxed);
+    g_xess_vsy.store(y, std::memory_order_relaxed);
+    return g_real_xess_vs ? g_real_xess_vs(ctx, x, y) : -1;
+}
+
+int hook_xess_exec(void *ctx, ID3D12GraphicsCommandList *cl, const ut_xess_exec *e)
+{
+    g_ut_xess_evals.fetch_add(1, std::memory_order_relaxed);
+    if (e != nullptr && g_mode.load(std::memory_order_relaxed) != 0 && ut_may_publish(2))
+    {
+        table t{};
+        t.frame = g_frames.load(std::memory_order_relaxed);
+        t.evals = g_ut_xess_evals.load(std::memory_order_relaxed);
+        t.color  = (unsigned long long)(uintptr_t)e->pColorTexture;
+        t.depth  = (unsigned long long)(uintptr_t)e->pDepthTexture;
+        t.mvec   = (unsigned long long)(uintptr_t)e->pVelocityTexture;
+        t.output = (unsigned long long)(uintptr_t)e->pOutputTexture;
+        if (t.color)  t.have |= KEY_COLOR;
+        if (t.depth)  t.have |= KEY_DEPTH;
+        if (t.mvec)   t.have |= KEY_MVEC;
+        if (t.output) t.have |= KEY_OUTPUT;
+
+        const unsigned xf = g_xess_flags.load(std::memory_order_relaxed);
+        t.render_w = e->inputWidth; t.render_h = e->inputHeight;
+        t.have |= KEY_RENDER_EXT;
+        // XeSS vectors are pixels times the velocity scale. With NDC velocity
+        // (bit 4) they are -1..1 across the input, so the pixel scale is half
+        // the input size with Y flipped, the same as DLSS gets from engines
+        // that write NDC.
+        float sx = g_xess_vsx.load(std::memory_order_relaxed);
+        float sy = g_xess_vsy.load(std::memory_order_relaxed);
+        if (xf & (1u << 4)) { sx *= 0.5f * (float)e->inputWidth; sy *= -0.5f * (float)e->inputHeight; }
+        t.mv_scale_x = sx; t.mv_scale_y = sy;
+        t.have |= KEY_MV_SCALE;
+        t.jitter_x = e->jitterOffsetX; t.jitter_y = e->jitterOffsetY;
+        t.have |= KEY_JITTER;
+        t.reset = e->resetHistory ? 1u : 0u;
+        t.have |= KEY_RESET;
+
+        const unsigned ow = g_xess_out_w.load(std::memory_order_relaxed);
+        const unsigned oh = g_xess_out_h.load(std::memory_order_relaxed);
+        if (ow && oh) { t.display_w = ow; t.display_h = oh; t.have |= KEY_DISPLAY_EXT; }
+
+        // Translate to the DLSS flag word the rest of the bridge reads.
+        unsigned fl = 0;
+        if (!(xf & (1u << 6))) fl |= 1u << 0;   // not LDR -> HDR
+        if (!(xf & (1u << 0))) fl |= 1u << 1;   // not HIGH_RES_MV -> MVLowRes
+        if (xf & (1u << 7))    fl |= 1u << 2;   // JITTERED_MV
+        if (xf & (1u << 1))    fl |= 1u << 3;   // INVERTED_DEPTH
+        if (xf & (1u << 8))    fl |= 1u << 6;   // auto exposure
+        decode_flags(fl, t);
+        t.have |= KEY_FLAGS;
+
+        ut_publish(t, 2);
+        g_ut_xess_pub.fetch_add(1, std::memory_order_relaxed);
+        if (!g_ut_said_xess)
+        {
+            g_ut_said_xess = true;
+            char l[300];
+            std::snprintf(l, sizeof l, "[MGPU][UT1] SOURCE = XeSS. Reading the game's XeSS inputs: render %ux%u, "
+                          "vectors x%.3f,%.3f, flags=0x%x. (Layout from Intel's public header; first run on this "
+                          "game - say so in a report if the picture is wrong.)",
+                          t.render_w, t.render_h, t.mv_scale_x, t.mv_scale_y, xf);
+            mgpu::diag::info(l);
+        }
+        ut_copy(cl, e->pVelocityTexture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    return g_real_xess_exec ? g_real_xess_exec(ctx, cl, e) : -1;
+}
+
+// ---- FSR 3.1 / FidelityFX API ----
+// RV3: the D3D12 state for the FFX state the game declared for its vectors.
+// IN26 mapped every state it did not list (UAV, render target, copy dest,
+// depth) to NON_PIXEL_SHADER_RESOURCE - a wrong "before" state in a barrier
+// is invalid D3D12 and can corrupt the buffer on some drivers. Unknown or
+// combined states now return kUtNoCopy and the copy is skipped.
+const D3D12_RESOURCE_STATES kUtNoCopy = (D3D12_RESOURCE_STATES)0xFFFFFFFF;
+D3D12_RESOURCE_STATES ut_ffx_state(uint32_t s)
+{
+    switch (s)
+    {
+    case FFX_API_RESOURCE_STATE_COMMON:             return D3D12_RESOURCE_STATE_COMMON;
+    case FFX_API_RESOURCE_STATE_UNORDERED_ACCESS:   return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    case FFX_API_RESOURCE_STATE_COMPUTE_READ:       return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    case FFX_API_RESOURCE_STATE_PIXEL_READ:         return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    case FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ: return (D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    case FFX_API_RESOURCE_STATE_COPY_SRC:           return D3D12_RESOURCE_STATE_COPY_SOURCE;
+    case FFX_API_RESOURCE_STATE_COPY_DEST:          return D3D12_RESOURCE_STATE_COPY_DEST;
+    case FFX_API_RESOURCE_STATE_GENERIC_READ:       return D3D12_RESOURCE_STATE_GENERIC_READ;
+    case FFX_API_RESOURCE_STATE_RENDER_TARGET:      return D3D12_RESOURCE_STATE_RENDER_TARGET;
+    default:                                        return kUtNoCopy;
+    }
+}
+
+ffxReturnCode_t hook_ffx_create(ffxContext *ctx, ffxCreateContextDescHeader *d, const ffxAllocationCallbacks *mc)
+{
+    if (d != nullptr && d->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE)
+    {
+        const ffxCreateContextDescUpscale *u = (const ffxCreateContextDescUpscale *)d;
+        g_ffx_flags.store(u->flags, std::memory_order_relaxed);
+        g_ffx_flags_known.store(true, std::memory_order_relaxed);
+        char l[200];
+        std::snprintf(l, sizeof l, "[MGPU][UT1] game created an FSR upscaler: max render %ux%u -> %ux%u flags=0x%x",
+                      u->maxRenderSize.width, u->maxRenderSize.height,
+                      u->maxUpscaleSize.width, u->maxUpscaleSize.height, u->flags);
+        mgpu::diag::info(l);
+    }
+    return g_real_ffx_create ? g_real_ffx_create(ctx, d, mc) : FFX_API_RETURN_ERROR;
+}
+
+ffxReturnCode_t hook_ffx_dispatch(ffxContext *ctx, const ffxDispatchDescHeader *d)
+{
+    if (d != nullptr && d->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE)
+    {
+        g_ut_ffx_evals.fetch_add(1, std::memory_order_relaxed);
+        if (g_mode.load(std::memory_order_relaxed) != 0 && ut_may_publish(3))
+        {
+            const ffxDispatchDescUpscale *u = (const ffxDispatchDescUpscale *)d;
+            table t{};
+            t.frame = g_frames.load(std::memory_order_relaxed);
+            t.evals = g_ut_ffx_evals.load(std::memory_order_relaxed);
+            t.color  = (unsigned long long)(uintptr_t)u->color.resource;
+            t.depth  = (unsigned long long)(uintptr_t)u->depth.resource;
+            t.mvec   = (unsigned long long)(uintptr_t)u->motionVectors.resource;
+            t.output = (unsigned long long)(uintptr_t)u->output.resource;
+            if (t.color)  t.have |= KEY_COLOR;
+            if (t.depth)  t.have |= KEY_DEPTH;
+            if (t.mvec)   t.have |= KEY_MVEC;
+            if (t.output) t.have |= KEY_OUTPUT;
+            // AMD: pixelMV = mv * motionVectorScale - the same meaning as DLSS's MV scale.
+            t.mv_scale_x = u->motionVectorScale.x; t.mv_scale_y = u->motionVectorScale.y;
+            t.have |= KEY_MV_SCALE;
+            t.jitter_x = u->jitterOffset.x; t.jitter_y = u->jitterOffset.y;
+            t.have |= KEY_JITTER;
+            t.reset = u->reset ? 1u : 0u;
+            t.have |= KEY_RESET;
+            t.render_w = u->renderSize.width; t.render_h = u->renderSize.height;
+            t.have |= KEY_RENDER_EXT;
+            if (u->upscaleSize.width && u->upscaleSize.height)
+            {
+                t.display_w = u->upscaleSize.width; t.display_h = u->upscaleSize.height;
+                t.have |= KEY_DISPLAY_EXT;
+            }
+            if (g_ffx_flags_known.load(std::memory_order_relaxed))
+            {
+                const unsigned af = g_ffx_flags.load(std::memory_order_relaxed);
+                unsigned fl = 0;
+                if (af & FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE)                    fl |= 1u << 0;
+                if (!(af & FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS)) fl |= 1u << 1;
+                if (af & FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION)   fl |= 1u << 2;
+                if (af & FFX_UPSCALE_ENABLE_DEPTH_INVERTED)                       fl |= 1u << 3;
+                if (af & FFX_UPSCALE_ENABLE_AUTO_EXPOSURE)                        fl |= 1u << 6;
+                decode_flags(fl, t);
+                t.have |= KEY_FLAGS;
+            }
+            ut_publish(t, 3);
+            g_ut_ffx_pub.fetch_add(1, std::memory_order_relaxed);
+            if (!g_ut_said_ffx)
+            {
+                g_ut_said_ffx = true;
+                char l[300];
+                std::snprintf(l, sizeof l, "[MGPU][UT1] SOURCE = FSR. Reading the game's FSR upscaler inputs: "
+                              "render %ux%u -> %ux%u, vectors x%.3f,%.3f, flags=0x%x.",
+                              t.render_w, t.render_h, t.display_w, t.display_h,
+                              t.mv_scale_x, t.mv_scale_y, g_ffx_flags.load(std::memory_order_relaxed));
+                mgpu::diag::info(l);
+            }
+            ut_copy((ID3D12GraphicsCommandList *)u->commandList,
+                    (ID3D12Resource *)u->motionVectors.resource,
+                    ut_ffx_state(u->motionVectors.state));
+        }
+    }
+    return g_real_ffx_dispatch ? g_real_ffx_dispatch(ctx, d) : FFX_API_RETURN_ERROR;
+}
+
+// ---- UT3: THE EXPORT TABLE, PATCHED THE MOMENT THE DLL LOADS ----
+//
+// RoboCop's XeSS was looked up two seconds after the add-on started and before
+// any of our hooks were in, and the result kept somewhere none of the walks
+// reach (UT2 found 0 import, 0 delay-load and 0 data slots). So the address
+// has to be wrong from the start: when libxess.dll / amd_fidelityfx_dx12.dll
+// is loaded, the DLL watcher (DW1) calls ut_on_load, which points those
+// exports in the DLL's export table at small jump stubs. Whatever the game
+// asks GetProcAddress for afterwards, by any route, is a stub, and the stub
+// jumps to our hook.
+//
+// The stubs live in a two-page block allocated just above the DLL (export
+// entries are 32-bit offsets from the DLL's base): page 1 holds one
+// "jmp [target]" per export, read+execute; page 2 holds the targets and the
+// real addresses, read+write. The block is never freed. When this add-on
+// unloads - ReShade loads and unloads it several times at start-up - every
+// target is set back to the real function, so a stub the game already holds
+// keeps working; the next copy of the add-on recognises the block by its
+// marker and points the targets at its own hooks again.
+constexpr unsigned long long kUtMagic = 0x3354554D4750554DULL;   // "MGPUUT3"
+constexpr unsigned kUtSlots = 8;
+struct ut_stub_data
+{
+    unsigned long long magic;
+    HMODULE mod;
+    void *target[kUtSlots];
+    void *real[kUtSlots];
+};
+BYTE *g_ut_pages[4] = {};
+unsigned g_ut_npages = 0;
+std::atomic<bool> g_ut_released{false};
+std::atomic<unsigned> g_ut_eat_xess{0}, g_ut_eat_ffx{0};   // exports routed through a stub
+
+ut_stub_data *ut_stub_of(const void *p, unsigned &slot)
+{
+    if (p == nullptr) return nullptr;
+    BYTE *page = (BYTE *)((uintptr_t)p & ~(uintptr_t)0xFFF);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(page + 0x1000, &mbi, sizeof mbi) == 0 || mbi.State != MEM_COMMIT ||
+        mbi.Protect != PAGE_READWRITE)
+        return nullptr;
+    ut_stub_data *d = (ut_stub_data *)(page + 0x1000);
+    if (d->magic != kUtMagic) return nullptr;
+    const uintptr_t off = (uintptr_t)((const BYTE *)p - page);
+    if ((off % 16u) != 0u || off / 16u >= kUtSlots) return nullptr;
+    slot = (unsigned)(off / 16u);
+    return d;
+}
+
+void ut_remember_page(BYTE *page)
+{
+    for (unsigned i = 0; i < g_ut_npages; ++i) if (g_ut_pages[i] == page) return;
+    if (g_ut_npages < 4u) g_ut_pages[g_ut_npages++] = page;
+}
+
+BYTE *ut_new_stub_page(HMODULE mod)
+{
+    BYTE *base = (BYTE *)mod;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    const uintptr_t g = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000u;
+    uintptr_t a = ((uintptr_t)base + nt->OptionalHeader.SizeOfImage + g - 1) & ~(g - 1);
+    const uintptr_t lim = (uintptr_t)base + 0xFFF00000ull;
+    while (a < lim)
+    {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery((void *)a, &mbi, sizeof mbi) == 0) break;
+        if (mbi.State == MEM_FREE && mbi.RegionSize >= 0x2000)
+        {
+            BYTE *p = (BYTE *)VirtualAlloc((void *)a, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (p != nullptr)
+            {
+                ut_stub_data *d = (ut_stub_data *)(p + 0x1000);
+                for (unsigned i = 0; i < kUtSlots; ++i)
+                {
+                    BYTE *c = p + i * 16u;
+                    c[0] = 0xFF; c[1] = 0x25;   // jmp qword ptr [rip+disp32]
+                    const int disp = (int)((BYTE *)&d->target[i] - (c + 6));
+                    std::memcpy(c + 2, &disp, 4);
+                    for (unsigned k = 6; k < 16; ++k) c[k] = 0xCC;
+                }
+                d->magic = kUtMagic;
+                d->mod = mod;
+                DWORD old = 0;
+                VirtualProtect(p, 0x1000, PAGE_EXECUTE_READ, &old);
+                FlushInstructionCache(GetCurrentProcess(), p, 0x1000);
+                return p;
+            }
+        }
+        uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        next = (next + g - 1) & ~(g - 1);
+        if (next <= a) break;
+        a = next;
+    }
+    return nullptr;
+}
+
+DWORD *ut_eat_slot(HMODULE mod, const char *name)
+{
+    if (mod == nullptr || name == nullptr) return nullptr;
+    BYTE *base = (BYTE *)mod;
+    DWORD *out = nullptr;
+    __try
+    {
+        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+        const IMAGE_DATA_DIRECTORY &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (dir.VirtualAddress == 0 || dir.Size == 0) return nullptr;
+        IMAGE_EXPORT_DIRECTORY *ed = (IMAGE_EXPORT_DIRECTORY *)(base + dir.VirtualAddress);
+        DWORD *names = (DWORD *)(base + ed->AddressOfNames);
+        WORD  *ords  = (WORD *)(base + ed->AddressOfNameOrdinals);
+        DWORD *funcs = (DWORD *)(base + ed->AddressOfFunctions);
+        for (DWORD i = 0; i < ed->NumberOfNames; ++i)
+        {
+            if (std::strcmp((const char *)(base + names[i]), name) != 0) continue;
+            if (ords[i] >= ed->NumberOfFunctions) return nullptr;
+            DWORD *slot = &funcs[ords[i]];
+            // A forwarder (the entry points back into the export directory) is
+            // a string, not code - leave it alone.
+            if (*slot >= dir.VirtualAddress && *slot < dir.VirtualAddress + dir.Size) return nullptr;
+            out = slot;
+            break;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+    return out;
+}
+
+// Route one export through a stub aimed at `hook`; returns the real function
+// (nullptr if it could not be done). Safe to call again: an export that is
+// already a stub - ours or a previous copy's - is adopted, not stacked.
+void *ut_eat_hook(HMODULE mod, const char *name, void *hook, BYTE *&page)
+{
+    if (g_ut_released.load(std::memory_order_relaxed)) return nullptr;
+    DWORD *slot = ut_eat_slot(mod, name);
+    if (slot == nullptr) return nullptr;
+    BYTE *base = (BYTE *)mod;
+    void *cur = base + *slot;
+    unsigned si = 0;
+    if (ut_stub_data *d = ut_stub_of(cur, si))
+    {
+        ut_remember_page((BYTE *)((uintptr_t)cur & ~(uintptr_t)0xFFF));
+        void *real = d->real[si];
+        if (real != nullptr) d->target[si] = hook;
+        return real;
+    }
+    if (page == nullptr) page = ut_new_stub_page(mod);
+    if (page == nullptr) return nullptr;
+    ut_remember_page(page);
+    ut_stub_data *d = (ut_stub_data *)(page + 0x1000);
+    unsigned i = 0;
+    while (i < kUtSlots && d->real[i] != nullptr) ++i;
+    if (i == kUtSlots) return nullptr;
+    const uintptr_t rva = (uintptr_t)(page + i * 16u) - (uintptr_t)base;
+    if (rva > 0xFFFFFFFFull) return nullptr;
+    d->real[i] = cur;
+    d->target[i] = hook;
+    DWORD old = 0;
+    if (!VirtualProtect(slot, sizeof(DWORD), PAGE_READWRITE, &old)) { d->real[i] = nullptr; return nullptr; }
+    *slot = (DWORD)rva;
+    VirtualProtect(slot, sizeof(DWORD), old, &old);
+    return cur;
+}
+
+// Every stub this copy touched goes straight to the real function again. The
+// export table is left pointing at the stubs on purpose (see above).
+void ut_eat_release()
+{
+    g_ut_released.store(true, std::memory_order_relaxed);
+    for (unsigned p = 0; p < g_ut_npages; ++p)
+    {
+        ut_stub_data *d = (ut_stub_data *)(g_ut_pages[p] + 0x1000);
+        for (unsigned i = 0; i < kUtSlots; ++i)
+            if (d->real[i] != nullptr) d->target[i] = d->real[i];
+    }
+}
+
+unsigned ut_eat_xess(HMODULE x)
+{
+    BYTE *page = nullptr;
+    unsigned n = 0;
+    if (void *r = ut_eat_hook(x, "xessD3D12Execute", (void *)&hook_xess_exec, page))     { g_real_xess_exec = (pf_xess_exec)r; ++n; }
+    if (void *r = ut_eat_hook(x, "xessD3D12Init", (void *)&hook_xess_init, page))        { g_real_xess_init = (pf_xess_init)r; ++n; }
+    if (void *r = ut_eat_hook(x, "xessSetVelocityScale", (void *)&hook_xess_vs, page))   { g_real_xess_vs = (pf_xess_vs)r;     ++n; }
+    return n;
+}
+
+unsigned ut_eat_ffx(HMODULE f)
+{
+    BYTE *page = nullptr;
+    unsigned n = 0;
+    if (void *r = ut_eat_hook(f, "ffxDispatch", (void *)&hook_ffx_dispatch, page))     { g_real_ffx_dispatch = (pf_ffx_dispatch)r; ++n; }
+    if (void *r = ut_eat_hook(f, "ffxCreateContext", (void *)&hook_ffx_create, page))  { g_real_ffx_create = (pf_ffx_create)r;     ++n; }
+    return n;
+}
+
+// Called from hook_gpa: a game that looks the upscaler up by name.
+FARPROC ut_gpa(HMODULE mod, const char *name, FARPROC real)
+{
+    if (real == nullptr || name == nullptr || (uintptr_t)name < 0x10000) return nullptr;   // RV3: nothing to wrap / an ordinal
+    if (name[0] != 'x' && name[0] != 'f') return nullptr;
+    { unsigned si = 0; if (ut_stub_of((const void *)real, si) != nullptr) return nullptr; }   // UT3: already routed
+    if (g_ut_mode.load(std::memory_order_relaxed) < 0 || g_ut_mode.load(std::memory_order_relaxed) == 1) return nullptr;
+    if (name[0] == 'x' && GetModuleHandleW(L"libxess.dll") == mod && mod != nullptr)
+    {
+        g_ut_xess_mod = mod;
+        if (std::strcmp(name, "xessD3D12Execute") == 0) { g_real_xess_exec = (pf_xess_exec)real; return (FARPROC)&hook_xess_exec; }
+        if (std::strcmp(name, "xessD3D12Init") == 0)    { g_real_xess_init = (pf_xess_init)real; return (FARPROC)&hook_xess_init; }
+        if (std::strcmp(name, "xessSetVelocityScale") == 0) { g_real_xess_vs = (pf_xess_vs)real; return (FARPROC)&hook_xess_vs; }
+    }
+    if (name[0] == 'f' && ut_is_ffx_mod(mod))
+    {
+        if (std::strcmp(name, "ffxDispatch") == 0)      { g_real_ffx_dispatch = (pf_ffx_dispatch)real; return (FARPROC)&hook_ffx_dispatch; }
+        if (std::strcmp(name, "ffxCreateContext") == 0) { g_real_ffx_create = (pf_ffx_create)real; return (FARPROC)&hook_ffx_create; }
+    }
+    return nullptr;
+}
+
 FARPROC WINAPI hook_gpa(HMODULE mod, LPCSTR name)
 {
     FARPROC real = (g_real_gpa != nullptr) ? g_real_gpa(mod, name)
@@ -1294,6 +2143,9 @@ FARPROC WINAPI hook_gpa(HMODULE mod, LPCSTR name)
     if (real == nullptr || name == nullptr || ((ULONG_PTR)name >> 16) == 0) return real;
 
     g_gpa_calls.fetch_add(1, std::memory_order_relaxed);
+
+    // UT1: the game's own XeSS / FSR upscaler, looked up by name.
+    if (FARPROC ut = ut_gpa(mod, name, real)) return ut;
 
     // R245: the trace. Off = these two tests and nothing else.
     if (g_trace_nvapi.load(std::memory_order_relaxed) != 0)
@@ -1360,6 +2212,14 @@ FARPROC WINAPI hook_gpa(HMODULE mod, LPCSTR name)
     if (std::strcmp(name, NAME_INITPID11) == 0)   { g_real_initpid11 = (pf_any7)real;   return (FARPROC)&hook_initpid11; }
     if (std::strcmp(name, NAME_SHUTDOWN11) == 0)  { g_real_shutdown11 = (pf_any7)real;  return (FARPROC)&hook_shutdown11; }
     if (std::strcmp(name, NAME_SHUTDOWN111) == 0) { g_real_shutdown111 = (pf_any7)real; return (FARPROC)&hook_shutdown111; }
+#if MGPU_XT2
+    // XT2 (IN86): observe-only, diagnostic builds.
+    if (std::strcmp(name, NAME_INIT12) == 0)      { g_real_init12 = (pf_any7)real;      return (FARPROC)&hook_init12; }
+    if (std::strcmp(name, NAME_INITEXT12) == 0)   { g_real_initext12 = (pf_any7)real;   return (FARPROC)&hook_initext12; }
+    if (std::strcmp(name, NAME_INITPID12) == 0)   { g_real_initpid12 = (pf_any7)real;   return (FARPROC)&hook_initpid12; }
+    if (std::strcmp(name, NAME_SHUTDOWN12) == 0)  { g_real_shutdown12 = (pf_any7)real;  return (FARPROC)&hook_shutdown12; }
+    if (std::strcmp(name, NAME_SHUTDOWN112) == 0) { g_real_shutdown112 = (pf_any7)real; return (FARPROC)&hook_shutdown112; }
+#endif
     return real;
 }
 
@@ -1424,6 +2284,261 @@ unsigned patch_module(HMODULE mod, void *find, void *repl)
 // Walks every module in the process except our own. Called at install and
 // again from note_frame while we are still waiting for NGX to show up, which
 // is how a DLL loaded after us gets patched without hooking LoadLibrary.
+
+// UT1. The import-table route for XeSS/FSR: a game that links the upscaler
+// normally. Same pointer swap as the NGX one; our module and anything loaded
+// from the mgpu folder are never touched.
+bool g_ut_xess_done = false, g_ut_ffx_done = false;
+
+// UT2. The import table is only one of three places a game keeps these
+// pointers, and RoboCop (UE5) used neither XeSS nor FSR through it: both logs
+// said "0 import slot(s) wrapped". A packaged Unreal game is one big exe whose
+// plugins DELAY-LOAD libxess.dll / amd_fidelityfx_dx12.dll, so the resolved
+// address lives in the exe's delay-load table, not its import table. And our
+// GetProcAddress hook went in after the game had already looked them up at
+// start-up. So the walk now covers, per module:
+//   1. the import table (as before),
+//   2. the delay-load table - matched by DLL and function NAME, so a slot the
+//      game has not called yet is wrapped too, not only a resolved one,
+//   3. the module's writable data sections, for a game that copied the
+//      pointer into its own table (the FFX API loader pattern).
+// Steps 2 and 3 skip Windows' own DLLs, ReShade, NVIDIA's NGX modules, the
+// upscaler DLL itself, our module and the mgpu folder.
+bool ut_skip_module(HMODULE m, HMODULE target)
+{
+    if (m == nullptr || m == g_self || m == target) return true;
+    if (GetProcAddress(m, "ReShadeRegisterAddon") != nullptr) return true;
+    wchar_t p[MAX_PATH * 2] = {};
+    if (GetModuleFileNameW(m, p, MAX_PATH * 2) == 0) return true;
+    for (wchar_t *c = p; *c; ++c) if (*c >= L'A' && *c <= L'Z') *c = (wchar_t)(*c + 32);
+    return std::wcsstr(p, L"\\mgpu\\") != nullptr || std::wcsstr(p, L"\\windows\\") != nullptr ||
+           std::wcsstr(p, L"nvngx") != nullptr;
+}
+
+unsigned ut_patch_delay(HMODULE mod, const char *dll, const char *fn, void *find, void *repl)
+{
+    if (mod == nullptr || dll == nullptr || repl == nullptr) return 0;
+    BYTE *base = (BYTE *)mod;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    const IMAGE_DATA_DIRECTORY &dir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (dir.VirtualAddress == 0 || dir.Size == 0) return 0;
+
+    volatile unsigned hits = 0;
+    __try
+    {
+        for (IMAGE_DELAYLOAD_DESCRIPTOR *d = (IMAGE_DELAYLOAD_DESCRIPTOR *)(base + dir.VirtualAddress);
+             d->DllNameRVA != 0; ++d)
+        {
+            if (d->Attributes.RvaBased == 0) continue;   // VC6-era layout, never in an x64 game
+            if (_stricmp((const char *)(base + d->DllNameRVA), dll) != 0) continue;
+            if (d->ImportAddressTableRVA == 0 || d->ImportNameTableRVA == 0) continue;
+            IMAGE_THUNK_DATA *iat = (IMAGE_THUNK_DATA *)(base + d->ImportAddressTableRVA);
+            IMAGE_THUNK_DATA *nam = (IMAGE_THUNK_DATA *)(base + d->ImportNameTableRVA);
+            for (; nam->u1.AddressOfData != 0; ++nam, ++iat)
+            {
+                void *cur = (void *)(uintptr_t)iat->u1.Function;
+                if (cur == repl) continue;
+                bool hit = (find != nullptr && cur == find);
+                if (!hit && fn != nullptr && !IMAGE_SNAP_BY_ORDINAL(nam->u1.Ordinal))
+                {
+                    const IMAGE_IMPORT_BY_NAME *ibn = (const IMAGE_IMPORT_BY_NAME *)(base + nam->u1.AddressOfData);
+                    hit = std::strcmp((const char *)ibn->Name, fn) == 0;
+                }
+                if (!hit) continue;
+                DWORD old = 0;
+                if (!VirtualProtect(&iat->u1.Function, sizeof(void *), PAGE_READWRITE, &old)) continue;
+                iat->u1.Function = (ULONGLONG)(uintptr_t)repl;
+                VirtualProtect(&iat->u1.Function, sizeof(void *), old, &old);
+                ++hits;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return (unsigned)hits;
+    }
+    return (unsigned)hits;
+}
+
+// Same walk as R102's patch_module_data, without its NGX hit ledger.
+unsigned ut_patch_data(HMODULE mod, void *find, void *repl)
+{
+    if (mod == nullptr || find == nullptr || repl == nullptr) return 0;
+    BYTE *base = (BYTE *)mod;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    volatile unsigned hits = 0;
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    const unsigned nsec = nt->FileHeader.NumberOfSections;
+    __try
+    {
+        for (unsigned i = 0; i < nsec; ++i, ++sec)
+        {
+            if ((sec->Characteristics & IMAGE_SCN_MEM_WRITE) == 0) continue;
+            if ((sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0) continue;
+            BYTE *p = base + sec->VirtualAddress;
+            SIZE_T len = (SIZE_T)sec->Misc.VirtualSize;
+            if (len < sizeof(void *)) continue;
+            len -= sizeof(void *);
+            for (SIZE_T off = 0; off <= len; off += sizeof(void *))
+            {
+                void **slot = (void **)(p + off);
+                if (*slot != find) continue;
+                DWORD old = 0;
+                if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old)) continue;
+                *slot = repl;
+                VirtualProtect(slot, sizeof(void *), old, &old);
+                ++hits;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return (unsigned)hits;
+    }
+    return (unsigned)hits;
+}
+
+struct ut_counts { unsigned eat = 0, iat = 0, delay = 0, data = 0; unsigned total() const { return eat + iat + delay + data; } };
+
+// fn == nullptr: undo (value match only). target: the upscaler DLL, never touched.
+void ut_patch_all(void *find, void *repl, const char *dll, const char *fn, HMODULE target, ut_counts &c)
+{
+    if (find == nullptr || repl == nullptr || find == repl) return;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    if (Module32FirstW(snap, &me))
+    {
+        do
+        {
+            if (me.hModule == g_self || ut_from_mgpu_folder(me.hModule)) continue;
+            c.iat += patch_module(me.hModule, find, repl);
+            if (ut_skip_module(me.hModule, target)) continue;
+            c.delay += ut_patch_delay(me.hModule, dll, fn, find, repl);
+            c.data  += ut_patch_data(me.hModule, find, repl);
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+}
+
+FARPROC ut_resolve(HMODULE m, const char *n)
+{
+    return g_real_gpa ? g_real_gpa(m, n) : GetProcAddress(m, n);
+}
+
+// UT2: a find with nothing wrapped is retried (the game may resolve the
+// functions only when the upscaler is first used), every 5th call - about
+// every 10 s - up to 12 times, then it gives up and says so.
+unsigned g_ut_xess_tries = 0, g_ut_ffx_tries = 0, g_ut_calls = 0;
+char g_ut_ffx_name[64] = {};
+
+// UT3 first: the export table (a stub the game already holds keeps working
+// for any later lookup). Then the UT2 walks for pointers resolved before it.
+void ut_wrap_one(HMODULE m, const char *dll, const char *fn, void *hook, void **real_out, BYTE *&page, ut_counts &c)
+{
+    void *r = ut_eat_hook(m, fn, hook, page);
+    if (r != nullptr) ++c.eat;
+    else r = (void *)ut_resolve(m, fn);
+    if (r == nullptr) return;
+    unsigned si = 0;
+    if (ut_stub_of(r, si) != nullptr) return;   // never treat a stub as the real function
+    *real_out = r;
+    ut_patch_all(r, hook, dll, fn, m, c);
+}
+
+void ut_wrap_xess(HMODULE x, ut_counts &c)
+{
+    BYTE *page = nullptr;
+    ut_wrap_one(x, "libxess.dll", "xessD3D12Execute",     (void *)&hook_xess_exec, (void **)&g_real_xess_exec, page, c);
+    ut_wrap_one(x, "libxess.dll", "xessD3D12Init",        (void *)&hook_xess_init, (void **)&g_real_xess_init, page, c);
+    ut_wrap_one(x, "libxess.dll", "xessSetVelocityScale", (void *)&hook_xess_vs,   (void **)&g_real_xess_vs,   page, c);
+}
+
+void ut_wrap_ffx(HMODULE f, ut_counts &c)
+{
+    BYTE *page = nullptr;
+    ut_wrap_one(f, g_ut_ffx_name, "ffxDispatch",      (void *)&hook_ffx_dispatch, (void **)&g_real_ffx_dispatch, page, c);
+    ut_wrap_one(f, g_ut_ffx_name, "ffxCreateContext", (void *)&hook_ffx_create,   (void **)&g_real_ffx_create,   page, c);
+}
+
+void ut_say(const char *what, const char *dll, unsigned attempt, const ut_counts &c, bool done, bool early)
+{
+    char l[520];
+    std::snprintf(l, sizeof l,
+        "[MGPU][UT1] the game loaded %s (%s), attempt %u: wrapped %u export(s)%s, %u import slot(s), %u delay-load "
+        "slot(s), %u data slot(s). %s UpscalerTap=%d (0 auto: DLSS first, then XeSS/FSR).",
+        what, dll, attempt, c.eat, early ? " (routed at load, before the game looked them up)" : "",
+        c.iat, c.delay, c.data,
+        c.total() != 0 ? "Its calls now pass through the bridge."
+                       : (done ? "NOTHING TO WRAP - giving up; this game reaches the upscaler a way the bridge does not see."
+                               : "Nothing yet - looking again in about 10 s."),
+        g_ut_mode.load(std::memory_order_relaxed));
+    mgpu::diag::info(l);
+}
+
+void ut_scan()
+{
+    const int m = g_ut_mode.load(std::memory_order_relaxed);
+    if (m < 0 || m == 1) return;
+    const unsigned call = g_ut_calls++;
+    if (!g_ut_xess_done && m != 3)
+    {
+        HMODULE x = GetModuleHandleW(L"libxess.dll");
+        if (x != nullptr && !ut_from_mgpu_folder(x) && (g_ut_xess_tries == 0 || (call % 5u) == 0u))
+        {
+            g_ut_xess_mod = x;
+            ut_counts c;
+            ut_wrap_xess(x, c);
+            ++g_ut_xess_tries;
+            g_ut_xess_done = c.total() != 0 || g_ut_xess_tries >= 12u;
+            if (g_ut_xess_tries == 1u || g_ut_xess_done) ut_say("XeSS", "libxess.dll", g_ut_xess_tries, c, g_ut_xess_done, g_ut_eat_xess.load(std::memory_order_relaxed) != 0u);
+        }
+    }
+    if (!g_ut_ffx_done && m != 2)
+    {
+        for (const wchar_t *n : kUtFfxNames)
+        {
+            HMODULE f = GetModuleHandleW(n);
+            if (f == nullptr || ut_from_mgpu_folder(f)) continue;
+            // RV3: SDK 2.x splits FidelityFX into a loader (which exports
+            // ffxDispatch) and effect DLLs (which do not). IN26 took the first
+            // name found and marked the search done even when it exported
+            // nothing - a game with both loaded would never be read.
+            if (ut_resolve(f, "ffxDispatch") == nullptr) continue;
+            if (g_ut_ffx_tries != 0 && (call % 5u) != 0u) break;
+            g_ut_ffx_mod = f;
+            std::snprintf(g_ut_ffx_name, sizeof g_ut_ffx_name, "%ls", n);
+            ut_counts c;
+            ut_wrap_ffx(f, c);
+            ++g_ut_ffx_tries;
+            g_ut_ffx_done = c.total() != 0 || g_ut_ffx_tries >= 12u;
+            if (g_ut_ffx_tries == 1u || g_ut_ffx_done) ut_say("AMD FidelityFX", g_ut_ffx_name, g_ut_ffx_tries, c, g_ut_ffx_done, g_ut_eat_ffx.load(std::memory_order_relaxed) != 0u);
+            break;
+        }
+    }
+}
+
+void ut_unscan()
+{
+    ut_counts c;
+    if (g_real_xess_exec) ut_patch_all((void *)&hook_xess_exec, (void *)g_real_xess_exec, "libxess.dll", nullptr, g_ut_xess_mod, c);
+    if (g_real_xess_init) ut_patch_all((void *)&hook_xess_init, (void *)g_real_xess_init, "libxess.dll", nullptr, g_ut_xess_mod, c);
+    if (g_real_xess_vs)   ut_patch_all((void *)&hook_xess_vs,   (void *)g_real_xess_vs,   "libxess.dll", nullptr, g_ut_xess_mod, c);
+    if (g_real_ffx_dispatch) ut_patch_all((void *)&hook_ffx_dispatch, (void *)g_real_ffx_dispatch, g_ut_ffx_name, nullptr, g_ut_ffx_mod, c);
+    if (g_real_ffx_create)   ut_patch_all((void *)&hook_ffx_create,   (void *)g_real_ffx_create,   g_ut_ffx_name, nullptr, g_ut_ffx_mod, c);
+    g_ut_xess_done = g_ut_ffx_done = false;
+    g_ut_xess_tries = g_ut_ffx_tries = 0;
+}
+
 unsigned scan_and_patch(void *find, void *repl)
 {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -1920,6 +3035,14 @@ void unscan_cached_pointers()
             if (g_real_create != nullptr)
                 patch_module_data(me.hModule, ngx, (void *)&hook_create,
                                   (void *)g_real_create);
+#if MGPU_XT2
+            // XT2 (IN86): the game may have stored these from GetProcAddress.
+            if (g_real_init12)      patch_module_data(me.hModule, ngx, (void *)&hook_init12,      (void *)g_real_init12);
+            if (g_real_initext12)   patch_module_data(me.hModule, ngx, (void *)&hook_initext12,   (void *)g_real_initext12);
+            if (g_real_initpid12)   patch_module_data(me.hModule, ngx, (void *)&hook_initpid12,   (void *)g_real_initpid12);
+            if (g_real_shutdown12)  patch_module_data(me.hModule, ngx, (void *)&hook_shutdown12,  (void *)g_real_shutdown12);
+            if (g_real_shutdown112) patch_module_data(me.hModule, ngx, (void *)&hook_shutdown112, (void *)g_real_shutdown112);
+#endif
         } while (Module32NextW(snap, &me));
     }
     CloseHandle(snap);
@@ -2002,6 +3125,35 @@ unsigned long long scene_captures()   // R281
 bool installed()   // R281
 {
     return g_installed.load(std::memory_order_relaxed);
+}
+
+void set_upscaler_tap(int mode)   // UT1
+{
+    g_ut_mode.store(mode, std::memory_order_relaxed);
+    if (mode < 0 || mode == 1) ut_eat_release();   // UT3: routed at load before the ini was read
+}
+
+// UT3. From the DLL watcher, on the loading thread, under the loader lock: the
+// export table only - no module walk, no logging, no file access here.
+void ut_on_load(void *base, const char *name)
+{
+    if (base == nullptr || name == nullptr || g_ut_released.load(std::memory_order_relaxed)) return;
+    const int m = g_ut_mode.load(std::memory_order_relaxed);
+    if (m < 0 || m == 1) return;
+    HMODULE h = (HMODULE)base;
+    if (m != 3 && _stricmp(name, "libxess.dll") == 0)
+    {
+        if (ut_from_mgpu_folder(h)) return;
+        g_ut_eat_xess.store(ut_eat_xess(h), std::memory_order_relaxed);
+        return;
+    }
+    if (m != 2 && (_stricmp(name, "amd_fidelityfx_dx12.dll") == 0 ||
+                   _stricmp(name, "amd_fidelityfx_upscaler_dx12.dll") == 0 ||
+                   _stricmp(name, "amd_fidelityfx_loader_dx12.dll") == 0))
+    {
+        if (ut_from_mgpu_folder(h) || ut_eat_slot(h, "ffxDispatch") == nullptr) return;
+        g_ut_eat_ffx.store(ut_eat_ffx(h), std::memory_order_relaxed);
+    }
 }
 
 void set_eval_copy(int mode)
@@ -2281,15 +3433,19 @@ void install(int packed)
         g_modules.load(std::memory_order_relaxed),
         hits, g_modules.load(std::memory_order_relaxed));
     mgpu::diag::info(line);
+    ut_scan();   // UT1
 }
 
 void uninstall()
 {
+    ut_eat_release();   // UT3: before anything else - this copy is going away
+    // XT2 (IN90): passive - no thread to stop, no reference to give back.
     std::lock_guard<std::mutex> lk(g_install_cs);
     if (!g_installed.load(std::memory_order_relaxed)) return;
 
     unscan_cached_pointers();
     mgpu::sltags::chain_gpa(nullptr);   // SLD2: before the hook stops being ours to hand out
+    ut_unscan();   // UT1
     scan_and_patch((void *)&hook_gpa, (void *)g_real_gpa);
     g_mode.store(0, std::memory_order_relaxed);
     g_installed.store(false, std::memory_order_relaxed);
@@ -2330,6 +3486,23 @@ void note_frame()
     // interpolating between different clocks - which is exactly what reading
     // the Plague Tale run cost.
     if ((f % 300ull) == 0ull) log_summary();
+
+    // UT1. XeSS/FSR can load late (when the player picks them in a menu), so
+    // look every two seconds until both are found. Four handle lookups.
+    if ((f % 120ull) == 0ull) ut_scan();
+    if ((f % 300ull) == 0ull &&
+        (g_ut_xess_evals.load(std::memory_order_relaxed) | g_ut_ffx_evals.load(std::memory_order_relaxed)) != 0ull)
+    {
+        static const char *const kSrc[] = { "none", "DLSS", "XeSS", "FSR" };
+        const int src = g_ut_src.load(std::memory_order_relaxed);
+        char l[260];
+        std::snprintf(l, sizeof l, "[MGPU][UT1] source=%s | xess calls=%llu used=%llu | fsr calls=%llu used=%llu | vector copies=%llu",
+                      kSrc[(src >= 0 && src <= 3) ? src : 0],
+                      g_ut_xess_evals.load(std::memory_order_relaxed), g_ut_xess_pub.load(std::memory_order_relaxed),
+                      g_ut_ffx_evals.load(std::memory_order_relaxed), g_ut_ffx_pub.load(std::memory_order_relaxed),
+                      g_ut_copies.load(std::memory_order_relaxed));
+        mgpu::diag::info(l);
+    }
 
     // A module that loaded after us has an unpatched import table. Rather than
     // hooking LoadLibrary - another interception, another thing to unwind -
@@ -2466,6 +3639,86 @@ void log_summary()
             "scale is the shape that makes reprojection look almost right.");
     }
     mgpu::diag::info(line);
+}
+
+// XT2 (IN86): see calibrator.hpp. No C++ objects in here (MSVC C2712).
+long probe_refs(void *unk)
+{
+    long n = -1;
+    if (unk == nullptr) return -1;
+    __try
+    {
+        IUnknown *u = (IUnknown *)unk;
+        (void)u->AddRef();
+        n = (long)u->Release();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        n = -1;
+    }
+    return n;
+}
+
+void *game_ngx_device12() { return g_game_dev12.load(std::memory_order_acquire); }
+long game_device12_refs() { return g_game_dev12_refs.load(std::memory_order_acquire); }
+void xt2_note_device(void *native, void *api_device)
+{
+#if MGPU_XT2
+    if (native == nullptr || api_device == nullptr) return;
+    std::lock_guard<std::mutex> lk(g_xt2_devs_cs);
+    for (xt2_dev &e : g_xt2_devs) if (e.api == api_device) { e.native = native; return; }
+    for (xt2_dev &e : g_xt2_devs) if (e.api == nullptr) { e.native = native; e.api = api_device; return; }
+#else
+    (void)native; (void)api_device;
+#endif
+}
+void xt2_forget_device(void *api_device)
+{
+#if MGPU_XT2
+    std::lock_guard<std::mutex> lk(g_xt2_devs_cs);
+    for (xt2_dev &e : g_xt2_devs)
+        if (e.api == api_device)
+        {
+            // The tracked device is being destroyed: never read it again.
+            if (e.native != nullptr && e.native == g_game_dev12_native.load(std::memory_order_acquire))
+            {
+                g_game_dev12.store(nullptr, std::memory_order_release);
+                g_game_dev12_native.store(nullptr, std::memory_order_release);
+                g_game_dev12_refs.store(0, std::memory_order_release);
+            }
+            e.api = nullptr; e.native = nullptr;
+        }
+#else
+    (void)api_device;
+#endif
+}
+
+long xt2_read_if_device(void *holder_device_native)
+{
+#if MGPU_XT2
+    void *w = g_game_dev12.load(std::memory_order_acquire);
+    if (w == nullptr || holder_device_native == nullptr ||
+        holder_device_native != g_game_dev12_native.load(std::memory_order_acquire)) return -3;
+    const long n = probe_refs(w);
+    g_game_dev12_refs.store(n, std::memory_order_release);
+    return n;
+#else
+    (void)holder_device_native;
+    return -3;
+#endif
+}
+
+long xt2_read_guaranteed()
+{
+#if MGPU_XT2
+    void *w = g_game_dev12.load(std::memory_order_acquire);
+    if (w == nullptr) return -3;
+    const long n = probe_refs(w);
+    g_game_dev12_refs.store(n, std::memory_order_release);
+    return n;
+#else
+    return -3;
+#endif
 }
 
 } // namespace calibrator

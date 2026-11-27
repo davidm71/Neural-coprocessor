@@ -360,6 +360,123 @@ static void test_assessments()
     }
 }
 
+// PG1 (LR99): the RivaTuner crash, Cyberpunk 2026-11-26 - dxgi.dll+0x84c9, Present at +0x84c0.
+static void test_pg_where()
+{
+    const uint64_t dx = 0x7ff800000000ull, p = dx + 0x84c0, p1 = dx + 0x89a0;
+    CHECK(pg_where(dx + 0x84c9, p, p1, true) == 1);          // the crash: 9 bytes in
+    CHECK(pg_where(p, p, p1, true) == 1);                     // the first byte
+    CHECK(pg_where(p + 31, p, p1, true) == 1);                // last of the window
+    CHECK(pg_where(p + 32, p, p1, true) == 0);                // deeper in Present: a lock may be held
+    CHECK(pg_where(p - 1, p, p1, true) == 0);                 // the function before it
+    CHECK(pg_where(p1 + 5, p, p1, true) == 1);                // Present1's first bytes
+    CHECK(pg_where(dx + 0x17f9d6, p, p1, true) == 0);         // elsewhere in dxgi.dll
+    CHECK(pg_where(0x7ff842450010ull, p, p1, false) == 2);    // RivaTuner's trampoline block (no module)
+    CHECK(pg_where(0x7ff842450010ull, p, p1, true) == 0);     // the same address inside a module: not taken
+    CHECK(pg_where(dx + 0x84c9, 0, 0, true) == 0);            // probe off (no slots): not taken in a module
+    CHECK(pg_where(0x1234, 0, 0, false) == 2);                // probe off: freed code still taken
+}
+
+// PG2 (LR103): the same crash on the GAME's thread, Cyberpunk 2026-11-26 11:30:09 -
+// the return is found among the words just above the faulting rsp.
+static pg2_cand pg2_good(uint64_t ret, uint64_t slot)
+{
+    pg2_cand c{};
+    c.d.rip = ret; c.d.rsp = slot + 8; c.d.walked_out = true; c.d.executable = true; c.d.readable_before = true;
+    const uint8_t vt[8] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0xFF, 0x50, 0x40 };   // call [rax+0x40]: Present
+    for (int i = 0; i < 8; ++i) c.d.before[i] = vt[i];
+    c.image = true; c.same_module = true; c.sem = call_sem::present;
+    return c;
+}
+static void test_pg2()
+{
+    const uint64_t dx = 0x7ff800000000ull, ret = dx + 0x17f9d6, rsp = 0x000000a1b2c3d000ull;   // rsp % 16 == 0
+    // the return two words up (the prologue pushed two before the fault): taken there
+    pg2_cand c[PG2_SLOTS];
+    for (int i = 0; i < PG2_SLOTS; ++i) { c[i] = pg2_good(ret, rsp + 8 * i); c[i].d.executable = false; }
+    c[1] = pg2_good(ret, rsp + 8);                       // slot rsp+8: after return rsp+16, aligned
+    CHECK(pg2_pick(c, PG2_SLOTS) == 1);
+    // the lowest believable word wins (the most recent return)
+    c[3] = pg2_good(ret + 0x100, rsp + 24);
+    CHECK(pg2_pick(c, PG2_SLOTS) == 1);
+    // a word that would leave rsp misaligned is not a return
+    pg2_cand m = pg2_good(ret, rsp);                     // rsp+8 after: misaligned
+    CHECK(!pg2_ok(m));
+    // a word into another module (stale, or the game's own code) is not taken
+    pg2_cand o = pg2_good(ret, rsp + 8); o.same_module = false;
+    CHECK(!pg2_ok(o));
+    // a hook's private block is not a module
+    pg2_cand h = pg2_good(ret, rsp + 8); h.image = false;
+    CHECK(!pg2_ok(h));
+    // a vtable call of another method: contrary evidence
+    pg2_cand v = pg2_good(ret, rsp + 8); v.sem = call_sem::other_method;
+    CHECK(!pg2_ok(v));
+    // a direct call: only into the Present that faulted
+    pg2_cand d = pg2_good(ret, rsp + 8); d.sem = call_sem::unknown; d.direct = true; d.direct_to_fn = false;
+    CHECK(!pg2_ok(d));
+    d.direct_to_fn = true;
+    CHECK(pg2_ok(d));
+    // a call form that says nothing (CFG dispatch, call [rip+x], call rax): accepted
+    pg2_cand u = pg2_good(ret, rsp + 8); u.sem = call_sem::unknown;
+    CHECK(pg2_ok(u));
+    // not after a CALL
+    pg2_cand n = pg2_good(ret, rsp + 8); for (int i = 0; i < 8; ++i) n.d.before[i] = 0x90;
+    CHECK(!pg2_ok(n));
+    // nothing believable in the window: not taken
+    pg2_cand none[PG2_SLOTS];
+    for (int i = 0; i < PG2_SLOTS; ++i) { none[i] = pg2_good(ret, rsp + 8 * i); none[i].same_module = false; }
+    CHECK(pg2_pick(none, PG2_SLOTS) == -1);
+    // only PG2_SLOTS words are looked at, however many are passed
+    pg2_cand far[8];
+    for (int i = 0; i < 8; ++i) { far[i] = pg2_good(ret, rsp + 8 * i); far[i].image = false; }
+    far[7] = pg2_good(ret, rsp + 8 * 7);                 // 0x38 up: past the window
+    CHECK(pg2_pick(far, 8) == -1);
+    // E8 rel32 target
+    const uint8_t e8[8] = { 0x90, 0x90, 0x90, 0xE8, 0x10, 0x00, 0x00, 0x00 };
+    CHECK(direct_target(e8, 0x1000) == 0x1010);
+    const uint8_t back[8] = { 0x90, 0x90, 0x90, 0xE8, 0xF0, 0xFF, 0xFF, 0xFF };
+    CHECK(direct_target(back, 0x1000) == 0x0FF0);
+}
+
+// PG2 (LR104): the decision needs independent agreement; each missing piece refuses.
+static void test_pg2_decide()
+{
+    pg2_facts f{};
+    f.scan_index = 1; f.unwind_found = true; f.unwind_agrees = true; f.regs_same = true; f.call_verified = true;
+    CHECK(pg2_decide(f) == pg2_why::taken);
+    { pg2_facts g = f; g.scan_index = -1;       CHECK(pg2_decide(g) == pg2_why::no_return); }
+    { pg2_facts g = f; g.unwind_found = false;  CHECK(pg2_decide(g) == pg2_why::unwind_none); }
+    { pg2_facts g = f; g.unwind_agrees = false; CHECK(pg2_decide(g) == pg2_why::unwind_disagrees); }
+    { pg2_facts g = f; g.regs_same = false;     CHECK(pg2_decide(g) == pg2_why::regs_changed); }
+    { pg2_facts g = f; g.call_verified = false; CHECK(pg2_decide(g) == pg2_why::call_unverified); }   // call rax / CFG
+    { pg2_facts g = f; g.call_verified = false; g.call_names_present = true; CHECK(pg2_decide(g) == pg2_why::taken); }
+    // the first failing condition is the one reported (scan before unwind before registers before call)
+    { pg2_facts g{}; CHECK(pg2_decide(g) == pg2_why::no_return); }
+    { pg2_facts g = f; g.unwind_agrees = false; g.regs_same = false; CHECK(pg2_decide(g) == pg2_why::unwind_disagrees); }
+    for (int w = 0; w <= 5; ++w) CHECK(pg2_text((pg2_why)w)[0] != '?');
+
+    // registers: only those the unwind read back are compared; the frame register is exempt
+    bool rest[16] = {}; uint64_t then[16] = {}, now[16] = {};
+    for (int i = 0; i < 16; ++i) { then[i] = 0x1000 + i; now[i] = 0x1000 + i; }
+    rest[3] = true; rest[6] = true;                              // rbx, rsi saved by the prologue
+    CHECK(pg2_regs_same(rest, then, now, 16, 0));
+    now[6] = 0xdead;                                             // rsi changed after it was saved
+    CHECK(!pg2_regs_same(rest, then, now, 16, 0));
+    now[6] = then[6]; now[1] = 0xbeef;                           // rcx (volatile, not restored) may differ
+    CHECK(pg2_regs_same(rest, then, now, 16, 0));
+    rest[5] = true; now[5] = 0x7777;                             // rbp restored and different...
+    CHECK(!pg2_regs_same(rest, then, now, 16, 0));
+    CHECK(pg2_regs_same(rest, then, now, 16, 5));                // ...unless it is the frame register
+
+    // call [rip+disp32]: FF 15 disp32 ends at the return
+    const uint8_t ff15[8] = { 0x90, 0x90, 0xFF, 0x15, 0x00, 0x01, 0x00, 0x00 };
+    CHECK(rip_mem_slot(ff15, 0x5000) == 0x5100);
+    const uint8_t rexff15[8] = { 0x90, 0x48, 0xFF, 0x15, 0xF8, 0xFF, 0xFF, 0xFF };
+    CHECK(rip_mem_slot(rexff15, 0x5000) == 0x4FF8);
+    const uint8_t vt[8] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0xFF, 0x50, 0x40 };
+    CHECK(rip_mem_slot(vt, 0x5000) == 0);                        // not that form
+}
+
 int main()
 {
     test_signature();
@@ -372,6 +489,9 @@ int main()
     test_ring_concurrent();
     test_ring_order();
     test_assessments();
+    test_pg_where();
+    test_pg2();
+    test_pg2_decide();
     std::printf("steam_guard_test: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

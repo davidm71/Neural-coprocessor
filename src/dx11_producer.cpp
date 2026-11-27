@@ -1,4 +1,5 @@
 // MGPU Bridge - the DX11 producer. See dx11_producer.hpp. R227.
+#include "d3dc.hpp"   // SC1
 #include <windows.h>
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -12,6 +13,7 @@
 #include "diag.hpp"
 #include "adapter.hpp"
 #include "gpu1_context.hpp"
+#include "gpu_safety_d3d12.hpp"   // LR100: bounded drain + event-retention rule
 #include "mgpu_ini_parser.hpp"
 
 namespace mgpu::dx11producer
@@ -49,6 +51,7 @@ ID3D12Resource *g_mvec12 = nullptr;         // R232: the shared vector texture, 
 unsigned long long g_value = 0;             // shared fence: D3D11 signals, D3D12 waits
 unsigned long long g_done_value = 0;
 unsigned long long g_frames = 0, g_depth_frames = 0, g_depth_remakes = 0, g_waits = 0;
+unsigned long long g_alloc_skips = 0;   // LR100: frames skipped because the allocator was still in use
 unsigned long long g_mvec_frames = 0, g_mvec_remakes = 0;   // R232
 unsigned long long g_wait_ms_total = 0;
 
@@ -435,7 +438,7 @@ bool cv_shaders()
     g_cv_shaders_tried = true;
     typedef HRESULT (WINAPI *pfn_d3dcompile)(LPCVOID, SIZE_T, LPCSTR, const void *, void *,
                                              LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
-    HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+    HMODULE dc = mgpu::sys_d3dcompiler_module() /* SC1 */;
     pfn_d3dcompile compile = dc ? (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile") : nullptr;
     if (compile == nullptr) { note_absent("mvec", "LoadLibrary(d3dcompiler_47)/D3DCompile for the typed copy", E_FAIL); return false; }
     static const char VS[] =
@@ -694,6 +697,20 @@ void on_finish_effects(void *context, void *back_buffer, void *depth)
             g_done->SetEventOnCompletion(need, g_done_ev);
             WaitForSingleObject(g_done_ev, 100);
             g_wait_ms_total += GetTickCount64() - t0;
+            // LR100: the wait is bounded at 100 ms, and the code below RESETS
+            // the allocator - which must not happen while its list still runs
+            // on the GPU. Read the fence again: a timeout (or an early wake
+            // from an earlier timed-out registration on this same event) is
+            // not completion. Then skip this frame - nothing has been recorded
+            // or submitted yet - instead of resetting an allocator in use.
+            // A removed device reads UINT64_MAX (>= need) and goes on as before.
+            if (g_done->GetCompletedValue() < need)
+            {
+                if (g_alloc_skips++ == 0ull)
+                    mgpu::diag::warn("[MGPU][DX11P] GPU 0 was more than 100 ms behind - this frame was skipped rather "
+                                     "than reuse a command allocator still in use (LR100; said once).");
+                return;
+            }
         }
     }
     hr = g_queue->Wait(g_fence12, g_value);
@@ -748,14 +765,25 @@ void shutdown()
 {
     g_mode.store(0, std::memory_order_release);
     g_ready = false;
-    if (g_queue != nullptr && g_done != nullptr && g_done_value != 0ull && g_done_ev != nullptr)
+    // LR100: the shared bounded drain (gpu_safety_d3d12.hpp): 2 s as before,
+    // removal read from the device too. Then the rules the D3D12 side follows
+    // everywhere else: the event is closed only when the fence passed or the
+    // device is gone (a per-frame wait that timed out may have left it
+    // registered), and the D3D12 objects our last list uses are LEFT
+    // ALLOCATED, not released under the GPU, when that cannot be confirmed.
+    bool idle12 = true;
+    if (g_queue != nullptr && g_done != nullptr && g_done_value != 0ull)
     {
-        // Bounded: our last list must finish before its allocator goes.
-        if (g_done->GetCompletedValue() < g_done_value)
-        {
-            g_done->SetEventOnCompletion(g_done_value, g_done_ev);
-            WaitForSingleObject(g_done_ev, 2000);
-        }
+        const mgpu::gpusafe::drain_r dr = mgpu::gpusafe::drain_fence(g_done, g_done_value, 2000, 0, g_dev12);
+        idle12 = dr.drained || dr.removed;
+    }
+    if (!idle12)
+    {
+        mgpu::diag::warn("[MGPU][DX11P] shutdown: GPU 0 did not finish our last copy within 2 s - its D3D12 objects "
+                         "are left allocated (a small leak) rather than released while in use (LR100).");
+        g_mvec12 = g_depth12 = g_color12 = nullptr; g_fence12 = nullptr; g_done = nullptr;
+        g_list = nullptr; g_alloc[0] = g_alloc[1] = nullptr; g_queue = nullptr; g_dev12 = nullptr;
+        g_done_ev = nullptr;   // kept: the driver may still set it
     }
     rel(g_mvec12); rel(g_depth12); rel(g_color12); rel(g_fence12); rel(g_done);
     rel(g_list); rel(g_alloc[0]); rel(g_alloc[1]); rel(g_queue); rel(g_dev12);

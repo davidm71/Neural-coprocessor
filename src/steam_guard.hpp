@@ -505,5 +505,143 @@ struct assessments
     }
 };
 
+// ---- PG1 (LR99): where a fault in the bridge's own Present may be taken ----
+// 1 = the first 32 bytes of dxgi.dll's Present or Present1 (the bytes a hook
+// rewrites; no lock is taken there yet), 2 = code that belongs to no module (a
+// hook's trampoline being replaced or freed), 0 = anywhere else in a module -
+// not taken (deeper in Present a lock may be held).
+const uint64_t PG_PROLOGUE = 32;
+inline int pg_where(uint64_t rip, uint64_t present_fn, uint64_t present1_fn, bool in_module)
+{
+    if (present_fn != 0 && rip >= present_fn && rip - present_fn < PG_PROLOGUE) return 1;
+    if (present1_fn != 0 && rip >= present1_fn && rip - present1_fn < PG_PROLOGUE) return 1;
+    return in_module ? 0 : 2;
+}
+
+// ---- PG2 (LR103): the GAME's Present, faulting in the bytes a hook rewrites ----
+// Cyberpunk 2077, 2026-11-26 11:30:09, on LR102: the same RivaTuner rewrite as
+// PG1, but on the GAME's presenting thread (Streamline -> DLSS-G -> dxgi.dll's
+// Present +9, writing 0x1a7). PG1 only covers the bridge's own call, where a
+// snapshot exists. Here there is none, so the return is FOUND:
+//
+// At Present's first instruction the return address is on top of the stack. A
+// fault within Present's first 32 bytes has pushed at most a few words since,
+// so the words from the faulting rsp up (PG2_SLOTS of them, 0x28 bytes) are
+// looked at, lowest first, and the first one that is a believable return
+// from a call INTO that Present is taken:
+//   - check_dest: after a CALL, in executable code, rsp aligned after the return;
+//   - in the same module as the Present that faulted (every one seen so far
+//     returns into dxgi.dll itself, at +0x17f9d6) - a word from some other
+//     module is not taken;
+//   - a direct call must target exactly that Present; a vtable call must not
+//     name another method (call forms that say nothing are accepted);
+//   - in executable IMAGE memory (a module), not a hook's private block.
+// None: not taken (the crash goes on as before, with its CR1 line).
+const int PG2_SLOTS = 5;
+struct pg2_cand
+{
+    dest_facts d;            // d.rip = the word, d.rsp = slot + 8
+    call_sem sem = call_sem::unknown;
+    bool image = false;      // the word points into a loaded module's code
+    bool same_module = false;
+    bool direct = false;     // E8 rel32 before the return
+    bool direct_to_fn = false;
+};
+inline bool pg2_ok(const pg2_cand &c)
+{
+    if (check_dest(c.d) != dest::ok) return false;
+    if (!c.image || !c.same_module) return false;
+    if (c.sem == call_sem::other_method) return false;
+    if (c.direct && !c.direct_to_fn) return false;
+    return true;
+}
+inline int pg2_pick(const pg2_cand *c, int n)
+{
+    for (int i = 0; i < n && i < PG2_SLOTS; ++i)
+        if (pg2_ok(c[i])) return i;
+    return -1;
+}
+// ---- PG2 (LR104): the decision, from facts gathered independently ----
+// LR103 took the return found by the scan above and assumed the half-written
+// bytes left the thread's registers alone. LR104 requires two INDEPENDENT
+// derivations to agree, and that nothing the prologue saved has changed:
+//   scan        - pg2_pick found a believable return among the words above rsp;
+//   unwind      - Windows' unwind data for that Present (RtlVirtualUnwind from
+//                 the faulting rip, as if the ORIGINAL prologue ran) lands on the
+//                 SAME return address and the SAME rsp. A half-written prologue
+//                 that moved rsp differently disagrees here;
+//   registers   - every callee-saved register the unwind reads back from the
+//                 stack (integer and xmm) equals the value the thread holds now:
+//                 a prologue only saves them, so a difference means the saved
+//                 slot or the register was changed by bytes that were not the
+//                 prologue. A frame register the prologue legitimately set is
+//                 the one exception (fp_reg);
+//   call        - the CALL before the return provably targets that Present (a
+//                 direct call to it, or a [rip+x] pointer holding it), or is a
+//                 vtable call through Present's own slot (+0x40 / +0xB0). Call
+//                 forms that say nothing (call rax, CFG dispatch) are refused.
+// Still assumed, and cannot be checked: a callee-saved register the prologue
+// had NOT saved yet was not changed. That is why PG2 is off unless asked for
+// (PresentGuardGame=1); off, the same decision is made and only reported.
+enum class pg2_why : int
+{
+    taken = 0, no_return = 1, unwind_none = 2, unwind_disagrees = 3, regs_changed = 4, call_unverified = 5,
+};
+struct pg2_facts
+{
+    int scan_index = -1;          // pg2_pick
+    bool unwind_found = false;    // an unwind entry beginning exactly at that Present
+    bool unwind_agrees = false;   // its return rip and rsp == the scanned slot's
+    bool regs_same = false;       // every register it restored from the stack == the current value
+    bool call_verified = false;   // direct / [rip+x] call whose target is that Present
+    bool call_names_present = false;   // call [reg+0x40] / [reg+0xB0]
+};
+inline pg2_why pg2_decide(const pg2_facts &f)
+{
+    if (f.scan_index < 0) return pg2_why::no_return;
+    if (!f.unwind_found) return pg2_why::unwind_none;
+    if (!f.unwind_agrees) return pg2_why::unwind_disagrees;
+    if (!f.regs_same) return pg2_why::regs_changed;
+    if (!f.call_verified && !f.call_names_present) return pg2_why::call_unverified;
+    return pg2_why::taken;
+}
+inline const char *pg2_text(pg2_why w)
+{
+    switch (w)
+    {
+    case pg2_why::taken:            return "every check passed";
+    case pg2_why::no_return:        return "no believable return address in the 5 words above the fault's rsp";
+    case pg2_why::unwind_none:      return "Windows has no unwind data starting at that Present";
+    case pg2_why::unwind_disagrees: return "the unwind data and the stack scan disagree on the return (the half-written bytes moved rsp)";
+    case pg2_why::regs_changed:     return "a callee-saved register no longer matches the value the prologue saved";
+    case pg2_why::call_unverified:  return "the call before the return does not prove it called Present (call rax / CFG dispatch / another form)";
+    }
+    return "?";
+}
+// The nonvolatile check: `restored[i]` is whether the unwind read register i
+// back from the stack, `then[i]` the value it read, `now[i]` the thread's value.
+// `fp_reg` (0 = none) is the frame register the prologue may have set.
+inline bool pg2_regs_same(const bool *restored, const uint64_t *then, const uint64_t *now, int n, int fp_reg)
+{
+    for (int i = 0; i < n; ++i)
+        if (restored[i] && i != fp_reg && then[i] != now[i]) return false;
+    return true;
+}
+
+// The target of an E8 rel32 call whose 8 bytes before the return are `b`.
+// The address of the pointer a "call [rip+disp32]" (FF 15 disp32, the last 6
+// bytes before the return) reads; 0 if the bytes are not that form.
+inline uint64_t rip_mem_slot(const uint8_t b[8], uint64_t ret)
+{
+    if (b[2] != 0xFF || b[3] != 0x15) return 0;
+    const int32_t rel = (int32_t)((uint32_t)b[4] | ((uint32_t)b[5] << 8) | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24));
+    return ret + (uint64_t)(int64_t)rel;
+}
+inline uint64_t direct_target(const uint8_t b[8], uint64_t ret)
+{
+    const int32_t rel = (int32_t)((uint32_t)b[4] | ((uint32_t)b[5] << 8) | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24));
+    return ret + (uint64_t)(int64_t)rel;
+}
+
 } // namespace steam_guard
 } // namespace mgpu

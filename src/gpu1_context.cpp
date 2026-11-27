@@ -37,13 +37,17 @@
 #include <condition_variable>
 #include <vector>   // FIX7: the present thread's retire list; R258: the calibration profiles
 #include <atomic>    // R78: one counter, written from the game's render thread
+#include <memory>    // TL1
+#include <new>       // TL1
                      // without this file's mutex - it counts the times that
                      // mutex was NOT taken, so it cannot be guarded by it.
 
 #include "adapter.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#include "archspoof.hpp"   // AS1
 #include "d3dc.hpp"   // FD1
+#pragma comment(lib, "version.lib")
 #include "calibrator.hpp"   // R104: jitter compensation
 #include "mgpu_ini_parser.hpp"
 #include "tray.hpp"     // TR1
@@ -59,6 +63,14 @@
 #include "cursormap.hpp"  // MC1: the pointer on the enlarged picture
 #include "dx11_producer.hpp"   // 0.3.1 backport: HudLess is D3D12-only
 #include "nr16.hpp"   // 0.3.1 R208: optional FP16 input to DLSS-NR (NRInput16=4)
+#include "tstab.hpp"  // TC1: temporal stabilisation of the NR output (TemporalStab, off by default)
+#include "nb_logic.hpp"   // NB3: the timestamp / budget decisions (tested in tests/nb_logic_test.cpp)
+#include "cpuprof.hpp"    // CP1: CPU cost of the per-frame paths (CpuProfile=1)
+#include "gpu_safety.hpp" // SF1: GPU error-path rules
+#include "gpu_safety_d3d12.hpp"   // SF2: the bounded fence drain
+#include "exit_detect.hpp"      // EX1 (IN90): game-closing rule, device-reference ledger
+#include "live_resize.hpp"      // LR1 (LR97): following a vector / depth size or format change in play
+#include "thread_life.hpp"      // LR100: FG present-thread and replay hook-thread life rules
 #include "capture.hpp"   // SS1 / VR1 / BM1
 #include "framewarp.hpp" // FW1
 #include "replay.hpp"    // BM2
@@ -526,6 +538,11 @@ static std::atomic<unsigned> g_dr_reset_seq{0};   // BM6: a sweep step restarts 
 // in bigger steps, raises only with clear room. Both generators.
 static std::atomic<int> g_dr_aggr{0};
 static std::atomic<int> g_dr_late{1};   // DR5: late frame pairs steer the scale (SRDynLatePairs)
+// NB1: a ceiling on NR's own GPU time per real frame (SRDynBudgetMs, whole ms,
+// 0 = off). Measured with NB1's timestamps (start of the NR passes to the end
+// of the last one), so the rebuild, frame generation and presenting are not in it.
+static std::atomic<int> g_dr_budget{0};
+static std::atomic<double> g_nb_nr_ms{-1.0}, g_nb_fg_ms{-1.0};   // smoothed, for the panel
 // DR8: what a DR decision is compared against - the neural stage's queue (NR,
 // AMD, composition), the present path's queues, AMD's call and the composition
 // (smoothed, from the AC timestamps), and the driver's own utilisation.
@@ -966,6 +983,7 @@ static void sc_cover_sync(bool force_log)
 // procedure on the same thread.
 static std::atomic<bool> g_bw_on{false};      // acting as the top picture (styled, same monitor)
 static std::atomic<bool> g_bw_console{false}; // the game's ReShade overlay is open (BT2)
+static std::atomic<bool> g_rc2{false};        // RC2: the game's picture no longer matches the stream's size
 static std::atomic<bool> g_bw_peek{false};    // CTRL+ALT+F6
 static std::atomic<bool> g_bw_panel{false};   // BT5: the ReShade panel is open on the picture's own runtime
 static std::atomic<bool> g_bw_top_pub{false}; // g_bw_top for other threads
@@ -1038,6 +1056,42 @@ static bool hw_show_idle()
     if (v < 0) { v = ui_ini_read("BridgeShowIdle", 0) != 0 ? 1 : 0; g_hw_cfg.store(v, std::memory_order_relaxed); }
     return v != 0;
 }
+// ---- SU1 (IN95): START-UP STAGE, SHOWN IN RESHADE'S OSD ON THE GAME ----
+//
+// Until the first neural frame the bridge picture is hidden (HW1) and the
+// user looks at the game's own window - in Halo for ~30 s, with the panel's
+// controls inert. SU1 says what the bridge is doing meanwhile, in ReShade's
+// fps-counter box (dllmain.cpp, the "OSD" widget):
+//   "MGPU:  Starting Atomic Bridge  -  <stage>"
+// Stages only move forward; set by the bridge thread at the points it already
+// logs (worker.cpp). Gone once the picture is shown. StartupHud=0: off.
+namespace
+{
+    std::atomic<int> g_su_stage{0};
+    std::atomic<unsigned long long> g_su_since{0};   // when the current stage began
+    int g_su_on = -1;
+}
+void su_set_stage(int stage)
+{
+    int cur = g_su_stage.load(std::memory_order_relaxed);
+    while (stage > cur && !g_su_stage.compare_exchange_weak(cur, stage, std::memory_order_relaxed)) {}
+    if (stage > cur) g_su_since.store(GetTickCount64(), std::memory_order_relaxed);
+}
+bool startup_hud_text(char *out, size_t n)
+{
+    if (g_su_on < 0) g_su_on = ui_ini_read("StartupHud", 1) != 0 ? 1 : 0;
+    if (g_su_on == 0 || out == nullptr || n == 0) return false;
+    const int st = g_su_stage.load(std::memory_order_relaxed);
+    if (st <= 0 || !bridge_window_hidden()) return false;   // nothing started yet, or the picture is up
+    const char *what = st == SU_ARMING ? "Arming"
+                     : st == SU_WAITING ? "Waiting for Gameplay"
+                     : st == SU_LOADING ? "Loading Neural Rendering" : "Upscaling";
+    const unsigned long long since = GetTickCount64() - g_su_since.load(std::memory_order_relaxed);
+    snprintf(out, n, "MGPU:  Starting Atomic Bridge  -  %s%s", what,
+             (st == SU_WAITING && since > 120000ull) ? "  (is DLSS on in the game's settings?)" : "");
+    return true;
+}
+
 bool bridge_window_hidden()
 {
     return !dcomp_overlay_mode() && !hw_show_idle() && !g_hw_revealed.load(std::memory_order_relaxed);
@@ -1223,6 +1277,17 @@ static bool hide_pointer_cfg()
     return v == 1;
 }
 
+// RC3 (IN91): while RC2 holds (the game runs at a size the stream was not
+// started at), the bridge window is HIDDEN - not held behind the game's
+// window. Held behind, its last 4K frame stayed up as a dead "wallpaper"
+// around a game window that is now smaller than the screen. Hidden, the game
+// is an ordinary window over the desktop until the size goes back. The
+// present loop already copes with a hidden window (HW1: Present returns
+// occluded at once; the loop paces itself to ~60 Hz). The panel still shows
+// on the picture if it is opened meanwhile.
+static std::atomic<bool> g_rc3_hidden{false};
+bool picture_hidden_for_resize() { return g_rc3_hidden.load(std::memory_order_relaxed); }
+
 static void bw_sync()
 {
     if (bw_cfg() == 0 || dcomp_overlay_mode() || g_game_hwnd == nullptr) return;
@@ -1241,6 +1306,32 @@ static void bw_sync()
             mgpu::diag::info("[MGPU][BT1] the bridge window is no longer on the game's monitor - it stays an ordinary window.");
         }
         return;
+    }
+    {   // RC3 (IN91)
+        const bool hide = g_rc2.load() && !g_bw_panel.load();
+        if (hide != g_rc3_hidden.load(std::memory_order_relaxed))
+        {
+            if (hide)
+            {
+                SetWindowPos(w, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                ShowWindow(w, SW_HIDE);
+                g_bw_top = false;
+                g_bw_top_pub.store(false);
+                mgpu::cursormap::tick(false);   // the pointer is the desktop's again
+                mgpu::diag::info("[MGPU][RC3] picture hidden while the game runs at a different size: the game is an "
+                                 "ordinary window over the desktop. It comes back when the size does (or restart the "
+                                 "game to run the bridge at the new size).");
+            }
+            else
+            {
+                ShowWindow(w, SW_SHOWNOACTIVATE);
+                mgpu::diag::info(g_rc2.load() ? "[MGPU][RC3] picture shown for the panel (the game is still at a "
+                                                "different size)."
+                                              : "[MGPU][RC3] the game is back at the stream's size: picture shown again.");
+            }
+            g_rc3_hidden.store(hide, std::memory_order_relaxed);
+        }
+        if (hide) return;
     }
     if (!g_bw_styled)
     {
@@ -1312,7 +1403,9 @@ static void bw_sync()
     }
     const bool console = g_bw_console.load(), peek = g_bw_peek.load();
     const bool panel = g_bw_panel.load();   // BT5: the panel is drawn on the picture itself - stay on top
-    const bool aside = console || peek;
+    // RC2: the game's own frames while the size differs - RC3 hides the picture
+    // then (above); only with the panel open is it up, and then on top.
+    const bool aside = console || peek || (g_rc2.load() && !panel);
     const bool want = shown && game_fg && !aside;
     // BT2: for the console or a peek the picture goes right BEHIND the game's
     // window rather than to the bottom - so it still covers the desktop and
@@ -1357,7 +1450,8 @@ static void bw_sync()
     {
         char l[260];
         snprintf(l, sizeof l, "[MGPU][BT2] picture %s.", behind ? (console ? "behind the game's window for the ReShade "
-                 "console (it still covers the desktop)" : "behind the game's window (CTRL+ALT+F6)") :
+                 "console (it still covers the desktop)" : g_rc2.load() ? "behind the game's window (the game changed "
+                 "resolution - RC2)" : "behind the game's window (CTRL+ALT+F6)") :
                  "no longer held behind the game's window");
         mgpu::diag::info(l);
     }
@@ -1404,7 +1498,8 @@ static void bw_sync()
 bool bw_active() { return g_bw_on.load(); }
 bool bw_on_top() { return g_bw_top_pub.load(); }
 bool bw_panel() { return g_bw_panel.load(); }
-void bw_set_panel(bool up) { g_bw_panel.store(up); }
+void bw_set_panel(bool up) { g_bw_panel.store(up); mgpu::cursormap::panel_up(up || g_sc_panel.load());   // PO2
+                             if (up) mgpu::hotkeys::rehook_keyboard(); }                               // KS2
 void bw_set_aside(bool on) { g_bw_console.store(on); }
 bool bw_peek_toggle()   // true = the picture is on screen after the call
 {
@@ -1423,7 +1518,15 @@ bool bw_mouse(HWND self, UINT msg, WPARAM wp, LPARAM lp, LRESULT *res)
     switch (msg)
     {
     case WM_SETCURSOR:
-        if (LOWORD(lp) == HTCLIENT && (mgpu::cursormap::installed() || hide_pointer_cfg())) { SetCursor(nullptr); *res = TRUE; return true; }
+        if (LOWORD(lp) == HTCLIENT && (mgpu::cursormap::installed() || hide_pointer_cfg()))
+        {
+            // MC7: the game's own pointer when it wants one and nothing is mapped
+            // onto the picture; otherwise none (MC1 draws it, or the game hid it).
+            if (mgpu::cursormap::installed()) mgpu::cursormap::forward_setcursor(lp);   // MC10
+            SetCursor(mgpu::cursormap::installed() ? mgpu::cursormap::picture_cursor() : nullptr);
+            *res = TRUE;
+            return true;
+        }
         return false;
     case WM_MOUSEMOVE:
     case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
@@ -1523,6 +1626,49 @@ static void gb_note(double unpack, double nr, double sr, double post_sr, double 
     g_gb_unpack += unpack; g_gb_nr += nr; g_gb_sr += sr; g_gb_post_sr += post_sr; g_gb_post += post; g_gb_list += list;
     ++g_gb_n; if (have_sr) ++g_gb_n_sr;
 }
+// NB1: per finished neural-stage list. nra: NR alone (ms), fgs: the frame
+// generation stage (ms), -1 when not measured. scale_x10: the dynamic scale the
+// list ran at - the budget window only keeps readings taken at one scale.
+static double g_gb_nra = 0, g_gb_fgs = 0;
+static unsigned g_gb_nra_n = 0, g_gb_fgs_n = 0;
+static unsigned long long g_gb_nb_bad = 0;   // NB3: marks written but out of order (window)
+static mgpu::nb::window g_nb_win;            // NB3: the budget window (under g_gb_mx)
+// NB3: running totals for the sweep (a step's exact mean = difference of two reads).
+static std::atomic<unsigned long long> g_nb_tot_nr_us{0}, g_nb_tot_nr_n{0}, g_nb_tot_fg_us{0}, g_nb_tot_fg_n{0};
+static std::atomic<unsigned long long> g_nb_missing{0}, g_nb_stale{0};
+static void nb_note(const mgpu::nb::sample &sm, int recorded_scale)
+{
+    const double nra = sm.nr_ms, fgs = sm.fg_ms;
+    if (nra >= 0.0)
+    {
+        const double o = g_nb_nr_ms.load(std::memory_order_relaxed);
+        g_nb_nr_ms.store(o < 0.0 ? nra : o + (nra - o) * 0.1, std::memory_order_relaxed);
+        g_nb_tot_nr_us.fetch_add((unsigned long long)(nra * 1000.0 + 0.5), std::memory_order_relaxed);
+        g_nb_tot_nr_n.fetch_add(1ull, std::memory_order_relaxed);
+    }
+    if (fgs >= 0.0)
+    {
+        const double o = g_nb_fg_ms.load(std::memory_order_relaxed);
+        g_nb_fg_ms.store(o < 0.0 ? fgs : o + (fgs - o) * 0.1, std::memory_order_relaxed);
+        g_nb_tot_fg_us.fetch_add((unsigned long long)(fgs * 1000.0 + 0.5), std::memory_order_relaxed);
+        g_nb_tot_fg_n.fetch_add(1ull, std::memory_order_relaxed);
+    }
+    if (sm.nr_bad || sm.fg_bad) g_nb_missing.fetch_add(1ull, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_gb_mx);
+    if (nra >= 0.0) { g_gb_nra += nra; ++g_gb_nra_n; }
+    if (fgs >= 0.0) { g_gb_fgs += fgs; ++g_gb_fgs_n; }
+    if (sm.nr_bad || sm.fg_bad) ++g_gb_nb_bad;
+    const unsigned long long st0 = g_nb_win.stale;
+    g_nb_win.note(nra, recorded_scale);
+    if (g_nb_win.stale != st0) g_nb_stale.fetch_add(1ull, std::memory_order_relaxed);
+}
+// NB1/NB3: the controller's window - the mean NR time of lists RECORDED at `cur`
+// since the last call; then a fresh window at `cur`.
+static void nb_take(int cur, double *avg, unsigned *n)
+{
+    std::lock_guard<std::mutex> lk(g_gb_mx);
+    g_nb_win.take(cur, avg, n);
+}
 int ui_frame_gen();
 static void gb_report(double dt, double real_fps, double shown_fps)
 {
@@ -1531,8 +1677,12 @@ static void gb_report(double dt, double real_fps, double shown_fps)
     if (on == 0 || dt <= 0.0) return;
     double unpack, nr, sr, post_sr, post, list; unsigned n, n_sr;
     double hdr, uu[4]; unsigned un;   // GB4
+    double nra = 0.0, fgs = 0.0; unsigned nra_n = 0, fgs_n = 0;   // NB1
+    unsigned long long nb_bad = 0;                                 // NB3
     {
         std::lock_guard<std::mutex> lk(g_gb_mx);
+        nra = g_gb_nra; fgs = g_gb_fgs; nra_n = g_gb_nra_n; fgs_n = g_gb_fgs_n; nb_bad = g_gb_nb_bad;
+        g_gb_nra = g_gb_fgs = 0.0; g_gb_nra_n = g_gb_fgs_n = 0; g_gb_nb_bad = 0;
         hdr = g_gb_hdr; for (int i = 0; i < 4; ++i) { uu[i] = g_gb_u[i]; g_gb_u[i] = 0.0; } un = g_gb_u_n;
         g_gb_hdr = 0.0; g_gb_u_n = 0;
         unpack = g_gb_unpack; nr = g_gb_nr; sr = g_gb_sr; post_sr = g_gb_post_sr; post = g_gb_post; list = g_gb_list;
@@ -1562,7 +1712,11 @@ static void gb_report(double dt, double real_fps, double shown_fps)
     double busy = -1.0;
     const bool hb = mgpu::gputime::busy(&busy);
     const double measured = (nq >= 0.0 ? nq / 10.0 : listp + (amd > 0 ? amd : 0) + (comp > 0 ? comp : 0)) + (pq >= 0.0 ? pq / 10.0 : 0.0);
-    char a[160] = "", r[200] = "", q[120] = "", b[200] = "";
+    char a[160] = "", r[200] = "", q[120] = "", b[200] = "", x[300] = "";
+    if (nra_n > 0 || fgs_n > 0 || nb_bad > 0)   // NB1 / NB3
+        snprintf(x, sizeof x, " | NB1: NR alone %.2f ms (%u lists), FG stage GPU time %.2f ms (%u lists; every FG command "
+                 "in the neural list: model evaluates + composition) per real frame, %llu sample(s) unusable",
+                 nra_n ? nra / nra_n : 0.0, nra_n, fgs_n ? fgs / fgs_n : 0.0, fgs_n, nb_bad);
     if (amd >= 0.0) snprintf(a, sizeof a, " | AMD frame generation %.1f%% | composition %.1f%%", amd, comp >= 0.0 ? comp : 0.0);
     if (rest_nq >= 0.0) snprintf(r, sizeof r, " | other neural-queue work%s %.1f%%", fg == 4 ? " (NVIDIA frame generation)" : "", rest_nq);
     if (pq >= 0.0) snprintf(q, sizeof q, " | presenting + scaling to the screen %.1f%% (%.2f ms per shown frame)", pq / 10.0,
@@ -1574,10 +1728,10 @@ static void gb_report(double dt, double real_fps, double shown_fps)
     char l[1300];
     snprintf(l, sizeof l, "[MGPU][GB1] neural card, share of each second over %.0f s (%u neural frames, %.1f real fps): "
              "frame unpack %.1f%% | neural rendering %.1f%% (%.2f ms each) | %s %.1f%% (%.2f ms each) | colour/after-SR %.1f%% | "
-             "sample/HUD/other %.1f%%%s%s%s%s",
+             "sample/HUD/other %.1f%%%s%s%s%s%s",
              dt, n, real_fps, unpack * per, nr * per, nr / n,
              n_sr ? "upscale (DLSS SR)" : "upscale (none in this list)", sr * per, n_sr ? sr / n_sr : 0.0,
-             post_sr * per, post * per, a, r, q, b);
+             post_sr * per, post * per, a, r, x, q, b);
     mgpu::diag::info(l);
     // GB4: where the unpack's time goes, per frame. GB5: and who did the copy.
     const unsigned cy = g_gb_cq_yes.exchange(0u), cf = g_gb_cq_fallback.exchange(0u), co = g_gb_cq_off.exchange(0u);
@@ -1719,7 +1873,8 @@ int fps_hud_toggle()
     const char *name = (g_fps_hud_mode == 1) ? "BASIC" :
                        (g_fps_hud_mode == 2) ? "DETAIL" : (g_fps_hud_mode == 3) ? "ADVANCED" : "OFF";
     char msg[128];
-    snprintf(msg, sizeof msg, "[MGPU][HUD] FPS HUD %s (CTRL+ALT+H cycles BASIC/DETAIL/ADVANCED/OFF)", name);
+    snprintf(msg, sizeof msg, "[MGPU][HUD] FPS HUD %s (%s cycles BASIC/DETAIL/ADVANCED/OFF)", name,
+             mgpu::hotkeys::name_now(mgpu::hotkeys::A_FPS_HUD));   // HK15
     mgpu::diag::info(msg);
     return g_fps_hud_mode;
 }
@@ -2553,10 +2708,101 @@ int ui_frame_gen();     // FG1
 // that is not declared this early. It is defined in the anonymous namespace
 // immediately above stream_nr_create, which is its only caller.
 
+// RQ1: a failed neural-rendering check on a bridge card that is not RTX 50-series
+// says so in words. REPORTED 2026-11-16: RTX 4090 + RTX 3080, CreateFeature
+// 0xBAD00001 FeatureNotSupported on both - the log gave only the code.
+static void rq1_hint(const char *failed_step)
+{
+    if (failed_step == nullptr || std::strstr(failed_step, "CreateFeature") == nullptr) return;
+    mgpu::adapter::selection_result sel{};
+    mgpu::adapter::get_selection(sel);
+    if (!sel.valid) return;
+    if (std::strstr(sel.selected_desc, "RTX 50") != nullptr || std::strstr(sel.selected_desc, "Blackwell") != nullptr ||
+        std::strstr(sel.selected_desc, "RTX 40") != nullptr) return;   // RQ3: an RTX 4090 ran it (field report #2)
+    char l[700];
+    snprintf(l, sizeof l,
+             "[MGPU][RQ1] the bridge card is \"%s\", not an RTX 50- or 40-series card. NVIDIA documents DLSS Neural "
+             "Rendering for RTX 50-series (an RTX 4090 has been reported working); on a card that cannot run it "
+             "the driver refuses it (FeatureNotSupported, 0xBAD00001). If the code above is that one, this card is "
+             "the likely reason - use an RTX 50-series card as the bridge card. Otherwise check the [MGPU][DL1] line "
+             "(which nvngx_dlssnr.dll was loaded).", sel.selected_desc);
+    mgpu::diag::warn(l);
+}
+
+// DL1: NAME THE nvngx_dlssnr.dll THAT WAS LOADED - path, file version and size
+// (the SHA-256 is in mgpu-report.bat). REPORTED 2026-11-16: a user's copy carried the same version number
+// (310.9.16) as a working one but a different size and hash (from a mod
+// package), and the driver refused it (CreateFeature 0xBAD00001
+// FeatureNotSupported on both cards). One log line now identifies the file.
+// TL1. A background thread that keeps this DLL loaded until it has finished.
+// A plain detached thread can still be running our code after ReShade unloads
+// the add-on (game exit), which crashes the game on the way out. This one
+// takes a reference on our module before it starts and drops it as its very
+// last act (FreeLibraryAndExitThread), so Windows cannot unmap the code under it.
+struct tl1_job { void (*fn)(void *); void *arg; HMODULE self; };
+static DWORD WINAPI tl1_entry(LPVOID p)
+{
+    tl1_job j = *(tl1_job *)p;
+    delete (tl1_job *)p;
+    j.fn(j.arg);
+    FreeLibraryAndExitThread(j.self, 0);
+    return 0;
+}
+static bool tl1_start(void (*fn)(void *), void *arg)
+{
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)&tl1_entry, &self))
+        return false;
+    tl1_job *j = new (std::nothrow) tl1_job{fn, arg, self};
+    if (j == nullptr) { FreeLibrary(self); return false; }
+    HANDLE t = CreateThread(nullptr, 0, &tl1_entry, j, 0, nullptr);
+    if (t == nullptr) { delete j; FreeLibrary(self); return false; }
+    CloseHandle(t);
+    return true;
+}
+
+// DL1b. The SHA-256 moved out of the add-on into mgpu-report.bat (Get-FileHash),
+// which hashes every DLSS/FSR/ReShade file in the game folder. What only the
+// add-on can know is WHICH copy Windows actually loaded, so that is all this
+// logs now: path, file version, size. No thread, no hashing, nothing decided.
+static void dl1_identify(HMODULE m)
+{
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+    wchar_t path[MAX_PATH * 2] = {};
+    if (GetModuleFileNameW(m, path, MAX_PATH * 2) == 0) return;
+    char ver[64] = "-";
+    DWORD dummy = 0;
+    const DWORD vsz = GetFileVersionInfoSizeW(path, &dummy);
+    if (vsz > 0)
+    {
+        std::vector<unsigned char> vb(vsz);
+        VS_FIXEDFILEINFO *ff = nullptr; UINT fl = 0;
+        if (GetFileVersionInfoW(path, 0, vsz, vb.data()) &&
+            VerQueryValueW(vb.data(), L"\\", reinterpret_cast<void **>(&ff), &fl) && ff != nullptr)
+            snprintf(ver, sizeof ver, "%u.%u.%u.%u", HIWORD(ff->dwFileVersionMS), LOWORD(ff->dwFileVersionMS),
+                     HIWORD(ff->dwFileVersionLS), LOWORD(ff->dwFileVersionLS));
+    }
+    unsigned long long size = 0;
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    if (GetFileAttributesExW(path, GetFileExInfoStandard, &fa))
+        size = ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+    char p8[MAX_PATH * 3] = {};
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, p8, sizeof p8, nullptr, nullptr);
+    char line[1200];
+    snprintf(line, sizeof line,
+             "[MGPU][DL1] nvngx_dlssnr.dll in use: %s | version %s | %llu bytes. For its SHA-256, run "
+             "mgpu-report.bat - a copy with the same version but a different size or hash (e.g. repackaged by a "
+             "mod) can be refused by the driver (CreateFeature 0xBAD00001).", p8, ver, size);
+    mgpu::diag::info(line);
+}
+
 static bool g_bb1_scale_failed = false;   // BB1: the last enlarge fell back to a crop
 bool present_frame(float r, float g, float b)
 {
     std::lock_guard<std::mutex> present_lock(g_present_mx);   // FG2
+    mgpu::cpuprof::scope cp_pf(mgpu::cpuprof::PRESENT_CPU);   // CP1: waits and Present() paused out below
     t_present_fv = 0;   // FIX8
     auto &S = st();
 
@@ -2604,7 +2850,11 @@ bool present_frame(float r, float g, float b)
     // opportunity instead of waiting behind others. Bounded: a stuck queue
     // never hangs the present thread (it then presents as before).
     if (lat_wait != nullptr)
+    {
+        cp_pf.pause();   // CP1
         (void)WaitForSingleObjectEx(lat_wait, 100, TRUE);
+        cp_pf.resume();
+    }
 
     char line[800];   // P5.3 widened: the Present=in banner is longer than 320 and a
                       // truncated banner is a wrong label on a whole run
@@ -2670,7 +2920,9 @@ bool present_frame(float r, float g, float b)
         if (FAILED(ehr))
             return fail("SetEventOnCompletion (slot reuse)", static_cast<unsigned>(ehr));
 
+        cp_pf.pause();   // CP1
         const DWORD wr = WaitForSingleObject(event, 5000);
+        cp_pf.resume();
         if (wr != WAIT_OBJECT_0)
         {
             // ---- R111. WHAT THIS USED TO SAY, AND WHY IT WAS WRONG ----
@@ -3332,7 +3584,15 @@ bool present_frame(float r, float g, float b)
         if (ns) hw_reveal("the first neural frame");
     }
     mgpu::crashlog::present_begin();   // SO5: this thread is presenting (the guard's evidence)
-    hr = sc->Present(pi_interval, 0);
+    cp_pf.pause();   // CP1: the Present call is measured on its own
+    {
+        const long long cp_t = mgpu::cpuprof::on() ? mgpu::cpuprof::qpc() : 0;
+        // PG1 (LR99): guarded - a hook rewriting Windows' Present under this
+        // thread costs one frame, not the game (crashlog::guarded_present).
+        hr = (HRESULT)mgpu::crashlog::guarded_present(sc, pi_interval, 0);
+        if (cp_t != 0) mgpu::cpuprof::add(mgpu::cpuprof::PRESENT_CALL, mgpu::cpuprof::qpc() - cp_t);
+    }
+    cp_pf.resume();
     mgpu::crashlog::note_present(1, (long)hr);   // SO2: the bridge's own present, for judging an overlay step-over
     if (FAILED(hr))
         return fail("Present", static_cast<unsigned>(hr));
@@ -3966,6 +4226,10 @@ namespace
 
     void ngx_trace_before_init(const char *site)
     {
+        // AS1: the NR runtime refuses to create below Blackwell by asking
+        // NvAPI for the architecture - answer "Blackwell" to that one
+        // question on RTX 20/30/40 cards (ArchSpoof=0 turns it off).
+        mgpu::archspoof::apply(GetModuleHandleW(L"nvngx_dlssnr.dll"), site);
         if (!ini_read_flag("TraceNvapi")) return;
         mgpu::calibrator::set_trace_nvapi(true);
         const unsigned hits = mgpu::calibrator::rescan_now();
@@ -4879,6 +5143,8 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         }
     }
 
+    if (mods.snippet != nullptr) dl1_identify(mods.snippet);   // DL1: which file, exactly
+
     snprintf(line, sizeof line,
              "[MGPU][P1.0c] ngx modules: _nvngx.dll=0x%p (%s) nvngx_dlssnr.dll=0x%p (%s)%s%s",
              (void *)mods.core, core_how, (void *)mods.snippet, snip_how,
@@ -5167,6 +5433,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                          "[MGPU][P1.0c] PROBE FAILED at %s - see the result code above. "
                          "Bridge continues.", failed_step);
                 mgpu::diag::warn(line);
+                rq1_hint(failed_step);   // RQ1
             }
             return;
         }
@@ -5293,6 +5560,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                      "Bridge continues.",
                      failed_step);
             mgpu::diag::warn(line);
+            rq1_hint(failed_step);   // RQ1
         }
     };
 
@@ -5827,6 +6095,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                  w_create, (unsigned)r, ngx_result_name(r), (void *)handle,
                  (unsigned)width, (unsigned)height, ms);
         mgpu::diag::info(line);
+        mgpu::archspoof::report();   // AS1: was the architecture asked, and rewritten?
 
         if (r != NVSDK_NGX_Result_Success)
         {
@@ -8976,6 +9245,29 @@ namespace
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     };
 
+    // ---- EX1 (IN89): REFERENCES ON THE GAME'S DEVICE, GIVEN BACK OUTSIDE ANY LOCK ----
+    //
+    // IN88 (RoboCop): at exit the count on the game's device - ReShade's
+    // wrapper, whose reaching zero raises destroy_device - stopped at 5 with
+    // the add-on, and reaches 0 without it. Two of those were plain leaks
+    // here: the stream's and the P1.5 probe's GetDevice references, both
+    // cleared to nullptr and never released ("borrowed" - they were not).
+    // They are now handed to this list and released by the bridge thread at
+    // the end of its ordered teardown, with no lock held: if one is the LAST
+    // reference, ReShade raises destroy_device inside that Release, and our
+    // handler takes s.cs - so the Release must never happen under s.cs.
+    std::mutex g_gref_cs;
+    mgpu::exitdet::ref_ledger<IUnknown *> g_gref;   // IN90: unbounded (IN89 had 4 slots)
+    // gpu_work_done: the GPU work that used it was PROVEN finished (or the
+    // device removed). If not, the reference is KEPT - never released - as
+    // GS2 keeps the resources themselves.
+    void gref_defer(IUnknown *p, bool gpu_work_done)
+    {
+        if (p == nullptr) return;
+        std::lock_guard<std::mutex> lk(g_gref_cs);
+        g_gref.defer(p, gpu_work_done);
+    }
+
     capture_state &cap()
     {
         static capture_state s;
@@ -9005,7 +9297,8 @@ namespace
         if (c.gread != nullptr) { c.gread->Release(); c.gread = nullptr; }
         if (c.gxfer != nullptr) { c.gxfer->Release(); c.gxfer = nullptr; }
         if (c.gheap != nullptr) { c.gheap->Release(); c.gheap = nullptr; }
-        c.gdev = nullptr;   // borrowed; never released here
+        gref_defer(c.gdev, true);   // EX1: a GetDevice reference (the probe's objects are released above)
+        c.gdev = nullptr;
         c.armed = false;
     }
 }
@@ -10393,10 +10686,12 @@ namespace
         // deliberately not taken here.
         ID3D12QueryHeap *tsheap = nullptr;
         ID3D12QueryHeap *gb_heap = nullptr;    // GB1: 2 marks around the DLSS SR evaluate; GB4: 3 more in the unpack
-        ID3D12Resource *gb_read = nullptr;     // GB1: READBACK, 40 bytes
+        ID3D12Resource *gb_read = nullptr;     // GB1: READBACK, 64 bytes (NB1: marks 5-7 at 40)
         bool gb_sr_marked = false;             // GB1: this list carries them
         bool gb_sr_was = false;                // GB1: the list being read carried them
         unsigned gb_u_marked = 0, gb_u_was = 0;   // GB4: unpack marks written (bit 0 = before depth, 1 = before MVec, 2 = before the field)
+        unsigned gb_x_marked = 0, gb_x_was = 0;   // NB1: bit 0 = mark 5 (NR passes done), 1 = mark 6 (FG stage start), 2 = mark 7 (FG stage end)
+        int nb_rec_scale = -1, nb_scale_was = -1;   // NB3: the NR scale (x10) this list was RECORDED at, -1 = none
         ID3D12Resource *tsread = nullptr;      // READBACK, TS_MARKS * 8 bytes
         UINT64 ts_freq = 0;
         bool ts_ok = false;
@@ -11212,6 +11507,8 @@ namespace
         // exit that did not unwind cleanly. Whichever arrives first does the
         // work; this makes the second a no-op rather than a double release.
         bool ngx_shut_done = false;
+        unsigned long long color_size_rejects = 0;   // RC2: colour frames refused (size changed)
+        bool sf_kept = false;   // SF1: teardown kept GPU 1's objects (queues never seen to finish)
         // Ping-pong. tex_in has no UAV flag - it is a copy destination and can
         // never be a neural OUTPUT - so passes alternate between tex_out and
         // tex_pong, both of which are UAV. `nr_final` is whichever one the last
@@ -11433,6 +11730,7 @@ namespace
         bool swapguard_in_episode = false;
         bool swapguard_said = false;
         unsigned long long mvec_arm_waits = 0;
+        unsigned long long nc_t0 = 0;        // NG1: when the no-DLSS-yet wait began (ms)
         unsigned long long mvec_hold = 1800ull;   // R234: MVecHold - frames the arm holds for vectors on a path that has none yet
         unsigned long long mvec_hold_said = 0;    // R236: the hold reports every 600 held frames
         bool   mvec_arm_logged = false;
@@ -11583,6 +11881,7 @@ namespace
         bool     learn_on = false;              // R278: MVecTap on and MVecLearned absent
         bool     learn_decided = false;         // R278d: the first-launch decision, made once at the hold
         unsigned long long learn_t0 = 0;        // fork LEARN1: start of the grace window (GetTickCount64), 0 = not started
+        int      learn_tapkey = -1;             // AU2: MVecTap present in mgpu.ini (read once per arm), -1 = not read
         int      learn_cand = 0;                // R278: MVecCandidate this launch tests
         int      cp_kx_votes[4] = {0,0,0,0}, cp_ky_votes[4] = {0,0,0,0};   // candidates: [0]=+full, [1]=-full, [2]=half (sign in cp_half_sign), [3]=PIXEL (R278b, sign in cp_px_sign)
         int      cp_kx_px_sign = 0, cp_ky_px_sign = 0;   // R278b
@@ -11616,6 +11915,45 @@ namespace
         bool  depth_fell_back = false;                      // this arm runs without depth
         bool  mvec_in_read = false;
         unsigned long long mvec_fills = 0;
+
+        // ---- LR1 (LR97): following a size or format change of the vectors or depth ----
+        //
+        // See live_resize.hpp for the rules. Until IN96 both lanes were sized
+        // once, at arm, and anything else was refused for the session (RC1:
+        // restart). Now each region of the slot has ROOM (depth_cap/mvec_cap,
+        // >= the bytes in use), the copy that refuses a shape follows it, and a
+        // real change is applied by the bridge at its safe point (rs_poll).
+        unsigned rs_on   = 1u;                    // ini LiveResize: 0 = the IN96 behaviour (restart)
+        unsigned rs_room = 1u;                    // ini ResizeRoom: 0 = room only for what was there at arm
+        UINT64 depth_cap = 0, mvec_cap = 0;       // the regions' room in the slot
+        // GPU 0 (the game's render thread): what the copy refused, followed per
+        // frame. Vectors under mvec_cs (stream_mvec_copy), depth under cs.
+        mgpu::live_resize::follower rs_mv_fol, rs_d_fol;
+        struct rs_req_t
+        {
+            bool on = false;
+            mgpu::live_resize::shape sh;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+            UINT64 bytes = 0;
+        };
+        rs_req_t rs_req_mv, rs_req_d;             // a change to apply; mv under mvec_cs, d under cs
+        std::atomic<bool> rs_pending{false};      // either request posted - read lock-free by the bridge
+        std::atomic<int>  rs_mv_held{0}, rs_d_held{0};   // live_resize::hold_why of the shape refused now (0 = none)
+        std::atomic<unsigned> rs_mv_hw{0}, rs_mv_hh{0}, rs_mv_hf{0};   // that shape, for the bridge's line
+        std::atomic<unsigned> rs_d_hw{0}, rs_d_hh{0}, rs_d_hf{0};
+        unsigned long long rs_mv_held_key = 0, rs_d_held_key = 0;   // bridge: the held line, once per shape
+        bool rs_broken = false;                   // a rebuild left a lane without its GPU 1 textures (RC1 stays)
+        // The bridge (stream_poll): a request seen, speculative copies stopped
+        // until GPU 1 is idle at a poll start (never waited for).
+        bool rs_hold = false;
+        unsigned long long rs_hold_ms = 0;
+        unsigned long long rs_retry_ms = 0;       // a try that found GPU 0 or 1 busy: the next one not before this
+        unsigned rs_tries = 0;                    // tries for the change pending now (3, then it is held as failed)
+        unsigned long long rs_from_f = 0;         // first frame sealed with the current geometry
+        unsigned rs_count = 0;                    // changes followed this session
+        bool rs_scale_px = false;                 // R278c 'px' units: the scale follows mvec_w/h
+        int  rs_px_gx = 1, rs_px_gy = 1;
+        unsigned rc1_windows = 0;                 // RC1: report windows in a row with the lane refused
 
         // ---- P8.1: per-pass Reset ----
         //
@@ -12173,8 +12511,23 @@ namespace
     // was one short of comfortable; a full mirror silently stops caching.
     // Fork: 12 -> 32. The panel reads more keys now, and a key that finds no
     // free slot is re-read from disk on every panel frame.
-    static const unsigned INI_MIRROR_N = 32u;
+    // AU4 (IN60 audit): 32 -> 256. About 130 different keys reach the mirror
+    // now (the panel's reads and writes, the capture / Frame Warp / HDR setting
+    // tables), so 32 filled up and every key after that was read from disk on
+    // EVERY call - including keys the panel reads each drawn frame. Keys are
+    // string literals (or static tables), so storing the pointer is safe. A
+    // full mirror now says so once, by name.
+    static const unsigned INI_MIRROR_N = 256u;
     ini_mirror_ent g_ini_mirror[INI_MIRROR_N] = {};
+    static void ini_mirror_full(const char *key)
+    {
+        static std::atomic<bool> said{false};
+        if (said.exchange(true)) return;
+        char l[200];
+        snprintf(l, sizeof l, "[MGPU][AU4] the mgpu.ini cache is full (%u keys) - \"%s\" and any key after it are "
+                 "read from the file on every call.", INI_MIRROR_N, key != nullptr ? key : "?");
+        mgpu::diag::warn(l);
+    }
 
     int ini_mirror_get(const char *key, int def)
     {
@@ -12186,7 +12539,8 @@ namespace
         const int v = ini_read_sr_int(key, def, -1000000, 1000000);
         for (unsigned i = 0; i < INI_MIRROR_N; ++i)
             if (!g_ini_mirror[i].have)
-            { g_ini_mirror[i].key = key; g_ini_mirror[i].val = v; g_ini_mirror[i].have = true; break; }
+            { g_ini_mirror[i].key = key; g_ini_mirror[i].val = v; g_ini_mirror[i].have = true; return v; }
+        ini_mirror_full(key);   // AU4
         return v;
     }
 
@@ -12200,6 +12554,7 @@ namespace
         for (unsigned i = 0; i < INI_MIRROR_N; ++i)
             if (!g_ini_mirror[i].have)
             { g_ini_mirror[i].key = key; g_ini_mirror[i].val = v; g_ini_mirror[i].have = true; return; }
+        ini_mirror_full(key);   // AU4
     }
 
     bool ini_slurp(char *buf, size_t n)
@@ -14840,33 +15195,73 @@ bool ext_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned ii, ID3
 // HANGFIX wait in stream_release, and the MVec recorder is stopped, so nothing
 // on the game's queue still references gstage. The copy queue is drained here
 // before gxfer - which it writes - is released.
-static void g0_stage_release(stream_state &s)
+// SF1: returns false when the copy queue could not be seen to finish (device
+// alive). Then its objects, and gxfer which it writes, are KEPT, not freed.
+// SF2: gstage is WRITTEN by the game's queue, so it is also kept when the
+// game's queue was not seen to finish (game_q_done false) - its own queue
+// finishing is not enough.
+static bool g0_stage_release(stream_state &s, bool game_q_done)
 {
     if (s.g0cq != nullptr)
     {
         ID3D12Fence *df = nullptr;
         ID3D12Device *dev = nullptr;
+        bool done = false, removed = false;
         if (SUCCEEDED(s.g0cq->GetDevice(IID_PPV_ARGS(&dev))) && dev != nullptr &&
             SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&df))) &&
-            SUCCEEDED(s.g0cq->Signal(df, 1)) && df->GetCompletedValue() < 1)
+            SUCCEEDED(s.g0cq->Signal(df, 1)))
         {
-            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (ev != nullptr)
+            done = df->GetCompletedValue() >= 1;
+            if (done && (df->GetCompletedValue() == UINT64_MAX || FAILED(dev->GetDeviceRemovedReason())))
+            { done = false; removed = true; }   // SF2: removal, not completion
+            if (!done && !removed)
             {
-                if (SUCCEEDED(df->SetEventOnCompletion(1, ev)))
-                    (void)WaitForSingleObject(ev, 2000);
-                CloseHandle(ev);
+                HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (ev != nullptr)
+                {
+                    if (SUCCEEDED(df->SetEventOnCompletion(1, ev)))
+                    {
+                        (void)WaitForSingleObject(ev, 2000);
+                        const mgpu::gpusafe::fence_read st = mgpu::gpusafe::fence_now(
+                            df->GetCompletedValue(), 1, FAILED(dev->GetDeviceRemovedReason()));
+                        done = st == mgpu::gpusafe::fence_read::reached;
+                        removed = st == mgpu::gpusafe::fence_read::removed;
+                        if (mgpu::gpusafe::may_close_event(done, removed)) CloseHandle(ev);   // else kept (rule 3)
+                    }
+                    else CloseHandle(ev);
+                }
             }
         }
-        if (df != nullptr) df->Release();
+        if (!done && !removed && dev != nullptr) removed = FAILED(dev->GetDeviceRemovedReason());
+        const mgpu::gpusafe::queue_state stage_q{ true, done, removed };
+        const mgpu::gpusafe::queue_state game_q{ false, game_q_done, false };
+        const bool keep = !mgpu::gpusafe::may_free(mgpu::gpusafe::group::g0_staging, game_q, stage_q, stage_q, stage_q);
+        if (df != nullptr && !keep) df->Release();   // a fence the queue may still signal is kept too
         if (dev != nullptr) dev->Release();
+        if (keep)
+        {
+            mgpu::diag::error(!game_q_done && (done || removed)
+                ? "[MGPU][GS2] teardown: the GPU 0 staging buffer is KEPT (not freed) - the game's queue, which writes it, "
+                  "was not seen to finish."
+                : "[MGPU][GS1] teardown: the GPU 0 staging copy queue did not finish within 2 s - it and "
+                  "the buffers it reads and writes are KEPT (not freed).");
+            s.g0cq = nullptr; s.gstage = nullptr; s.g0ca = nullptr; s.g0sf = nullptr; s.g0cts = nullptr;
+            for (unsigned k = 0; k < stream_state::RING; ++k) s.g0cl[k] = nullptr;
+            if (s.g0tsrb != nullptr) s.g0tsrb->Unmap(0, nullptr);
+            s.g0tsrb = nullptr; s.g0tsrb_cpu = nullptr; s.g0ts = nullptr;
+            return false;
+        }
     }
     for (unsigned k = 0; k < stream_state::RING; ++k)
         if (s.g0cl[k] != nullptr) { s.g0cl[k]->Release(); s.g0cl[k] = nullptr; }
     if (s.g0cts != nullptr) { s.g0cts->Release(); s.g0cts = nullptr; }
     if (s.g0sf != nullptr) { s.g0sf->Release(); s.g0sf = nullptr; }
     if (s.g0ca != nullptr) { s.g0ca->Release(); s.g0ca = nullptr; }
-    if (s.g0cq != nullptr) { s.g0cq->Release(); s.g0cq = nullptr; }
+    // EX1 (IN89): the copy queue is one of ReShade's queue wrappers and holds a
+    // reference on the game's device; this runs under s.cs, so if that were the
+    // last one, destroy_device would fire here and its handler would wait for
+    // s.cs on this same thread. Given back with the others, no lock held.
+    if (s.g0cq != nullptr) { gref_defer(s.g0cq, true); s.g0cq = nullptr; }   // reached only when proven (keep returns above)
     if (s.gstage != nullptr) { s.gstage->Release(); s.gstage = nullptr; }
     if (s.g0tsrb != nullptr)
     {
@@ -14875,7 +15270,17 @@ static void g0_stage_release(stream_state &s)
     }
     s.g0tsrb_cpu = nullptr;
     if (s.g0ts != nullptr) { s.g0ts->Release(); s.g0ts = nullptr; }
+    return true;
 }
+
+    // SF1: the bounded teardown drain - mgpu::gpusafe::drain_fence in
+    // gpu_safety_d3d12.hpp (SF2: moved there so a Windows test can run it
+    // against a real D3D12 device; tests/d3d12_drain_itest.cpp).
+    using sf_drain_r = mgpu::gpusafe::drain_r;
+    static sf_drain_r sf_drain_fence(ID3D12Fence *f, UINT64 v, DWORD first_ms, DWORD ext_ms, ID3D12Device *dev)
+    {
+        return mgpu::gpusafe::drain_fence(f, v, first_ms, ext_ms, dev);
+    }
 
     void stream_release()
     {
@@ -14913,6 +15318,44 @@ static void g0_stage_release(stream_state &s)
         // again and the value written here is the last it ever holds. Writing
         // it while the producer was live would corrupt a counter whose value
         // IS the frame index.
+        // ---- SF2: GPU 0 FIRST, BEFORE THE FENCE IS ADVANCED FROM THE CPU ----
+        //
+        // gfence (GPU 0) and nfence (GPU 1) are ONE shared fence. R28-B just
+        // below advances it from the CPU to free GPU 1's copy queue - after that,
+        // "gfence reached gsignaled" no longer proves the GAME's queue finished
+        // writing gxfer; it can be our own CPU write. So GPU 0's answer is taken
+        // here, first: the game-thread copies into gxfer are stopped (R88, moved
+        // up from the end), then the fence is read - and, with the drain on,
+        // waited for (2 s, bounded, as before). The verdict is used at the end.
+        {
+            std::lock_guard<std::mutex> mlk(s.mvec_cs);
+            s.mvec_live.store(false, std::memory_order_release);
+            s.hud_live.store(false, std::memory_order_release);   // HL1
+        }
+        mgpu::gpusafe::queue_state sf_g0q{ false, true, false };   // the game's queue on gxfer: waited / drained / removed
+        double sf_g0_ms = 0.0;
+        const unsigned long long sf_g0_to = s.gsignaled;
+        if (s.gfence != nullptr && sf_g0_to != 0)
+        {
+            // SF2: removal first - a removed GPU 0's fence reads UINT64_MAX.
+            const mgpu::gpusafe::fence_read st0 = mgpu::gpusafe::fence_now(
+                s.gfence->GetCompletedValue(), sf_g0_to, s.gdev != nullptr && FAILED(s.gdev->GetDeviceRemovedReason()));
+            const unsigned wait_ms = mgpu::gpusafe::g0_wait_ms(s.drain_on, st0 != mgpu::gpusafe::fence_read::pending);
+            if (st0 == mgpu::gpusafe::fence_read::removed)
+                sf_g0q = mgpu::gpusafe::queue_state{ false, false, true };
+            else if (st0 == mgpu::gpusafe::fence_read::pending && wait_ms == 0)   // DrainGpu0=0: no wait, not done
+                sf_g0q = mgpu::gpusafe::queue_state{ false, false, false };
+            else if (st0 == mgpu::gpusafe::fence_read::pending)
+            {
+                LARGE_INTEGER t0{}, t1{}, fq{};
+                QueryPerformanceCounter(&t0);
+                const sf_drain_r d0 = sf_drain_fence(s.gfence, (UINT64)sf_g0_to, wait_ms, 0, s.gdev);
+                QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&fq);
+                sf_g0_ms = (fq.QuadPart != 0) ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart : 0.0;
+                sf_g0q = mgpu::gpusafe::queue_state{ wait_ms != 0, d0.drained, d0.removed };
+            }
+        }
+
         if (s.cq_gated && s.nfence != nullptr && s.cq_issued > 0 &&
             s.nfence->GetCompletedValue() < (UINT64)s.cq_issued)
         {
@@ -14924,18 +15367,22 @@ static void g0_stage_release(stream_state &s)
         // so this drains the copy queue whether or not the last per-frame
         // Signal was the one that succeeded - which the cqf_value bookkeeping
         // alone cannot promise.
+        // SF1: the outcome decides below whether anything is freed at all.
+        bool sf_cq_ok = true, sf_nq_ok = true, sf_removed = false;
         if (s.cq != nullptr && s.cqf != nullptr)
         {
             const UINT64 fin = s.cqf_value + 1;
-            if (SUCCEEDED(s.cq->Signal(s.cqf, fin)) && s.cqf->GetCompletedValue() < fin)
+            if (SUCCEEDED(s.cq->Signal(s.cqf, fin)))
             {
-                HANDLE drain_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-                if (drain_ev != nullptr)
-                {
-                    if (SUCCEEDED(s.cqf->SetEventOnCompletion(fin, drain_ev)))
-                        WaitForSingleObject(drain_ev, 5000);
-                    CloseHandle(drain_ev);
-                }
+                const sf_drain_r d = sf_drain_fence(s.cqf, fin, 5000, 5000, s.ndev_b);
+                sf_cq_ok = d.drained; sf_removed |= d.removed;
+            }
+            else
+            {
+                // No trailing signal: completion cannot be observed. Free only
+                // if the device is gone.
+                sf_cq_ok = false;
+                sf_removed |= (s.ndev_b != nullptr && FAILED(s.ndev_b->GetDeviceRemovedReason()));
             }
         }
 
@@ -14943,22 +15390,33 @@ static void g0_stage_release(stream_state &s)
         // features, SR, FG and HUD buffers, AMD's context). Every frame is
         // normally CPU-waited, so this returns at once; it matters only after
         // a timed-out per-frame wait, when the last list may still be running.
+        // SF1: a TRAILING signal, as for the copy queue - it drains the queue
+        // even after a failed per-frame Signal (rule 2), which a wait on
+        // nf_value alone never could.
         if (s.nq != nullptr && s.nf != nullptr && s.nf->GetCompletedValue() < s.nf_value)
         {
-            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            DWORD wr = WAIT_FAILED;
-            if (ev != nullptr)
-            {
-                if (SUCCEEDED(s.nf->SetEventOnCompletion(s.nf_value, ev)))
-                    wr = WaitForSingleObject(ev, 5000);
-                CloseHandle(ev);
-            }
+            const UINT64 fin = s.nf_value + 1;
+            sf_drain_r d{ false, false };
+            if (SUCCEEDED(s.nq->Signal(s.nf, fin))) { s.nf_value = fin; d = sf_drain_fence(s.nf, fin, 5000, 5000, s.ndev_b); }
+            else d.removed = (s.ndev_b != nullptr && FAILED(s.ndev_b->GetDeviceRemovedReason()));
+            sf_nq_ok = d.drained; sf_removed |= d.removed;
             char fl[260];
             snprintf(fl, sizeof fl,
                      "[MGPU][FIX8] release: the NR queue still had work in flight - waited, %s.",
-                     (wr == WAIT_OBJECT_0) ? "it finished" : "it did NOT finish within 5 s");
+                     d.drained ? "it finished" : d.removed ? "the device is gone (removed)" : "it did NOT finish within 10 s");
             mgpu::diag::warn(fl);
         }
+
+        // SF1 (rule 3): free GPU 1's objects only when its queues were seen to
+        // finish, or the device is gone. Otherwise every one of them is KEPT
+        // (leaked) - the stream ends either way and never re-arms in this
+        // launch (s.tried), so nothing reuses them.
+        const bool sf_keep = mgpu::gpusafe::verdict(sf_cq_ok && sf_nq_ok, sf_removed) == mgpu::gpusafe::teardown::keep_all;
+        s.sf_kept = s.sf_kept || sf_keep;
+        if (sf_keep)
+            mgpu::diag::error("[MGPU][GS1] teardown: the neural card's queues did not finish within 10 s and the device "
+                              "is not removed - its NGX features, buffers and queues are KEPT (not freed) so nothing the "
+                              "GPU may still use is destroyed. Restart the game before arming again.");
 
         // The NGX features first: they hold references to the textures.
         // Released in reverse creation order, every one of them - a partial
@@ -14966,104 +15424,105 @@ static void g0_stage_release(stream_state &s)
         if (s.nr_release != nullptr)
             for (int i = (int)stream_state::MAX_PASSES - 1; i >= 0; --i)
                 if (s.nr_handle[i] != nullptr)
-                { (void)s.nr_release(s.nr_handle[i]); s.nr_handle[i] = nullptr; }
+                { if (!sf_keep) (void)s.nr_release(s.nr_handle[i]); s.nr_handle[i] = nullptr; }
         for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) s.nr_handle[i] = nullptr;
 
         // C2-SR teardown, in the same order and for the same reason as R26 and
         // R28-B: the feature goes before the resources it was created against,
         // and nothing is freed while the GPU may still be reading it.
         if (s.sr_handle != nullptr && s.sr_release != nullptr)
-        { (void)s.sr_release(s.sr_handle); }
+        { if (!sf_keep) (void)s.sr_release(s.sr_handle); }
         s.sr_handle = nullptr;
         s.sr_ready = false;
-        if (s.ds_pso  != nullptr) { s.ds_pso->Release();  s.ds_pso  = nullptr; }
-        if (s.ds_rs   != nullptr) { s.ds_rs->Release();   s.ds_rs   = nullptr; }
-        if (s.rs_pso  != nullptr) { s.rs_pso->Release();  s.rs_pso  = nullptr; }   // RS1
-        if (s.rs_rs   != nullptr) { s.rs_rs->Release();   s.rs_rs   = nullptr; }
-        if (s.ds_heap != nullptr) { s.ds_heap->Release(); s.ds_heap = nullptr; }
-        mgpu::nr16::release();   // R208: same point, same reason
+        if (s.ds_pso  != nullptr) { if (!sf_keep) s.ds_pso->Release();  s.ds_pso  = nullptr; }
+        if (s.ds_rs   != nullptr) { if (!sf_keep) s.ds_rs->Release();   s.ds_rs   = nullptr; }
+        if (s.rs_pso  != nullptr) { if (!sf_keep) s.rs_pso->Release();  s.rs_pso  = nullptr; }   // RS1
+        if (s.rs_rs   != nullptr) { if (!sf_keep) s.rs_rs->Release();   s.rs_rs   = nullptr; }
+        if (s.ds_heap != nullptr) { if (!sf_keep) s.ds_heap->Release(); s.ds_heap = nullptr; }
+        if (!sf_keep) mgpu::nr16::release();   // R208: same point, same reason
+        if (!sf_keep) mgpu::tstab::release();  // TC1: same point - the NR queue has drained
         for (unsigned i = 0; i < 2u; ++i)
-            if (s.sr_color[i] != nullptr) { s.sr_color[i]->Release(); s.sr_color[i] = nullptr; }
-        if (s.sr_depth  != nullptr) { s.sr_depth->Release();  s.sr_depth  = nullptr; }
-        if (s.sr_nrout  != nullptr) { s.sr_nrout->Release();  s.sr_nrout  = nullptr; }
-        if (s.fov_out   != nullptr) { s.fov_out->Release();   s.fov_out   = nullptr; }   // FV1
+            if (s.sr_color[i] != nullptr) { if (!sf_keep) s.sr_color[i]->Release(); s.sr_color[i] = nullptr; }
+        if (s.sr_depth  != nullptr) { if (!sf_keep) s.sr_depth->Release();  s.sr_depth  = nullptr; }
+        if (s.sr_nrout  != nullptr) { if (!sf_keep) s.sr_nrout->Release();  s.sr_nrout  = nullptr; }
+        if (s.fov_out   != nullptr) { if (!sf_keep) s.fov_out->Release();   s.fov_out   = nullptr; }   // FV1
         s.fov_first = true;
-        if (s.sr_expose != nullptr) { s.sr_expose->Release(); s.sr_expose = nullptr; }
+        if (s.sr_expose != nullptr) { if (!sf_keep) s.sr_expose->Release(); s.sr_expose = nullptr; }
         s.nr_final = nullptr;   // borrowed; released with tex_out / tex_pong
-        if (s.nr_read != nullptr) { s.nr_read->Release(); s.nr_read = nullptr; }
+        if (s.nr_read != nullptr) { if (!sf_keep) s.nr_read->Release(); s.nr_read = nullptr; }
         // FG1
         for (unsigned q = 0; q < stream_state::FG_SETS; ++q)
         {
-            if (s.fg_real[q] != nullptr) { s.fg_real[q]->Release(); s.fg_real[q] = nullptr; }
-            if (s.fg_out[q]  != nullptr) { s.fg_out[q]->Release();  s.fg_out[q]  = nullptr; }
+            if (s.fg_real[q] != nullptr) { if (!sf_keep) s.fg_real[q]->Release(); s.fg_real[q] = nullptr; }
+            if (s.fg_out[q]  != nullptr) { if (!sf_keep) s.fg_out[q]->Release();  s.fg_out[q]  = nullptr; }
             for (unsigned e = 0; e < stream_state::FG_MAX_EXTRA; ++e)   // DLSSG2/MFG6
-                if (s.fg_outx[q][e] != nullptr) { s.fg_outx[q][e]->Release(); s.fg_outx[q][e] = nullptr; }
+                if (s.fg_outx[q][e] != nullptr) { if (!sf_keep) s.fg_outx[q][e]->Release(); s.fg_outx[q][e] = nullptr; }
         }
         s.fg_extras_failed = false;
         s.fg_ready_n = 0;
         s.fg_ready_show = 0;
-        fsr_destroy(s);   // FSR1: the AMD context goes before the resources it saw
-        dgp_release();    // DGP1: the probe's feature and textures, same point
-        if (s.fsr_out != nullptr) { s.fsr_out->Release(); s.fsr_out = nullptr; }
-        if (s.fsrb_q != nullptr) { s.fsrb_q->Release(); s.fsrb_q = nullptr; }   // AC3
-        if (s.fsrb_t != nullptr) { s.fsrb_t->Release(); s.fsrb_t = nullptr; }
-        if (s.ac_tsheap != nullptr) { s.ac_tsheap->Release(); s.ac_tsheap = nullptr; }
-        if (s.ac_tsread != nullptr) { s.ac_tsread->Release(); s.ac_tsread = nullptr; }
+        if (!sf_keep) fsr_destroy(s);   // FSR1: the AMD context goes before the resources it saw
+        if (!sf_keep) dgp_release();    // DGP1: the probe's feature and textures, same point
+        if (s.fsr_out != nullptr) { if (!sf_keep) s.fsr_out->Release(); s.fsr_out = nullptr; }
+        if (s.fsrb_q != nullptr) { if (!sf_keep) s.fsrb_q->Release(); s.fsrb_q = nullptr; }   // AC3
+        if (s.fsrb_t != nullptr) { if (!sf_keep) s.fsrb_t->Release(); s.fsrb_t = nullptr; }
+        if (s.ac_tsheap != nullptr) { if (!sf_keep) s.ac_tsheap->Release(); s.ac_tsheap = nullptr; }
+        if (s.ac_tsread != nullptr) { if (!sf_keep) s.ac_tsread->Release(); s.ac_tsread = nullptr; }
         s.ac_ts_tried = false; s.ac_ts_ok = false; s.ac_ts_mask = 0; s.ac_ts_resolved = false;
         s.ac_ts_next_slot = 0; s.ac_ts_res_slot = 0;
         for (unsigned q = 0; q < stream_state::AC_RING; ++q) { s.ac_ts_pend_fv[q] = 0; s.ac_ts_pend_mask[q] = 0; }
         for (unsigned q = 0; q < 2u; ++q)
-            if (s.fg_mask[q] != nullptr) { s.fg_mask[q]->Release(); s.fg_mask[q] = nullptr; }
+            if (s.fg_mask[q] != nullptr) { if (!sf_keep) s.fg_mask[q]->Release(); s.fg_mask[q] = nullptr; }
         s.fg_mask_valid = false;
-        if (s.fg_pso  != nullptr) { s.fg_pso->Release();  s.fg_pso  = nullptr; }
-        if (s.fg_rs   != nullptr) { s.fg_rs->Release();   s.fg_rs   = nullptr; }
-        if (s.fg_heap != nullptr) { s.fg_heap->Release(); s.fg_heap = nullptr; }
+        if (s.fg_pso  != nullptr) { if (!sf_keep) s.fg_pso->Release();  s.fg_pso  = nullptr; }
+        if (s.fg_rs   != nullptr) { if (!sf_keep) s.fg_rs->Release();   s.fg_rs   = nullptr; }
+        if (s.fg_heap != nullptr) { if (!sf_keep) s.fg_heap->Release(); s.fg_heap = nullptr; }
         s.fg_built = false; s.fg_prev_valid = false; g_fd2_break = FD2_BROKEN_OTHER;   // FD2
         // P8.0, before the textures it describes.
         if (s.mvec_up != nullptr && s.mvec_cpu != nullptr) { s.mvec_up->Unmap(0, nullptr); }
         s.mvec_cpu = nullptr;
-        if (s.mvec_up  != nullptr) { s.mvec_up->Release();  s.mvec_up = nullptr; }
-        if (s.tex_mvec != nullptr) { s.tex_mvec->Release(); s.tex_mvec = nullptr; }
+        if (s.mvec_up  != nullptr) { if (!sf_keep) s.mvec_up->Release();  s.mvec_up = nullptr; }
+        if (s.tex_mvec != nullptr) { if (!sf_keep) s.tex_mvec->Release(); s.tex_mvec = nullptr; }
         // R78: the mode-3 pair, released the same way tex_depth is.
         for (unsigned mi = 0; mi < 2; ++mi)
             if (s.tex_mvec_r[mi] != nullptr)
-            { s.tex_mvec_r[mi]->Release(); s.tex_mvec_r[mi] = nullptr; }
+            { if (!sf_keep) s.tex_mvec_r[mi]->Release(); s.tex_mvec_r[mi] = nullptr; }
         for (unsigned di = 0; di < 2; ++di)
             if (s.tex_depth[di] != nullptr)
-            { s.tex_depth[di]->Release(); s.tex_depth[di] = nullptr; }
+            { if (!sf_keep) s.tex_depth[di]->Release(); s.tex_depth[di] = nullptr; }
         s.mvec_dirty = true;
         s.mvec_in_read = false;
-        if (s.tex_pong != nullptr) { s.tex_pong->Release(); s.tex_pong = nullptr; }
-        if (s.tex_out != nullptr) { s.tex_out->Release(); s.tex_out = nullptr; }
+        if (s.tex_pong != nullptr) { if (!sf_keep) s.tex_pong->Release(); s.tex_pong = nullptr; }
+        if (s.tex_out != nullptr) { if (!sf_keep) s.tex_out->Release(); s.tex_out = nullptr; }
         s.tex_in_show = nullptr;   // borrowed; released with the pair below
         s.tex_ui_show = nullptr;   // SP3
         for (int ti = 1; ti >= 0; --ti)
-            if (s.tex_in[ti] != nullptr) { s.tex_in[ti]->Release(); s.tex_in[ti] = nullptr; }
+            if (s.tex_in[ti] != nullptr) { if (!sf_keep) s.tex_in[ti]->Release(); s.tex_in[ti] = nullptr; }
         for (unsigned ui = 0; ui < 2u; ++ui)   // HL1
-            if (s.tex_ui[ui] != nullptr) { s.tex_ui[ui]->Release(); s.tex_ui[ui] = nullptr; }
+            if (s.tex_ui[ui] != nullptr) { if (!sf_keep) s.tex_ui[ui]->Release(); s.tex_ui[ui] = nullptr; }
         for (unsigned q = 0; q < stream_state::FG_SETS; ++q)
         {
-            if (s.fg_hl[q] != nullptr) { s.fg_hl[q]->Release(); s.fg_hl[q] = nullptr; }
+            if (s.fg_hl[q] != nullptr) { if (!sf_keep) s.fg_hl[q]->Release(); s.fg_hl[q] = nullptr; }
             s.fg_hl_k[q] = false;
         }
-        if (s.ui_pso  != nullptr) { s.ui_pso->Release();  s.ui_pso  = nullptr; }
-        if (s.ui_rs   != nullptr) { s.ui_rs->Release();   s.ui_rs   = nullptr; }
-        if (s.ui_heap != nullptr) { s.ui_heap->Release(); s.ui_heap = nullptr; }
-        if (s.ui_cnt != nullptr) { s.ui_cnt->Release(); s.ui_cnt = nullptr; }              // HL2
-        if (s.ui_cnt_read != nullptr) { s.ui_cnt_read->Release(); s.ui_cnt_read = nullptr; }
+        if (s.ui_pso  != nullptr) { if (!sf_keep) s.ui_pso->Release();  s.ui_pso  = nullptr; }
+        if (s.ui_rs   != nullptr) { if (!sf_keep) s.ui_rs->Release();   s.ui_rs   = nullptr; }
+        if (s.ui_heap != nullptr) { if (!sf_keep) s.ui_heap->Release(); s.ui_heap = nullptr; }
+        if (s.ui_cnt != nullptr) { if (!sf_keep) s.ui_cnt->Release(); s.ui_cnt = nullptr; }              // HL2
+        if (s.ui_cnt_read != nullptr) { if (!sf_keep) s.ui_cnt_read->Release(); s.ui_cnt_read = nullptr; }
         s.ui_cnt_pending = false; s.ui_menu = false; s.ui_cnt_last = 0; s.ui_menu_ev = s.ui_game_ev = 0;
         s.hl3_on = false;
         g_ui_menu.store(false, std::memory_order_relaxed);
         s.ui_built = false; s.ui_failed = false;
-        if (s.cs_pso  != nullptr) { s.cs_pso->Release();  s.cs_pso  = nullptr; }   // CS1
-        if (s.cs_rs   != nullptr) { s.cs_rs->Release();   s.cs_rs   = nullptr; }
-        if (s.cs_heap != nullptr) { s.cs_heap->Release(); s.cs_heap = nullptr; }
+        if (s.cs_pso  != nullptr) { if (!sf_keep) s.cs_pso->Release();  s.cs_pso  = nullptr; }   // CS1
+        if (s.cs_rs   != nullptr) { if (!sf_keep) s.cs_rs->Release();   s.cs_rs   = nullptr; }
+        if (s.cs_heap != nullptr) { if (!sf_keep) s.cs_heap->Release(); s.cs_heap = nullptr; }
         s.cs_built = false; s.cs_failed = false;
-        if (s.fwc_pso  != nullptr) { s.fwc_pso->Release();  s.fwc_pso  = nullptr; }   // FW2
-        if (s.fwc_rs   != nullptr) { s.fwc_rs->Release();   s.fwc_rs   = nullptr; }
-        if (s.fwc_heap != nullptr) { s.fwc_heap->Release(); s.fwc_heap = nullptr; }
-        if (s.fwc_buf  != nullptr) { s.fwc_buf->Release();  s.fwc_buf  = nullptr; }
-        if (s.fwc_read != nullptr) { s.fwc_read->Release(); s.fwc_read = nullptr; }
+        if (s.fwc_pso  != nullptr) { if (!sf_keep) s.fwc_pso->Release();  s.fwc_pso  = nullptr; }   // FW2
+        if (s.fwc_rs   != nullptr) { if (!sf_keep) s.fwc_rs->Release();   s.fwc_rs   = nullptr; }
+        if (s.fwc_heap != nullptr) { if (!sf_keep) s.fwc_heap->Release(); s.fwc_heap = nullptr; }
+        if (s.fwc_buf  != nullptr) { if (!sf_keep) s.fwc_buf->Release();  s.fwc_buf  = nullptr; }
+        if (s.fwc_read != nullptr) { if (!sf_keep) s.fwc_read->Release(); s.fwc_read = nullptr; }
         s.fwc_built = false; s.fwc_failed = false; s.fwc_pending = false; s.fwc_prev_cap = 0;
         // nr_params is NOT destroyed: it is the core's capability block and the
         // NGX session is deliberately kept open for the process lifetime.
@@ -15071,42 +15530,42 @@ static void g0_stage_release(stream_state &s)
         s.gup_cpu = nullptr;
         // R26, in reverse creation order and BEFORE the DIRECT set it was
         // created after. Drained above.
-        if (s.cq_tsread != nullptr) { s.cq_tsread->Release(); s.cq_tsread = nullptr; }
-        if (s.cq_tsheap != nullptr) { s.cq_tsheap->Release(); s.cq_tsheap = nullptr; }
-        if (s.cqf != nullptr) { s.cqf->Release(); s.cqf = nullptr; }
+        if (s.cq_tsread != nullptr) { if (!sf_keep) s.cq_tsread->Release(); s.cq_tsread = nullptr; }
+        if (s.cq_tsheap != nullptr) { if (!sf_keep) s.cq_tsheap->Release(); s.cq_tsheap = nullptr; }
+        if (s.cqf != nullptr) { if (!sf_keep) s.cqf->Release(); s.cqf = nullptr; }
         for (int ci = 1; ci >= 0; --ci)
         {
-            if (s.cql[ci] != nullptr) { s.cql[ci]->Release(); s.cql[ci] = nullptr; }
-            if (s.cqa[ci] != nullptr) { s.cqa[ci]->Release(); s.cqa[ci] = nullptr; }
+            if (s.cql[ci] != nullptr) { if (!sf_keep) s.cql[ci]->Release(); s.cql[ci] = nullptr; }
+            if (s.cqa[ci] != nullptr) { if (!sf_keep) s.cqa[ci]->Release(); s.cqa[ci] = nullptr; }
         }
-        if (s.cq  != nullptr) { mgpu::gputime::forget(s.cq); s.cq->Release();  s.cq = nullptr; }   // WT1
+        if (s.cq  != nullptr) { mgpu::gputime::forget(s.cq); if (!sf_keep) s.cq->Release();  s.cq = nullptr; }   // WT1
         s.cqf_value = 0;
         s.cq_gated = false;
         s.cqa_value[0] = 0;
         s.cqa_value[1] = 0;
         s.cq_ts_ok = false;
-        if (s.nev != nullptr) { CloseHandle(s.nev); s.nev = nullptr; }
-        if (s.nf  != nullptr) { s.nf->Release();  s.nf = nullptr; }
-        if (s.nl  != nullptr) { s.nl->Release();  s.nl = nullptr; }
-        if (s.na  != nullptr) { s.na->Release();  s.na = nullptr; }
-        if (s.nq  != nullptr) { mgpu::gputime::forget(s.nq); s.nq->Release();  s.nq = nullptr; }   // GT2
-        if (s.gate_ev != nullptr) { CloseHandle(s.gate_ev); s.gate_ev = nullptr; }
-        if (s.tsread != nullptr) { s.tsread->Release(); s.tsread = nullptr; }
-        if (s.tsheap != nullptr) { s.tsheap->Release(); s.tsheap = nullptr; }
-        if (s.gb_heap != nullptr) { s.gb_heap->Release(); s.gb_heap = nullptr; }   // GB1
-        if (s.gb_read != nullptr) { s.gb_read->Release(); s.gb_read = nullptr; }
-        if (s.nseal != nullptr) { s.nseal->Release(); s.nseal = nullptr; }
-        for (int i = 0; i < 2; ++i) if (s.cp_rb[i] != nullptr) { s.cp_rb[i]->Release(); s.cp_rb[i] = nullptr; }   // R258
-        s.cp_stage = 0; s.cp_n = 0; s.cp_written = false; s.cp_worse = 0; s.learn_on = false; s.learn_decided = false; s.learn_t0 = 0; s.cp_win_n = 0;   // R278
+        if (s.nev != nullptr) { if (!sf_keep) CloseHandle(s.nev); s.nev = nullptr; }
+        if (s.nf  != nullptr) { if (!sf_keep) s.nf->Release();  s.nf = nullptr; }
+        if (s.nl  != nullptr) { if (!sf_keep) s.nl->Release();  s.nl = nullptr; }
+        if (s.na  != nullptr) { if (!sf_keep) s.na->Release();  s.na = nullptr; }
+        if (s.nq  != nullptr) { mgpu::gputime::forget(s.nq); if (!sf_keep) s.nq->Release();  s.nq = nullptr; }   // GT2
+        if (s.gate_ev != nullptr) { if (!sf_keep) CloseHandle(s.gate_ev); s.gate_ev = nullptr; }
+        if (s.tsread != nullptr) { if (!sf_keep) s.tsread->Release(); s.tsread = nullptr; }
+        if (s.tsheap != nullptr) { if (!sf_keep) s.tsheap->Release(); s.tsheap = nullptr; }
+        if (s.gb_heap != nullptr) { if (!sf_keep) s.gb_heap->Release(); s.gb_heap = nullptr; }   // GB1
+        if (s.gb_read != nullptr) { if (!sf_keep) s.gb_read->Release(); s.gb_read = nullptr; }
+        if (s.nseal != nullptr) { if (!sf_keep) s.nseal->Release(); s.nseal = nullptr; }
+        for (int i = 0; i < 2; ++i) if (s.cp_rb[i] != nullptr) { if (!sf_keep) s.cp_rb[i]->Release(); s.cp_rb[i] = nullptr; }   // R258
+        s.cp_stage = 0; s.cp_n = 0; s.cp_written = false; s.cp_worse = 0; s.learn_on = false; s.learn_decided = false; s.learn_t0 = 0; s.learn_tapkey = -1; s.cp_win_n = 0;   // R278 / AU2
         s.x_edge_used = 0; s.x_edges_rec = 0; s.x_edge_sum[0] = s.x_edge_sum[1] = 0.0; s.x_edge_n[0] = s.x_edge_n[1] = 0; s.x_edge_fixed = false; s.x_edge_bad = 0; s.x_verdicts = 0; s.x_kx = s.x_ky = 0;   // R280e
         g_mvec_x_edge_req.store(0, std::memory_order_relaxed);
         g_mv_cand_req.store(-1, std::memory_order_relaxed);   // R278f
         for (int i = 0; i < 4; ++i) { s.cp_kx_votes[i] = 0; s.cp_ky_votes[i] = 0; }   // R278b: 4 buckets
-        if (s.vp_rb != nullptr) { s.vp_rb->Release(); s.vp_rb = nullptr; }   // R257
+        if (s.vp_rb != nullptr) { if (!sf_keep) s.vp_rb->Release(); s.vp_rb = nullptr; }   // R257
         s.vp_pending = false; s.vp_n = 0;
-        if (s.dp_rb != nullptr) { s.dp_rb->Release(); s.dp_rb = nullptr; }   // R244
+        if (s.dp_rb != nullptr) { if (!sf_keep) s.dp_rb->Release(); s.dp_rb = nullptr; }   // R244
         s.dp_pending = false; s.dp_n = 0; s.dp_agree = s.dp_disagree = 0; s.dp_written = false;
-        if (s.nfence != nullptr) { s.nfence->Release(); s.nfence = nullptr; }
+        if (s.nfence != nullptr) { if (!sf_keep) s.nfence->Release(); s.nfence = nullptr; }
         // ---- HANGFIX 2026-09-12: DRAIN *GPU 0* BEFORE FREEING WHAT IT READS ----
         //
         // "Never free under the GPU" is enforced twice over for GPU 1 in this
@@ -15132,69 +15591,44 @@ static void g0_stage_release(stream_state &s)
         // game's side and is still alive here; the target is gsignaled, the
         // last value actually signalled, so a normal exit waits ~0 ms. Because
         // this turns on a wait no shipped build has executed, it carries its
-        // own fault switch: the wait is timed and logged on every teardown,
-        // and if it ever hits the bound the add-on writes DrainGpu0=0 and
-        // DrainGpu0Off=<reason> to mgpu.ini and skips the drain on later
-        // launches - one slow exit, then never again, with the reason on file.
+        // own fault switch: the wait is timed and logged on every teardown.
+        // (Until SF2 it also wrote DrainGpu0=0 after a timeout, which made every
+        // later launch free gxfer with no check - removed; see SF2 below.)
+        // SF2: GPU 0's verdict, from the reading taken before the CPU-side
+        // fence advance (top of this function). No setting is ever changed by a
+        // timeout any more: R275 used to write DrainGpu0=0 after one, and every
+        // later launch then freed gxfer with no check at all. DrainGpu0=0 now
+        // means "do not WAIT" - gxfer is still freed only if the game's queue
+        // had already passed it, otherwise it is kept.
+        bool sf_keep0 = !mgpu::gpusafe::proven(sf_g0q);
         {
-            const unsigned long long drain_to = s.gsignaled;
-            if (!s.drain_on)
-                mgpu::diag::info("[MGPU][R275] teardown: the GPU 0 drain is OFF (DrainGpu0=0 in mgpu.ini - the add-on "
-                                 "wrote it after a stalled drain, or it was set by hand). gxfer is released without a wait, "
-                                 "as every build before R275 did.");
-            else if (s.gfence != nullptr && drain_to != 0
-                     && s.gfence->GetCompletedValue() < (UINT64)drain_to)
-            {
-                HANDLE dev0 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-                if (dev0 != nullptr)
-                {
-                    LARGE_INTEGER t0{}, t1{}, fq{};
-                    QueryPerformanceCounter(&t0);
-                    bool timed_out = false;
-                    if (SUCCEEDED(s.gfence->SetEventOnCompletion((UINT64)drain_to, dev0)))
-                        timed_out = (WaitForSingleObject(dev0, 2000) != WAIT_OBJECT_0);
-                    QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&fq);
-                    const double ms = (fq.QuadPart != 0) ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart : 0.0;
-                    char dl[560];
-                    if (!timed_out)
-                    {
-                        snprintf(dl, sizeof dl, "[MGPU][R275] teardown: GPU 0 drain waited %.2f ms for gfence to reach %llu "
-                                                "(now completed %llu). gxfer is released after the game's queue passed it.",
-                                 ms, drain_to, (unsigned long long)s.gfence->GetCompletedValue());
-                        mgpu::diag::info(dl);
-                    }
-                    else
-                    {
-                        char why[160];
-                        snprintf(why, sizeof why, "drain waited %.0f ms for gfence %llu and timed out", ms, drain_to);
-                        (void)ini_write_int("DrainGpu0", 0);
-                        (void)ini_write_text("DrainGpu0Off", why);
-                        snprintf(dl, sizeof dl,
-                                 "[MGPU][P4.0] teardown: the GAME's queue did not reach the signalled count within 2 s "
-                                 "(%s). Releasing anyway - a leak is recoverable and a hang here is not. If this line "
-                                 "appears, something on GPU 0 is stuck and the device removal that may follow is NOT this "
-                                 "add-on freeing under it. [R275] mgpu.ini now has DrainGpu0=0 and DrainGpu0Off=<reason>: "
-                                 "the next launch skips this drain.", why);
-                        mgpu::diag::warn(dl);
-                    }
-                    CloseHandle(dev0);
-                }
-            }
+            char dl[600];
+            if (sf_g0_to == 0 || s.gfence == nullptr)
+                snprintf(dl, sizeof dl, "[MGPU][R275] teardown: GPU 0 drain - nothing was ever signalled, nothing to wait for.");
+            else if (!sf_g0q.waited && sf_g0q.drained)
+                snprintf(dl, sizeof dl, "[MGPU][R275] teardown: GPU 0 drain needed no wait (the game's queue had passed %llu).", sf_g0_to);
+            else if (sf_g0q.drained)
+                snprintf(dl, sizeof dl, "[MGPU][R275] teardown: GPU 0 drain waited %.2f ms for the game's queue to pass %llu - "
+                         "gxfer is freed after it.", sf_g0_ms, sf_g0_to);
+            else if (sf_g0q.removed)
+                snprintf(dl, sizeof dl, "[MGPU][R275] teardown: GPU 0 is removed (%.0f ms) - nothing runs on it, gxfer is freed.", sf_g0_ms);
+            else if (!sf_g0q.waited)
+                snprintf(dl, sizeof dl, "[MGPU][GS2] teardown: DrainGpu0=0 - no wait, and the game's queue had NOT passed %llu, "
+                         "so gxfer, its heap and the shared fence are KEPT (not freed).", sf_g0_to);
             else
-            {
-                char dl[300];
-                snprintf(dl, sizeof dl, "[MGPU][R275] teardown: GPU 0 drain needed no wait (gfence completed %llu, last signalled %llu).",
-                         (s.gfence != nullptr) ? (unsigned long long)s.gfence->GetCompletedValue() : 0ull, drain_to);
-                mgpu::diag::info(dl);
-            }
+                snprintf(dl, sizeof dl, "[MGPU][GS2] teardown: the GAME's queue did not pass %llu within 2 s (%.0f ms) - gxfer, "
+                         "its heap and the shared fence are KEPT (not freed). Nothing is written to mgpu.ini: the next launch "
+                         "waits (bounded) as usual.", sf_g0_to, sf_g0_ms);
+            if (sf_keep0) mgpu::diag::warn(dl); else mgpu::diag::info(dl);
         }
 
         if (s.gfence_share != nullptr) { CloseHandle(s.gfence_share); s.gfence_share = nullptr; }
-        if (s.gfence != nullptr) { s.gfence->Release(); s.gfence = nullptr; }
-        if (s.nxfer != nullptr) { s.nxfer->Release(); s.nxfer = nullptr; }
-        if (s.nheap != nullptr) { s.nheap->Release(); s.nheap = nullptr; }
-        if (s.gup   != nullptr) { s.gup->Release();   s.gup = nullptr; }
+        if (s.nxfer != nullptr) { if (!sf_keep) s.nxfer->Release(); s.nxfer = nullptr; }       // SF1: GPU 1 reads it
+        if (s.nheap != nullptr) { if (!sf_keep) s.nheap->Release(); s.nheap = nullptr; }
+        if (s.gup   != nullptr) { if (!sf_keep) s.gup->Release();   s.gup = nullptr; }
         // ---- R88: STOP THE GAME THREAD FIRST, THEN FREE ----
+        // (SF2: done at the top of stream_release now, before GPU 0's drain;
+        // repeated here, harmlessly, so this block stays self-contained.)
         // stream_mvec_copy records into gxfer from the game's render thread.
         // Clearing the flag under mvec_cs means any copy already inside the
         // lock finishes, and none starts afterwards.
@@ -15203,10 +15637,31 @@ static void g0_stage_release(stream_state &s)
             s.mvec_live.store(false, std::memory_order_release);
             s.hud_live.store(false, std::memory_order_release);   // HL1
         }
-        g0_stage_release(s);   // OPT5: drains the GPU 0 copy queue that writes gxfer
-        if (s.gxfer != nullptr) { s.gxfer->Release(); s.gxfer = nullptr; }
-        if (s.gheap != nullptr) { s.gheap->Release(); s.gheap = nullptr; }
+        const bool sf_g0stage_ok = g0_stage_release(s, mgpu::gpusafe::proven(sf_g0q));   // OPT5 (+SF2: the game's queue too)
+        if (!sf_g0stage_ok) sf_keep0 = true;              // SF1: or keeps it
+        // SF2: the shared fence is freed only HERE, after the staging verdict -
+        // with StageCopy on it is the staging queue that signals gfence, and the
+        // game's queue Waits on it, so it lives as long as either may use it.
+        if (s.gfence != nullptr) { if (!sf_keep0) s.gfence->Release(); s.gfence = nullptr; }
+        if (s.gxfer != nullptr) { if (!sf_keep0) s.gxfer->Release(); s.gxfer = nullptr; }   // SF1
+        if (s.gheap != nullptr) { if (!sf_keep0) s.gheap->Release(); s.gheap = nullptr; }
         if (s.gshare!= nullptr) { CloseHandle(s.gshare); s.gshare = nullptr; }
+        {   // SF2: one line - which queue did not finish, what was kept.
+            char sl[420];
+            snprintf(sl, sizeof sl, "[MGPU][GS2] teardown summary | GPU 0 game queue: %s | GPU 0 staging (queue + buffer): %s | "
+                     "GPU 1 copy + NR queues: %s | kept: %s%s",
+                     mgpu::gpusafe::proven(sf_g0q) ? (sf_g0q.removed ? "device removed" : "finished") : "NOT finished",
+                     sf_g0stage_ok ? "freed (or not used)" : "KEPT",
+                     !sf_keep ? (sf_removed ? "device removed" : "finished") : "NOT finished",
+                     sf_keep0 ? (sf_g0stage_ok ? "GPU 0 transfer buffer, heap, shared fence"
+                                               : "GPU 0 transfer buffer, heap, shared fence, staging") : "",
+                     sf_keep ? (sf_keep0 ? "; GPU 1 queues, buffers, NGX features" : "GPU 1 queues, buffers, NGX features")
+                             : (sf_keep0 ? "" : "nothing"));
+            if (sf_keep0 || sf_keep || !sf_g0stage_ok) mgpu::diag::warn(sl); else mgpu::diag::info(sl);
+        }
+        // EX1: the arm's GetDevice reference, given back at teardown with no lock
+        // held - but only if GPU 0's work was proven done (GS2); else kept.
+        gref_defer(s.gdev, !sf_keep0);
         s.gdev = nullptr;
         s.ndev_b = nullptr;   // borrowed
         s.armed = false;
@@ -15368,7 +15823,7 @@ namespace
     {
         char line[700];
 
-        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        HMODULE dc = mgpu::sys_d3dcompiler_module() /* SC1 */;
         if (dc == nullptr)
         {
             mgpu::diag::error("[MGPU][C2-SR] d3dcompiler_47.dll not loadable - the reduce "
@@ -15661,7 +16116,7 @@ namespace
         char line[700];
         if (ndev == nullptr || like == nullptr) return false;
 
-        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        HMODULE dc = mgpu::sys_d3dcompiler_module() /* SC1 */;
         pfn_d3dcompile p_compile = (dc != nullptr)
             ? (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile") : nullptr;
         if (p_compile == nullptr)
@@ -15820,9 +16275,10 @@ namespace
                  "[MGPU][FG1] FRAME GENERATION PROTOTYPE UP: %llux%u fmt=%d, motion vectors "
                  "%ux%u, depth %ux%u, MV sign %s. One generated frame per NR frame, shown by a "
                  "separate present thread half an interval before the real one, so the NR loop "
-                 "never waits for it (FG2). HUD: GENERATED line (CTRL+ALT+H).",
+                 "never waits for it (FG2). HUD: GENERATED line (%s).",
                  (unsigned long long)rd.Width, rd.Height, (int)rd.Format, s.mvec_w, s.mvec_h,
-                 s.depth_w, s.depth_h, s.fg_invert ? "INVERTED (FGInvertMV=1)" : "as NR");
+                 s.depth_w, s.depth_h, s.fg_invert ? "INVERTED (FGInvertMV=1)" : "as NR",
+                 mgpu::hotkeys::name_now(mgpu::hotkeys::A_FPS_HUD));   // HK15
         mgpu::diag::info(line);
         return true;
     }
@@ -15886,7 +16342,7 @@ namespace
             mgpu::diag::warn(line);
             return false;
         }
-        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        HMODULE dc = mgpu::sys_d3dcompiler_module() /* SC1 */;
         pfn_d3dcompile p_compile = (dc != nullptr)
             ? (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile") : nullptr;
         if (p_compile == nullptr) { mgpu::diag::warn("[MGPU][HL1] no D3DCompile - HUD-less mode off."); return false; }
@@ -16176,7 +16632,7 @@ namespace
             mgpu::diag::warn(line);
             return false;
         }
-        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        HMODULE dc = mgpu::sys_d3dcompiler_module() /* SC1 */;
         pfn_d3dcompile p_compile = (dc != nullptr)
             ? (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile") : nullptr;
         if (p_compile == nullptr) { mgpu::diag::warn("[MGPU][CS1] no D3DCompile - Color Strength off."); return false; }
@@ -16341,7 +16797,7 @@ namespace
         if (dev == nullptr) return false;
         s.fwc_failed = true;   // until proven otherwise
         char line[300];
-        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        HMODULE dc = mgpu::sys_d3dcompiler_module() /* SC1 */;
         pfn_d3dcompile p_compile = (dc != nullptr) ? (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile") : nullptr;
         if (p_compile == nullptr) { mgpu::diag::warn("[MGPU][FW2] no D3DCompile - calibration unavailable."); return false; }
         ID3DBlob *cs = nullptr, *err = nullptr;
@@ -18039,6 +18495,8 @@ namespace
         // R208 (0.3.1, backported): the FP16 input path. Reads NRInput16 itself;
         // a failure here leaves it off and never fails the arm.
         if (SUCCEEDED(h)) (void)mgpu::nr16::arm(ndev, s.width, s.height);
+        (void)mgpu::tstab::mode();   // TC1: read its keys here, at arm - never in the per-frame path
+        mgpu::cpuprof::init();       // CP1: the same
         if (SUCCEEDED(h) && mgpu::nr16::active() && s.passes != 1u)
             mgpu::diag::warn("[MGPU][R208] NRInput16=4 is set, but the FP16 path only runs with Passes=1 "
                              "- with this ini every frame takes the normal 8/10-bit path.");
@@ -18279,6 +18737,7 @@ namespace
                          (unsigned)r, ngx_result_name(r), (void *)s.nr_handle[i],
                          (fq.QuadPart > 0) ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart) : 0.0);
                 mgpu::diag::info(line);
+                if (i == 0) mgpu::archspoof::report();   // AS1
                 if (r != NVSDK_NGX_Result_Success || s.nr_handle[i] == nullptr) break;
             }
             // Survived NGX. Whether the RESULT was a success does not matter
@@ -19963,7 +20422,10 @@ void stream_shutdown(unsigned lock_timeout_ms)
     //
     // Announced first, because it is a vendor call in a teardown path, and
     // this project has now been killed twice by exactly that.
-    if (s.ngx_destroy_params != nullptr)
+    if (s.sf_kept)   // SF1: the features were kept, so the blocks they were created against are too
+        mgpu::diag::warn("[MGPU][T5] DestroyParameters skipped: the NGX features were kept (SF1), so the parameter "
+                         "blocks they use are kept with them.");
+    else if (s.ngx_destroy_params != nullptr)
     {
         if (s.nr_params != nullptr)
         {
@@ -20081,6 +20543,12 @@ bool ui_panel_is_open()
     return (n >= t) && (n - t) < 500ull;
 }
 
+// LR106: two relaxed atomics - read by the replay thread and, during a
+// benchmark countdown only, by the capture path; never on the frame path.
+static std::atomic<bool> g_rs_menu_open{false};
+void ui_rs_menu(bool open) { g_rs_menu_open.store(open, std::memory_order_relaxed); }
+bool ui_any_menu_open() { return g_rs_menu_open.load(std::memory_order_relaxed) || ui_panel_is_open(); }
+
 void ui_request_arm()
 {
     g_arm_request.store(1u, std::memory_order_relaxed);
@@ -20167,6 +20635,22 @@ bool ui_ini_write(const char *key, int value)
         if (queued) { ini_mirror_set(key, value); return true; }
     }
     const bool ok = ini_write_int(key, value);   // queue full: write now, as before
+    if (ok) ini_mirror_set(key, value);
+    return ok;
+}
+
+// HK12: write NOW (not queued for 400 ms): for keys set once and meant to
+// stick - the hotkeys. Drops a queued value for the same key first, so an
+// older queued write cannot land after this one.
+bool ui_ini_write_now(const char *key, int value)
+{
+    if (key == nullptr) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_ini_pend_mx);
+        for (ini_pend &p : g_ini_pend)
+            if (p.used && strcmp(p.key, key) == 0) p.used = false;
+    }
+    const bool ok = ini_write_int(key, value);
     if (ok) ini_mirror_set(key, value);
     return ok;
 }
@@ -20422,6 +20906,7 @@ bool ui_scaler_active()        { return g_sc_active.load(); }
 bool dcomp_visual_rooted()      { return g_dcomp_rooted; }
 void *dcomp_game_hwnd()         { return (void *)g_game_hwnd; }
 void sc_set_panel_live(bool up) { g_sc_panel.store(up); g_sc_sync_req.store(true); if (!up) g_pm_btn.store(0);
+                                  mgpu::cursormap::panel_up(up || g_bw_panel.load());   // PO2
                                   mgpu::hotkeys::panel_mouse(up); }   // PP3
 bool sc_panel_live()            { return g_sc_panel.load(); }
 void sc_cover_mouse(int x, int y, unsigned btn, int wheel)
@@ -20512,13 +20997,20 @@ int  ui_nr_uic()              { return g_nr_uic.load(); }
 void ui_set_nr_uic(int v)     { if (v < 0 || v > 2) v = 0; g_nr_uic.store(v); (void)ui_ini_write("NRUICorrection", v); }
 
 // FL1: FG Lite and which frame generation DLL loads (next launch).
-int  ui_fg_lite()            { return ini_read_sr_int("FGLite", 0, 0, 1); }
+// AU1: through the cached mirror (ui_ini_write keeps it current) - the panel
+// asks every drawn frame, and this used to open mgpu.ini each time.
+static int ini_cached_range(const char *key, int dflt, int lo, int hi)
+{
+    const int v = ini_mirror_get(key, dflt);
+    return (v < lo || v > hi) ? dflt : v;
+}
+int  ui_fg_lite()            { return ini_cached_range("FGLite", 0, 0, 1); }
 void ui_set_fg_lite(int on)  { (void)ui_ini_write("FGLite", on ? 1 : 0); }
-int  ui_fg_source()          { return ini_read_sr_int("FGSource", 0, 0, 1); }
+int  ui_fg_source()          { return ini_cached_range("FGSource", 0, 0, 1); }
 void ui_set_fg_source(int v) { (void)ui_ini_write("FGSource", v ? 1 : 0); }
 
 // NM1: NR model preset, applied when NR is created (next launch).
-int  ui_nr_model()      { return ini_read_sr_int("NRModel", 0, 0, 2); }
+int  ui_nr_model()      { return ini_cached_range("NRModel", 0, 0, 2); }   // AU1
 void ui_set_nr_model(int m)
 {
     if (m < 0) m = 0;
@@ -20527,7 +21019,7 @@ void ui_set_nr_model(int m)
 }
 
 // NM2: the 2nd and later passes' network, applied when NR is created (next launch).
-int  ui_nr_model2()     { return ini_read_sr_int("NRModel2", 0, 0, 2); }
+int  ui_nr_model2()     { return ini_cached_range("NRModel2", 0, 0, 2); }   // AU1
 void ui_set_nr_model2(int m)
 {
     if (m < 0) m = 0;
@@ -20607,7 +21099,7 @@ static void nvx_text(const nvx_acc &a, char *out, size_t n)
              "clock limited by:%s", a.clk / a.n, a.clk_min == ~0u ? 0u : a.clk_min, a.clk_rated, a.pw / a.n, a.pw_max,
              a.pw_lim / 1000u, a.temp_max, a.util / a.n, lim[0] ? lim : " none");
 }
-static void nvml_thread()
+static void nvml_thread(void *)
 {
     typedef int (*pf_init)();
     typedef int (*pf_count)(unsigned *);
@@ -20755,7 +21247,7 @@ static void nvml_start()
     g_nv_want.store(GetTickCount64(), std::memory_order_relaxed);
     if (g_nv_started.exchange(true)) return;
     g_nv_running.store(true);
-    try { std::thread(nvml_thread).detach(); } catch (...) { g_nv_running.store(false); }
+    if (!tl1_start(&nvml_thread, nullptr)) g_nv_running.store(false);   // TL1: pinned
 }
 void bus_meter_stop()   // shutdown: let the reader finish before the module can go
 {
@@ -21027,6 +21519,55 @@ static int clock_lines(char (*out)[24])
         else        snprintf(out[n++], 24, "%u:%02u", mm, ss);
     }
     return n;
+}
+
+// PA1: a coarse bridge state for the panel's status dot. Never waits for
+// s.cs (try_lock): a busy stream keeps the last answer; refreshed at most
+// every 250 ms. 0 waiting, 1 starting, 2 running, 3 failed or off.
+int ui_bridge_state()
+{
+    static std::atomic<int> last{0};
+    static std::atomic<unsigned long long> at{0}, ok_seen{~0ull}, ok_at{0};
+    const unsigned long long now = GetTickCount64();
+    if (now - at.load(std::memory_order_relaxed) < 250ull) return last.load(std::memory_order_relaxed);
+    at.store(now, std::memory_order_relaxed);
+    const unsigned long long nok = g_hud_nr_ok_count.load(std::memory_order_relaxed);
+    if (nok != ok_seen.load(std::memory_order_relaxed)) { ok_seen.store(nok); ok_at.store(now); }
+    stream_state &st = str();
+    std::unique_lock<std::mutex> lk(st.cs, std::try_to_lock);
+    if (!lk.owns_lock()) return last.load(std::memory_order_relaxed);
+    const int v = !st.armed ? 0 : !st.neural ? 3 : (st.nr_tried && !st.nr_ok) ? 3 : !st.nr_ok ? 1
+                : (now - ok_at.load() <= 1000ull) ? 2 : 1;
+    last.store(v, std::memory_order_relaxed);
+    return v;
+}
+
+// RC1: the game changed resolution after the stream started. The motion-
+// vector and depth slots are sized once, at arm (R169), so from then on frame
+// generation has no vectors. Not fixed live (that is a full stream rebuild);
+// the panel's Frame Generation section says so instead: restart the game. Set by the R169
+// report on the bridge thread, read by the HUD and the panel.
+std::atomic<bool> g_rc_on{false};
+std::atomic<unsigned> g_rc_w{0}, g_rc_h{0}, g_rc_aw{0}, g_rc_ah{0};
+// LR1 (LR97): RC1 now means "could NOT be followed" - most changes are followed
+// live and never reach the panel. 1 = the size changed, 2 = only the format.
+std::atomic<int> g_rc_kind{1};
+
+bool ui_res_changed() { return g_rc_on.load(std::memory_order_relaxed) || g_rc2.load(std::memory_order_relaxed); }
+int  ui_res_change_kind() { return g_rc2.load(std::memory_order_relaxed) ? 1 : g_rc_kind.load(std::memory_order_relaxed); }
+
+// RC2: called every frame from the game's Present (the thread the Home key's
+// dcomp_set_visible already runs on). The picture-on-top window steps aside by
+// itself (bw: aside); the DirectComposition overlay and the scaler cover are
+// unrooted / hidden here, and put back when the size matches again.
+void rc2_poll()
+{
+    static bool was = false;
+    const bool now = g_rc2.load(std::memory_order_relaxed);
+    if (now == was) return;
+    was = now;
+    if (g_bw_on.load()) return;
+    dcomp_set_visible(!now);
 }
 
 // Present path only (under g_present_mx, so the statics need no lock).
@@ -21853,8 +22394,20 @@ static std::atomic<bool> g_fgp_failed{false};
 // A pointer, never a static std::thread: a joinable static thread object
 // destroyed at DLL unload calls std::terminate.
 static std::thread *g_fgp_thread = nullptr;
-static LARGE_INTEGER g_fg_last{};
-static double g_fg_ema_ms = 0.0;
+// LR100: the present thread's life, read and written ONLY under g_fgp_mx.
+// Today every fg_handoff and fg_present_stop runs on the bridge thread, so
+// they never overlap - this makes that a checked rule instead of an
+// assumption: a hand-over that arrives while a stop is joining the thread is
+// refused (the frame is presented the normal way), never a second thread over
+// a pointer that is about to be deleted. Rules: mgpu::thlife (thread_life.hpp).
+static mgpu::thlife::state g_fgp_life = mgpu::thlife::state::idle;
+static LARGE_INTEGER g_fg_last{};   // bridge thread only (fg_handoff, fg_present_stop)
+// LR100: the average real-frame interval. WRITTEN by the bridge thread in
+// fg_handoff BEFORE it takes g_fgp_mx, READ by the present thread in fd_pair
+// under g_fgp_mx - the mutex never covered the write, so a plain double was a
+// data race. An atomic (lock-free for double on x64) with relaxed order: it is
+// a statistic, nothing else is published through it.
+static std::atomic<double> g_fg_ema_ms{0.0};
 static HANDLE g_fg_timer = nullptr;
 
 extern std::atomic<unsigned long long> g_fgp_replaced;
@@ -22054,7 +22607,8 @@ static void fd_pair(double wait_ms, const fg_job &job)
         if (d < 200.0)
         {
             if (d > g_fd.arrive_max) g_fd.arrive_max = d;
-            if (g_fg_ema_ms > 0.0 && d > g_fg_ema_ms * 1.5) ++g_fd.p_late;
+            const double ema = g_fg_ema_ms.load(std::memory_order_relaxed);   // LR100
+            if (ema > 0.0 && d > ema * 1.5) ++g_fd.p_late;
         }
     }
     g_fd.last_arrive = now;
@@ -22433,19 +22987,45 @@ bool fg_handoff(float r, float g, float b, bool &failed)
         const double dt = (double)(now.QuadPart - g_fg_last.QuadPart) * 1000.0 / (double)fq.QuadPart;
         if (dt > 3.0 && dt < 60.0)
         {
-            g_fg_ema_ms = (g_fg_ema_ms <= 0.0) ? dt : (g_fg_ema_ms * 0.85 + dt * 0.15);
-            g_fg_real_us.store((int)(g_fg_ema_ms * 1000.0), std::memory_order_relaxed);   // DMF1
+            // LR100: one writer (this thread), so load-modify-store is enough.
+            const double prev = g_fg_ema_ms.load(std::memory_order_relaxed);
+            const double ema = (prev <= 0.0) ? dt : (prev * 0.85 + dt * 0.15);
+            g_fg_ema_ms.store(ema, std::memory_order_relaxed);
+            g_fg_real_us.store((int)(ema * 1000.0), std::memory_order_relaxed);   // DMF1
         }
     }
     g_fg_last = now;
     job.t0 = now;
-    job.half_ms = g_fg_ema_ms * 0.5;
+    job.half_ms = g_fg_ema_ms.load(std::memory_order_relaxed) * 0.5;
 
     std::unique_lock<std::mutex> lk(g_fgp_mx);
-    if (g_fgp_thread == nullptr)
+    // LR100: only a fully stopped (idle) thread is restarted; a stop in
+    // progress refuses the job. The caller then presents this frame itself.
+    const mgpu::thlife::step st_ = mgpu::thlife::use(g_fgp_life, g_fgp_thread != nullptr);
+    if (st_ == mgpu::thlife::step::refuse)
+    {
+        lk.unlock();
+        fg_job_drop(job);
+        return false;
+    }
+    if (st_ == mgpu::thlife::step::start)
     {
         g_fgp_stop = false;
-        g_fgp_thread = new std::thread(fg_present_thread_main);
+        try
+        {
+            g_fgp_thread = new std::thread(fg_present_thread_main);
+        }
+        catch (...)
+        {
+            // LR100: std::thread throws std::system_error when the OS will not
+            // make a thread; operator new throws bad_alloc. Neither may leave
+            // this function with the lock held and the frame's refs taken.
+            g_fgp_thread = nullptr;
+            lk.unlock();
+            fg_job_drop(job);
+            return false;
+        }
+        g_fgp_life = mgpu::thlife::started();
     }
     if (g_fgp_has)
     {
@@ -22467,22 +23047,48 @@ bool fg_handoff(float r, float g, float b, bool &failed)
 }
 
 // Bridge thread, before the present chain is torn down.
+// LR104: one stop at a time, START TO FINISH. Every caller today is the bridge
+// thread (worker.cpp teardown, and stream_poll which only the worker calls),
+// so stops never overlap - but LR100 serialised only the thread part: a second
+// stop arriving while the first joined would have gone on to drain the queue,
+// release g_fg_retire and g_fg_pfence and reset the set marks under a present
+// thread the first stop was still joining. This mutex covers the whole stop.
+// It is taken by nothing else - not by the present thread, not by fg_handoff -
+// so holding it while joining cannot block the thread being joined, and the
+// render path never sees it.
+static std::mutex g_fgp_stop_mx;
+
 void fg_present_stop()
 {
+    std::lock_guard<std::mutex> owner(g_fgp_stop_mx);   // LR104: single owner of the whole teardown
+    // LR100: the thread pointer is TAKEN under the lock and the state set to
+    // stopping, so a hand-over cannot start or reach a thread being joined.
+    // The join itself runs with the lock released - the present thread needs
+    // g_fgp_mx to see the stop flag. A second stop (nothing to take) is a no-op.
+    std::thread *t = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_fgp_mx);
         g_fgp_stop = true;
+        t = g_fgp_thread;
+        g_fgp_thread = nullptr;
+        (void)mgpu::thlife::stop_take(g_fgp_life, t != nullptr);
     }
     g_fgp_cv.notify_one();
-    if (g_fgp_thread != nullptr)
+    bool joined = false;
+    if (t != nullptr)
     {
-        if (g_fgp_thread->joinable()) g_fgp_thread->join();
-        delete g_fgp_thread;
-        g_fgp_thread = nullptr;
+        // Never join from the present thread itself (resource_deadlock_would_occur).
+        if (t->joinable() && t->get_id() != std::this_thread::get_id()) { t->join(); joined = true; }
+        else if (t->joinable()) t->detach();   // cannot happen today; then FG stays off (stopping)
+        else joined = true;
+        delete t;
     }
     {
         std::lock_guard<std::mutex> lk(g_fgp_mx);
         if (g_fgp_has) { fg_job_drop(g_fgp_job); g_fgp_has = false; }
+        // LR104: the slot stays "stopping" until the END of this function, so a
+        // hand-over cannot start a new present thread while the queue is still
+        // being drained and the shared FG state below is being reset.
     }
     // REV3: a failure belongs to the stream that had it. Never reset, it ended
     // every later bridge thread at its first hand-over, silently.
@@ -22522,13 +23128,16 @@ void fg_present_stop()
                         if (wr != WAIT_OBJECT_0 && SUCCEEDED(dev->GetDeviceRemovedReason()))
                             wr = WaitForSingleObject(ev, 8000);
                         drained = (wr == WAIT_OBJECT_0);
+                        // SF1 (rule 3): an event the driver may still set stays open.
+                        if (mgpu::gpusafe::may_close_event(drained, FAILED(dev->GetDeviceRemovedReason())))
+                            CloseHandle(ev);
                     }
-                    CloseHandle(ev);
+                    else CloseHandle(ev);
                 }
             }
         }
-        if (df != nullptr) df->Release();
         if (!drained && FAILED(dev->GetDeviceRemovedReason())) drained = true;
+        if (df != nullptr && drained) df->Release();   // SF1: else kept - the queue may still signal it
     }
     {
         std::lock_guard<std::mutex> lk(g_fgp_mx);
@@ -22556,8 +23165,14 @@ void fg_present_stop()
     g_fgp_dropped_jobs.store(0ull, std::memory_order_relaxed);
     g_fgp_dropped_frames.store(0ull, std::memory_order_relaxed);
     g_fg_last.QuadPart = 0;
-    g_fg_ema_ms = 0.0;
+    g_fg_ema_ms.store(0.0, std::memory_order_relaxed);
     g_fg_real_us.store(0, std::memory_order_relaxed);
+    // LR104: the slot reopens only now, at the end of the whole stop (also a
+    // stop that found no thread: it ran the same cleanup).
+    {
+        std::lock_guard<std::mutex> lk(g_fgp_mx);
+        mgpu::thlife::stop_done(g_fgp_life, t == nullptr || joined);
+    }
 }
 
 // Generated frames per second for the HUD, sampled at most four times a second.
@@ -22780,6 +23395,9 @@ static void fg_mode_set(int mode)
 {
     if (mode < 0) mode = 0;
     if (mode > 4) mode = 4;
+#ifdef MGPU_PRODUCTION
+    if (mode == 2) mode = 1;   // MV1: motion view is a diagnostic-build tool - the built-in generator instead
+#endif
     {
         stream_state &s = str();
         std::lock_guard<std::mutex> lk(s.cs);
@@ -23072,7 +23690,12 @@ void stream_request()
             s.ll_on         = (unsigned)ini_read_sr_int("LateLatch", 0, 0, 1);
             s.ll_age        = (unsigned)ini_read_sr_int("LateLatchAge", 2, 0, 4);
             s.stage_on      = (unsigned)ini_read_sr_int("StageCopy", 0, 0, 1);   // OPT5
+            s.rs_on         = (unsigned)ini_read_sr_int("LiveResize", 1, 0, 1); // LR1 (LR97)
+            s.rs_room       = (unsigned)ini_read_sr_int("ResizeRoom", 1, 0, 1); // LR1
             s.fg_on         = (unsigned)ini_read_sr_int("FrameGen", 0, 0, 4);    // FG1: 2 = motion view, 3 = AMD FSR 3, 4 = NVIDIA DLSS FG
+#ifdef MGPU_PRODUCTION
+            if (s.fg_on == 2u) s.fg_on = 1u;   // MV1: no motion view in the release build (FrameGen=2 left in an old mgpu.ini)
+#endif
             s.fg_invert     = (unsigned)ini_read_sr_int("FGInvertMV", 0, 0, 1);  // FG1
             s.fg_hudfix     = (unsigned)ini_read_sr_int("FGHudFix", 1, 0, 1);    // FG3
             s.fg_mult       = (unsigned)ini_read_sr_int("FGMultiplier", 2, 2, 6); // DLSSG2/MFG6: FrameGen=4 only
@@ -23186,6 +23809,7 @@ void stream_request()
             g_sm_sens.store(ini_read_sr_int("SRDynSmooth", 2, 0, 3));          // SM1
             g_dr_aggr.store(ini_read_sr_int("SRDynAggressive", 0, 0, 1));      // DR6
             g_dr_late.store(ini_read_sr_int("SRDynLatePairs", 1, 0, 1));      // DR5
+            g_dr_budget.store(ini_read_sr_int("SRDynBudgetMs", 0, 0, 50));     // NB1
             g_dr_pct_x10.store((int)s.sr_scale_pct * 10);                  // starts at SRScale
             g_rs_recon.store(ini_read_sr_int("SRRecon", 1, 0, 1));          // RS1
             g_rs_down.store(ini_read_sr_int("SRDownFilter", 0, 0, 2));
@@ -23290,7 +23914,10 @@ void stream_request()
     }
     s.preset = ini_read_preset();
     s.window_mode = ini_read_window_mode();
-    s.drain_on = ini_read_sr_int("DrainGpu0", 1, 0, 1) != 0;   // R275: absent = on; 0 is written by the add-on itself after a stalled drain
+    // R275: absent = on. SF2: never written by the add-on any more; 0 (by hand,
+    // or left by an older build) only skips the WAIT - teardown still keeps
+    // gxfer if the game's queue had not finished with it.
+    s.drain_on = ini_read_sr_int("DrainGpu0", 1, 0, 1) != 0;
     {
         char buf[INI_BYTES];
         const bool have = ini_slurp(buf, sizeof buf);
@@ -23499,6 +24126,125 @@ static ID3D12Resource *g0_dst(stream_state &s)
     return (s.stage_on != 0u && s.gstage != nullptr) ? s.gstage : s.gxfer;
 }
 
+// ---- LR1 (LR97): helpers for following a vector / depth change ----
+//
+// The copyable bytes of `like` reshaped to w x h in format f - subresource 0,
+// the way the arm measures every region. 0 when the driver calls the shape
+// invalid (GetCopyableFootprints answers UINT64_MAX then).
+static UINT64 rs_footprint_bytes(ID3D12Device *dev, D3D12_RESOURCE_DESC like, UINT w, UINT h, DXGI_FORMAT f)
+{
+    if (dev == nullptr || w == 0u || h == 0u) return 0ull;
+    if (f != like.Format)   // a colour format cannot carry the depth flag
+        like.Flags = (D3D12_RESOURCE_FLAGS)(like.Flags & ~(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                                             D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE));
+    like.Width = w; like.Height = h; like.Format = f;
+    like.Alignment = 0; like.MipLevels = 1; like.DepthOrArraySize = 1;
+    UINT64 total = 0;
+    dev->GetCopyableFootprints(&like, 0, 1, 0, nullptr, nullptr, nullptr, &total);
+    return (total == UINT64_MAX) ? 0ull : total;
+}
+
+// StageCopy=1: the regions of a slot the staging copy moves - only what GPU 1
+// reads (seal + colour, the depth and vector bytes in use, the HUD-less copy),
+// never the room behind them. Before LR1 this was the whole slot in one copy;
+// with no room in the slot the ranges are the same bytes less the 512-byte
+// alignment gaps.
+static unsigned rs_stage_ranges(const stream_state &s, mgpu::live_resize::range r[4])
+{
+    return mgpu::live_resize::slot_ranges(SEAL_STRIDE + s.payload_bytes,
+                                          s.depth_off, s.depth_bytes,
+                                          s.mvec_off, s.mvec_bytes2,
+                                          s.hud_off, (s.hud_off != 0) ? s.payload_bytes : 0ull, r);
+}
+static UINT64 rs_stage_bytes(const stream_state &s)
+{
+    mgpu::live_resize::range r[4];
+    const unsigned n = rs_stage_ranges(s, r);
+    UINT64 t = 0;
+    for (unsigned i = 0; i < n; ++i) t += r[i].len;
+    return t;
+}
+// Records staging slot k -> gxfer slot k into the OPEN list `cl` (the caller
+// closes it), with the DMA timing marks when that heap exists.
+static void rs_stage_record(stream_state &s, ID3D12GraphicsCommandList *cl, unsigned k)
+{
+    const UINT64 off = (UINT64)k * s.slot_bytes;
+    mgpu::live_resize::range r[4];
+    const unsigned n = rs_stage_ranges(s, r);
+    if (s.g0cts != nullptr)
+        cl->EndQuery(s.g0cts, D3D12_QUERY_TYPE_TIMESTAMP, k * 2u);
+    for (unsigned i = 0; i < n; ++i)
+        cl->CopyBufferRegion(s.gxfer, off + r[i].off, s.gstage, off + r[i].off, r[i].len);
+    if (s.g0cts != nullptr)
+    {
+        cl->EndQuery(s.g0cts, D3D12_QUERY_TYPE_TIMESTAMP, k * 2u + 1u);
+        cl->ResolveQueryData(s.g0cts, D3D12_QUERY_TYPE_TIMESTAMP, k * 2u, 2,
+                             s.g0tsrb, (UINT64)k * 48ull + 32ull);
+    }
+}
+
+// Game thread: the copy refused `d` - vectors (stream_mvec_copy, mvec_cs held)
+// or depth (stream_on_finish_effects, cs held). Follows it and, once it is a
+// real change that can be followed, posts it for the bridge (rs_poll). Writes
+// no log line: this is the game's render thread, mid-scene for the vectors.
+// The bridge reads rs_*_held and says what happened.
+static void rs_follow(stream_state &s, bool depth, const D3D12_RESOURCE_DESC &d)
+{
+    namespace lr = mgpu::live_resize;
+    if (s.gdev == nullptr) return;
+    lr::follower &fol = depth ? s.rs_d_fol : s.rs_mv_fol;
+    stream_state::rs_req_t &rq = depth ? s.rs_req_d : s.rs_req_mv;
+    std::atomic<int> &held = depth ? s.rs_d_held : s.rs_mv_held;
+    lr::shape got;
+    got.w = (unsigned)d.Width; got.h = (unsigned)d.Height; got.fmt = (unsigned)d.Format;
+    auto publish = [&](int why) {
+        (depth ? s.rs_d_hw : s.rs_mv_hw).store(got.w, std::memory_order_relaxed);
+        (depth ? s.rs_d_hh : s.rs_mv_hh).store(got.h, std::memory_order_relaxed);
+        (depth ? s.rs_d_hf : s.rs_mv_hf).store(got.fmt, std::memory_order_relaxed);
+        held.store(why, std::memory_order_release);
+    };
+    if (rq.on)
+    {
+        if (lr::same(rq.sh, got)) return;                 // posted; the bridge has not applied it yet
+        rq.on = false;                                    // the game moved on: withdrawn, followed afresh
+    }
+    if (lr::is_held(fol, got)) { if (held.load(std::memory_order_relaxed) == 0) publish(fol.held_why); return; }
+    const unsigned n = lr::refused(fol, got, s.produced_a.load(std::memory_order_acquire));
+    if (n < lr::NEED_FRAMES) return;
+    if (s.rs_on == 0u) { lr::hold(fol, got, lr::held_off); publish(lr::held_off); return; }
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1u)
+    { lr::hold(fol, got, lr::held_shape); publish(lr::held_shape); return; }
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT rows = 0; UINT64 rowb = 0, bytes = 0;
+    s.gdev->GetCopyableFootprints(&d, 0, 1, 0, &fp, &rows, &rowb, &bytes);
+    if (bytes == UINT64_MAX) bytes = 0;
+    // LR98: depth follows size only; vectors change format only between the
+    // plain float formats; a planar format (footprint != resource format) never.
+    const bool fmt_ok = lr::format_ok(depth, depth ? s.depth_format : s.mvec_format,
+                                      got.fmt, (unsigned)fp.Footprint.Format);
+    const lr::step st = lr::decide(n, lr::same_aspect(got.w, got.h, s.width, s.height),
+                                   bytes, depth ? s.depth_cap : s.mvec_cap, fmt_ok);
+    if (st == lr::step::post)
+    {
+        rq.on = true; rq.sh = got; rq.fp = fp; rq.bytes = bytes;
+        held.store(lr::held_none, std::memory_order_relaxed);
+        s.rs_pending.store(true, std::memory_order_release);
+    }
+    else if (st == lr::step::refuse_big)   { lr::hold(fol, got, lr::held_too_big); publish(lr::held_too_big); }
+    else if (st == lr::step::refuse_shape) { lr::hold(fol, got, lr::held_shape);   publish(lr::held_shape); }
+    else if (st == lr::step::refuse_format) { lr::hold(fol, got, lr::held_format); publish(lr::held_format); }
+}
+
+// The copy took the lane's own shape: anything followed was a passing thing,
+// and a posted change the bridge has not applied yet is withdrawn.
+static void rs_accepted(stream_state &s, bool depth)
+{
+    mgpu::live_resize::accepted(depth ? s.rs_d_fol : s.rs_mv_fol);
+    (depth ? s.rs_req_d : s.rs_req_mv).on = false;
+    std::atomic<int> &held = depth ? s.rs_d_held : s.rs_mv_held;
+    if (held.load(std::memory_order_relaxed) != 0) held.store(0, std::memory_order_relaxed);
+}
+
 // A timestamp mark on the GAME's queue, slot-relative. q: 0/1 finish copies,
 // 2/3 MVec copy. Resolved by the caller with g0_ts_resolve after the end mark.
 static void g0_ts_mark(stream_state &s, ID3D12GraphicsCommandList *gl, unsigned slot, unsigned q)
@@ -23587,7 +24333,16 @@ static void g0_signal(stream_state &s, ID3D12CommandQueue *gq, unsigned long lon
         s.stage_last = f;
         return;
     }
-    if (FAILED(s.g0cq->Wait(s.g0sf, f))) ++s.stage_fail;   // SAFE1-lite: counted (summary line)
+    if (FAILED(s.g0cq->Wait(s.g0sf, f)))
+    {
+        // SF1 (rule 1): the copies read gstage, which the game's queue writes up
+        // to g0sf=f. Without that Wait they would run unordered against it. Not
+        // submitted - handled exactly like the failed g0sf Signal above.
+        ++s.stage_fail;
+        if (SUCCEEDED(gq->Signal(s.gfence, f))) s.gsignaled = f;
+        s.stage_last = f;
+        return;
+    }
     ID3D12CommandList *ls[stream_state::RING];
     UINT n = 0;
     for (unsigned long long k = from; k <= f; ++k)
@@ -23696,22 +24451,16 @@ static void g0_stage_create(stream_state &s, ID3D12Device *gdev, ID3D12CommandQu
         }
     }
 
-    // The RING prerecorded lists: stage slot k -> gxfer slot k, whole slot.
+    // The RING prerecorded lists: stage slot k -> gxfer slot k. LR1 (LR97):
+    // only the regions GPU 1 reads (rs_stage_record), not the whole slot - the
+    // slot now has room behind depth and the vectors, and copying it would move
+    // unused bytes over PCIe every frame. Re-recorded when a lane changes size.
     for (unsigned k = 0; k < stream_state::RING && SUCCEEDED(h); ++k)
     {
         h = gdev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, s.g0ca, nullptr,
                                     IID_PPV_ARGS(&s.g0cl[k]));
         if (FAILED(h)) break;
-        const UINT64 off = (UINT64)k * s.slot_bytes;
-        if (s.g0cts != nullptr)
-            s.g0cl[k]->EndQuery(s.g0cts, D3D12_QUERY_TYPE_TIMESTAMP, k * 2u);
-        s.g0cl[k]->CopyBufferRegion(s.gxfer, off, s.gstage, off, s.slot_bytes);
-        if (s.g0cts != nullptr)
-        {
-            s.g0cl[k]->EndQuery(s.g0cts, D3D12_QUERY_TYPE_TIMESTAMP, k * 2u + 1u);
-            s.g0cl[k]->ResolveQueryData(s.g0cts, D3D12_QUERY_TYPE_TIMESTAMP, k * 2u, 2,
-                                        s.g0tsrb, (UINT64)k * 48ull + 32ull);
-        }
+        rs_stage_record(s, s.g0cl[k], k);
         h = s.g0cl[k]->Close();
     }
 
@@ -23735,11 +24484,13 @@ static void g0_stage_create(stream_state &s, ID3D12Device *gdev, ID3D12CommandQu
 
     snprintf(line, sizeof line,
              "[MGPU][OPT5] StageCopy=1 UP: %llu-byte VRAM staging ring on GPU 0, a GPU 0 COPY "
-             "queue with %u prerecorded slot copies (%llu bytes each), DMA timing %s. The game's "
+             "queue with %u prerecorded slot copies (%llu bytes each of a %llu-byte slot - LR1: "
+             "only what GPU 1 reads), DMA timing %s. The game's "
              "list now copies VRAM to VRAM and the PCIe transfer runs on the DMA engine. Compare "
              "'GPU0 in-frame copies' in [MGPU][OPT] against a StageCopy=0 run.",
              (unsigned long long)heap_bytes, stream_state::RING,
-             (unsigned long long)s.slot_bytes, s.g0cts ? "ON" : "OFF");
+             (unsigned long long)rs_stage_bytes(s), (unsigned long long)s.slot_bytes,
+             s.g0cts ? "ON" : "OFF");
     mgpu::diag::info(line);
 }
 
@@ -23764,6 +24515,7 @@ static void g0_stage_create(stream_state &s, ID3D12Device *gdev, ID3D12CommandQu
 // is why this is safe to try rather than safe to assume.
 void stream_on_present(void *cmd_queue_v)
 {
+    mgpu::cpuprof::scope cp_gp(mgpu::cpuprof::GAME_PRESENT);   // CP1 (lock wait included: it is the game's time)
     stream_state &s = str();   // str(), not st() - st() is the capture state
     std::lock_guard<std::mutex> lk(s.cs);
 
@@ -23971,6 +24723,7 @@ namespace reflex
     static IUnknown *dev_held = nullptr;
     static pfn_set   p_set_held = nullptr;
     static pfn_unload p_unload_held = nullptr;
+    void *held_device() { return (void *)dev_held; }   // XT1 (IN85, log only)
 
     // ---- V43: UNDO A PREVIOUS PROCESS'S WRITE ----
     //
@@ -24615,9 +25368,23 @@ int ui_bs_dr_start(int pct)
     g_dr_reset_seq.fetch_add(1u, std::memory_order_release);
     return v / 10;
 }
+// NB2: a sweep step's NR time budget, without writing mgpu.ini. -1 puts the
+// setting back. Sweep worker thread only (the saved value is not shared).
+static int g_bs_bud_saved = -1;
+void ui_bs_budget(int ms)
+{
+    if (ms < 0)
+    {
+        if (g_bs_bud_saved >= 0) { g_dr_budget.store(g_bs_bud_saved); g_bs_bud_saved = -1; }
+        return;
+    }
+    if (g_bs_bud_saved < 0) g_bs_bud_saved = g_dr_budget.load();
+    g_dr_budget.store(ms > 50 ? 50 : ms);
+}
 void ui_bs_end()
 {
     (void)ui_bs_hold_nr(0);   // BM5
+    ui_bs_budget(-1);         // NB2
     if (g_bs_on.exchange(0) == 0) return;
     g_bs_cap.store(0);
     // -1 = read again from mgpu.ini on next use; the sweep never wrote these.
@@ -24693,6 +25460,18 @@ void ui_set_dr_on(bool on)
 }
 int  ui_dr_min()          { return g_dr_min.load(); }
 void ui_set_dr_min(int v) { if (v < 33) v = 33; if (v > 90) v = 90; g_dr_min.store(v); (void)ui_ini_write("SRDynMin", v); }
+// NB1: NR time budget (ms, 0 = off) and the measured times, for the panel.
+int  ui_dr_budget() { return g_dr_budget.load(); }
+void ui_set_dr_budget(int v) { if (v < 0) v = 0; if (v > 50) v = 50; g_dr_budget.store(v); (void)ui_ini_write("SRDynBudgetMs", v); }
+float ui_nb_nr_ms() { return (float)g_nb_nr_ms.load(std::memory_order_relaxed); }
+float ui_nb_fg_ms() { return (float)g_nb_fg_ms.load(std::memory_order_relaxed); }
+// NB3: running totals (microseconds, list counts) for exact per-step means, and
+// whether the budget can be measured at all on this run.
+void ui_nb_totals(unsigned long long *nr_us, unsigned long long *nr_n, unsigned long long *fg_us, unsigned long long *fg_n)
+{
+    *nr_us = g_nb_tot_nr_us.load(); *nr_n = g_nb_tot_nr_n.load();
+    *fg_us = g_nb_tot_fg_us.load(); *fg_n = g_nb_tot_fg_n.load();
+}
 int  ui_dr_max()          { return g_dr_max.load(); }
 void ui_set_dr_max(int v) { if (v < 33) v = 33; if (v > 90) v = 90; g_dr_max.store(v); (void)ui_ini_write("SRDynMax", v); }
 float ui_dr_now()         { return (float)g_dr_pct_x10.load() / 10.0f; }
@@ -24759,7 +25538,14 @@ static void dr_parts(LONGLONG now, LONGLONG freq, double out, bool amd, char *bu
     char u[48] = "";
     const int ut = g_nvx_util_in.load(std::memory_order_relaxed);
     if (ut >= 0) snprintf(u, sizeof u, "%sdriver-busy %d%%", (q[0] || a[0]) ? "; " : "", ut);
-    if (q[0] || a[0] || u[0]) snprintf(buf, n, " | parts: %s%s%s", q, a, u);
+    char nb[200] = "";   // NB1 / NB3
+    const double nrm = g_nb_nr_ms.load(std::memory_order_relaxed), fgm = g_nb_fg_ms.load(std::memory_order_relaxed);
+    if (nrm >= 0.0 || fgm >= 0.0)
+        snprintf(nb, sizeof nb, "%sNR %.2f ms, FG stage GPU %.2f ms per real frame (timing samples so far: %llu from "
+                 "an earlier scale dropped, %llu unusable)", (q[0] || a[0] || u[0]) ? "; " : "",
+                 nrm >= 0.0 ? nrm : 0.0, fgm >= 0.0 ? fgm : 0.0,
+                 g_nb_stale.load(std::memory_order_relaxed), g_nb_missing.load(std::memory_order_relaxed));
+    if (q[0] || a[0] || u[0] || nb[0]) snprintf(buf, n, " | parts: %s%s%s%s", q, a, u, nb);
 }
 
 // DR5: late frame pairs. The present thread counts the hitches where it sat
@@ -24877,8 +25663,8 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
     const double helped_by = amd ? 0.01 : 0.02;
     const char *mode = amd ? (aggr ? " [AMD, aggressive]" : " [AMD]") : (aggr ? " [aggressive]" : "");
     static LONGLONG sm_said_at = 0;
-    char l[900];
-    char parts[400];
+    char l[1300];
+    char parts[640];
     dr_parts(now, freq, out, amd, parts, sizeof parts);   // DR8: every window, so the deltas stay per window
 
     // A new multiplier or Limiter is a new situation: forget the verdict.
@@ -24970,6 +25756,44 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
         }
     }
 
+    // ---- NB1: NR's own GPU time against a ceiling ----
+    //
+    // A hard limit the user set, so it applies whatever the other measures say
+    // (and whether or not NR has been judged "not the bottleneck"). NR's cost
+    // follows the pixel count, about the square of the scale, which sizes the
+    // step - bounded to 2-6 points so the picture never jumps. 4 s between
+    // budget moves; a step up must leave 10% of the budget spare (hysteresis).
+    const int bud = g_dr_budget.load();
+    double nb_avg = -1.0; unsigned nb_n = 0;
+    if (bud > 0) nb_take(cur, &nb_avg, &nb_n);
+    static LONGLONG nb_moved = 0, nb_said = 0;
+    const mgpu::nb::step bst = mgpu::nb::budget_step(cur, lo, nb_avg, nb_n, bud,
+                                                     nb_moved == 0 || now - nb_moved >= freq * 4);
+    if (bst.next < cur)
+    {
+        const int nx = bst.next;
+        snprintf(l, sizeof l, "[MGPU][NB1] neural resolution %.1f%% -> %.1f%%: NR took %.2f ms per real frame "
+                 "(%u frames recorded at %.1f%%), over its %d ms budget (SRDynBudgetMs).%s",
+                 cur / 10.0, nx / 10.0, nb_avg, nb_n, cur / 10.0, bud, parts);
+        mgpu::diag::info(l);
+        g_dr_pct_x10.store(nx);
+        nb_moved = now;
+        up_at = now + freq * 8;
+        last_down = now;
+        dr5_tick(now, freq, true);
+        return true;
+    }
+    if (bst.at_floor && (nb_said == 0 || now - nb_said > freq * 60))
+    {
+        nb_said = now;
+        snprintf(l, sizeof l, "[MGPU][NB1] NR takes %.2f ms per real frame at the lowest scale (%.1f%%, "
+                 "SRDynMin) - still over its %d ms budget. Lower SRDynMin, raise the budget, or lower the "
+                 "Limiter.", nb_avg, cur / 10.0, bud);
+        mgpu::diag::warn(l);
+    }
+    // A step up needs a reading that leaves room at the next scale.
+    const bool nb_room = mgpu::nb::room_up(cur, 20, nb_avg, nb_n, bud);
+
     int next = cur;
     bool reduction = false, by_spacing = false, by_late = false;
     const char *why = "";
@@ -25051,7 +25875,8 @@ static bool dr_on_window(LONGLONG now, LONGLONG freq, double out, double expct, 
         {
             next = cur - step_s; why = "early warning: neural card nearly full"; hot = 0;
         }
-        else if (ratio >= up_ratio && (steady || !sp_counts) && now >= up_at && (busy < 0.0 || busy < up_busy))
+        else if (ratio >= up_ratio && (steady || !sp_counts) && now >= up_at && (busy < 0.0 || busy < up_busy) &&
+                 nb_room)   // NB1
         {
             if (late_ok) next = cur + 20;
             else if (cur < hi && (late_said_at == 0 || now - late_said_at > freq * 60))
@@ -25584,12 +26409,23 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                               unsigned long long depth_handle,
                               unsigned long long mvec_handle)
 {
+    // CP1: the game's queue and the picture's runtime are counted apart, and
+    // the Limiter's deliberate wait is paused out (it is reported on its own).
+    const bool cp_game_q = cmd_queue_v != nullptr && cmd_queue_v == g_tf_game_queue.load(std::memory_order_relaxed);
+    mgpu::cpuprof::scope cp_gf(cp_game_q ? mgpu::cpuprof::GAME_FINISH : mgpu::cpuprof::PICTURE_FINISH);
     // R246: counted before anything else, armed or not - the deferred startup
     // probe waits on this.
     g_game_effects_frames.fetch_add(1, std::memory_order_relaxed);
     // TF1: the frame cap and the real-fps measurement, on the game's queue only.
-    if (cmd_queue_v != nullptr && cmd_queue_v == g_tf_game_queue.load(std::memory_order_relaxed))
-        tf_game_frame();
+    if (cp_game_q)
+    {
+        cp_gf.pause();
+        {
+            mgpu::cpuprof::scope cp_lim(mgpu::cpuprof::LIMITER_WAIT);
+            tf_game_frame();
+        }
+        cp_gf.resume();
+    }
     // ---- REFLEX, BEFORE ANY LOCK, ON THE GAME'S OWN RENDER THREAD ----
     //
     // The first attempt put this in stream_on_present and it crashed on arm.
@@ -25860,7 +26696,11 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // none of them (a title without DLSS: learning on, as before).
         if (!s.learn_decided)
         {
-            const bool candidate = !ini_has_key("MVecTap") && ui_ini_read("MVecLearned", -1) < 0 && s.mvec_mode == 3;
+            // AU2: the MVecTap key is looked up once per arm, not on every game
+            // frame of the (up to 25 s) hold - this runs on the game's render
+            // thread holding s.cs, where nothing may touch the disk.
+            if (s.learn_tapkey < 0) s.learn_tapkey = ini_has_key("MVecTap") ? 1 : 0;
+            const bool candidate = s.learn_tapkey == 0 && ui_ini_read("MVecLearned", -1) < 0 && s.mvec_mode == 3;
             const bool contract  = game_contract_seen() || mgpu::calibrator::scene_captures() != 0ull;
             bool auto_learn = false;
             if (candidate && !contract)
@@ -25919,8 +26759,27 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             s.mvec_mode = 1;
         }
         const bool can_tap = (tap_k == 1 || tap_k == 2) || learnable;   // R277: 2 is the D3D12 tap with the common assumption
+        // NG1. REPORTED 2026-11-17 (Shadow of the Tomb Raider, IN29): the
+        // stream armed in the menu, 0.1 s before the game started its DLSS,
+        // and this branch gave up at once ("never initialised NGX") - the run
+        // then had no motion vectors and frame generation made nothing. The
+        // first-launch grace (LEARN1) did not apply because MVecLearned was
+        // already in mgpu.ini. Give the game the same 25 s to start DLSS
+        // before deciding it never will.
+        bool ng1_wait = false;
+        if (s.mvec_mode == 3 && mvec_handle == 0 && !mgpu::calibrator::game_ngx_init_seen() && !can_tap)
+        {
+            const unsigned long long now = GetTickCount64();
+            if (s.nc_t0 == 0)
+            {
+                s.nc_t0 = now;
+                mgpu::diag::info("[MGPU][NG1] no DLSS from the game yet: waiting up to 25 s for it before using "
+                                 "the synthetic field. The bridge arm holds meanwhile.");
+            }
+            ng1_wait = (now - s.nc_t0) < 25000ull;
+        }
         if (s.mvec_mode == 3 && mvec_handle == 0 && g_no_real_vectors.load(std::memory_order_acquire) &&
-            (s.mvec_arm_waits >= s.mvec_hold || (!mgpu::calibrator::game_ngx_init_seen() && !can_tap)))
+            (s.mvec_arm_waits >= s.mvec_hold || (!mgpu::calibrator::game_ngx_init_seen() && !can_tap && !ng1_wait)))
         {
             // R234 (was R227 at the request): a path that said it has no real
             // vectors, and none arrived within the hold. Synthetic from here.
@@ -26087,8 +26946,20 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             UINT drows = 0; UINT64 drowb = 0;
             gdev->GetCopyableFootprints(&dd, 0, 1, 0, &s.depth_fp,
                                         &drows, &drowb, &s.depth_bytes);
+            // LR1 (LR97): the region's ROOM. The same format at the picture's
+            // size (the larger per axis), so a render size that grows later -
+            // a DLSS quality step up, DLAA - still fits. Only the bytes in use
+            // are ever copied (rs_stage_record), so the room is memory, not bus.
+            s.depth_cap = s.depth_bytes;
+            if (s.rs_on != 0u && s.rs_room != 0u)
+            {
+                unsigned rw = 0, rh = 0;
+                mgpu::live_resize::room_dims(s.depth_w, s.depth_h, s.width, s.height, rw, rh);
+                const UINT64 rb = rs_footprint_bytes(gdev, dd, rw, rh, dd.Format);
+                if (rb > s.depth_cap) s.depth_cap = rb;
+            }
             s.depth_off = ((slot_end + SEAL_STRIDE - 1) / SEAL_STRIDE) * SEAL_STRIDE;
-            slot_end = s.depth_off + s.depth_bytes;
+            slot_end = s.depth_off + s.depth_cap;
         }
 
         // ---- R78: the MVec region, on its own 512 boundary after depth ----
@@ -26111,8 +26982,21 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             UINT mrows2 = 0; UINT64 mrowb2 = 0;
             gdev->GetCopyableFootprints(&md2, 0, 1, 0, &s.mvec_fp2,
                                         &mrows2, &mrowb2, &s.mvec_bytes2);
+            // LR1 (LR97): room for the vectors at the picture's size AND at 8
+            // bytes a pixel (RGBA16F), the largest format seen: Cyberpunk moves
+            // between RGBA16F and RG16F when the DLSS model changes.
+            s.mvec_cap = s.mvec_bytes2;
+            if (s.rs_on != 0u && s.rs_room != 0u)
+            {
+                unsigned rw = 0, rh = 0;
+                mgpu::live_resize::room_dims(s.mvec_w, s.mvec_h, s.width, s.height, rw, rh);
+                UINT64 rb = rs_footprint_bytes(gdev, md2, rw, rh, md2.Format);
+                const UINT64 rb8 = rs_footprint_bytes(gdev, md2, rw, rh, DXGI_FORMAT_R16G16B16A16_FLOAT);
+                if (rb8 > rb) rb = rb8;
+                if (rb > s.mvec_cap) s.mvec_cap = rb;
+            }
             s.mvec_off = ((slot_end + SEAL_STRIDE - 1) / SEAL_STRIDE) * SEAL_STRIDE;
-            slot_end = s.mvec_off + s.mvec_bytes2;
+            slot_end = s.mvec_off + s.mvec_cap;
         }
 
         // HL1: the HUD-less region - same size and footprint as the colour
@@ -26259,12 +27143,15 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                                   D3D12_HEAP_TYPE_READBACK, &s.tsread);
                 if (SUCCEEDED(th)) th = s.nq->GetTimestampFrequency(&s.ts_freq);
                 s.ts_ok = SUCCEEDED(th) && s.ts_freq > 0;
-                if (s.ts_ok && ui_ini_read("GpuBudget", 1) != 0)   // GB1
+                // GB1 / NB3: the heap is made whenever timestamps work - NR's own
+                // time feeds the NR time budget (SRDynBudgetMs), which can be
+                // switched on live. GpuBudget=0 only silences the GB1/GB4 lines.
+                if (s.ts_ok)
                 {
                     D3D12_QUERY_HEAP_DESC gq{};
-                    gq.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; gq.Count = 5; gq.NodeMask = 0;   // GB4: + 3 in the unpack
+                    gq.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; gq.Count = 8; gq.NodeMask = 0;   // GB4: + 3 in the unpack; NB1: + 3 (NR alone, FG stage)
                     if (FAILED(ndev->CreateQueryHeap(&gq, IID_PPV_ARGS(&s.gb_heap))) ||
-                        FAILED(make_buf(ndev, 40, D3D12_HEAP_TYPE_READBACK, &s.gb_read)))
+                        FAILED(make_buf(ndev, 64, D3D12_HEAP_TYPE_READBACK, &s.gb_read)))
                     {
                         if (s.gb_heap != nullptr) { s.gb_heap->Release(); s.gb_heap = nullptr; }
                         if (s.gb_read != nullptr) { s.gb_read->Release(); s.gb_read = nullptr; }
@@ -26451,6 +27338,27 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             mgpu::diag::info(ml);
         }
 
+        // LR1 (LR97): what a change of the vectors or depth can grow into
+        // without a restart. Said once, release logs too.
+        {
+            char rl[700];
+            const unsigned long long extra =
+                (unsigned long long)((s.depth_cap - s.depth_bytes) + (s.mvec_cap - s.mvec_bytes2)) *
+                (unsigned long long)stream_state::RING;
+            snprintf(rl, sizeof rl,
+                     "[MGPU][LR1] live resize %s (LiveResize=%u, ResizeRoom=%u): depth region %llu bytes "
+                     "(%llu in use), vectors region %llu bytes (%llu in use). A DLSS quality or model "
+                     "change in play is followed when it fits; the room costs %.1f MB of shared system "
+                     "memory%s and no bus time (only the bytes in use are copied).",
+                     s.rs_on ? "ON" : "OFF - a vector or depth change needs a restart (IN96 behaviour)",
+                     s.rs_on, s.rs_room,
+                     (unsigned long long)s.depth_cap, (unsigned long long)s.depth_bytes,
+                     (unsigned long long)s.mvec_cap, (unsigned long long)s.mvec_bytes2,
+                     (double)extra / (1024.0 * 1024.0),
+                     s.stage_on ? " and the same again in the render card's staging VRAM" : "");
+            mgpu::diag::info(rl);
+        }
+
         // OPT5. Never fails the arm; turns StageCopy off on its own failure.
         if (SUCCEEDED(h)) g0_stage_create(s, gdev, gq, heap_bytes);
 
@@ -26463,6 +27371,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             return;
         }
         s.armed = true;
+        ex_session_begin();   // EX1 (IN90): a new session - the closing latch starts over
         // R278: the vector learning runs once per title. Only with the tap on
         // (MVecTap, off by default) and no MVecLearned yet; learned titles skip
         // R258 altogether (no probes, no readbacks).
@@ -26501,6 +27410,9 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                 if (sx != 0.0f)
                 {
                     s.mvec_scale_x = (float)gx * sx; s.mvec_scale_y = (float)gy * sy; s.mvec_dirty = true;
+                    // LR1 (LR97): 'px' is the only unit whose scale depends on
+                    // the vectors' size - remembered so a size change re-derives it.
+                    s.rs_scale_px = (_stricmp(un, "px") == 0); s.rs_px_gx = gx; s.rs_px_gy = gy;
                     char ul[260];
                     if (x_on && tk == 0)
                         snprintf(ul, sizeof ul, "[MGPU][R280] vectors from the virtual target: units uv by construction, MVecScaleX=%.2f MVecScaleY=%.2f "
@@ -26539,6 +27451,11 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                      (unsigned long long)s.slot_bytes);
             mgpu::diag::info(hl);
         }
+        // LR1: a new session follows from a clean state.
+        s.rs_mv_fol = mgpu::live_resize::follower{}; s.rs_d_fol = mgpu::live_resize::follower{};
+        s.rs_req_mv = stream_state::rs_req_t{}; s.rs_req_d = stream_state::rs_req_t{};
+        s.rs_pending.store(false); s.rs_mv_held.store(0); s.rs_d_held.store(0);
+        s.rs_hold = false; s.rs_from_f = 0; s.rc1_windows = 0;
         s.mvec_live.store(s.mvec_mode == 3 && s.mvec_bytes2 != 0,
                           std::memory_order_release);
         return;    // record nothing on the arming frame
@@ -26726,6 +27643,44 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // Placed AFTER the produced-count signal and the bound check, so neither
     // changes behaviour, and BEFORE anything touches the game's command list -
     // the whole point is that a strided frame costs the render card nothing.
+    // ---- RC2: THE COLOUR SIZE GUARD ----
+    //
+    // The transfer ring was laid out ONCE, at arm, for the picture's size then
+    // (s.fp). Depth, motion vectors and the HUD-less copy each refuse a source
+    // that no longer matches; the colour copy did not. RoboCop, 2026-11-22: the
+    // game went 1920x1080 -> 2560x1440 and the full-size copy no longer fit its
+    // footprint - an invalid CopyTextureRegion, so D3D12 refused to Close the
+    // game's whole ReShade command list, every frame (1,875 "Failed to close
+    // immediate command list ... E_INVALIDARG"): nothing ReShade recorded ran,
+    // and the picture froze. Now the frame is refused before anything is
+    // recorded - no seal, no copy, produced unchanged - the picture steps aside
+    // so the game's own frames show, and it all comes back by itself if the
+    // size matches again.
+    {
+        const D3D12_RESOURCE_DESC cd0 = src->GetDesc();
+        const bool fits = (UINT)cd0.Width == s.width && cd0.Height == s.height &&
+                          cd0.Format == s.format && cd0.SampleDesc.Count == 1;
+        if (fits != !g_rc2.load(std::memory_order_relaxed))
+        {
+            g_rc2.store(!fits, std::memory_order_relaxed);
+            char rl[520];
+            if (!fits)
+                snprintf(rl, sizeof rl,
+                         "[MGPU][RC2] the game's picture is now %llux%u (format %d) - the stream was started at %ux%u "
+                         "(format %d). Its copy would not fit, so the bridge STOPS COPYING IT (no frame is sent) and "
+                         "the game's own frames are shown. Change back to %ux%u to resume, or restart the game to "
+                         "run the bridge at the new size.",
+                         (unsigned long long)cd0.Width, cd0.Height, (int)cd0.Format, s.width, s.height, (int)s.format,
+                         s.width, s.height);
+            else
+                snprintf(rl, sizeof rl,
+                         "[MGPU][RC2] the game's picture is %ux%u again - the bridge copies it again (%llu frame(s) "
+                         "were refused while it differed).", s.width, s.height, s.color_size_rejects);
+            mgpu::diag::warn(rl);
+        }
+        if (!fits) { ++s.color_size_rejects; return; }
+    }
+
     ++s.game_frames;
     if (s.stride_max != 0)
     {
@@ -26905,11 +27860,13 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                 (unsigned)dd.Format == s.depth_format)
             {
                 depth_ok = true;
+                rs_accepted(s, true);      // LR1 (LR97)
             }
             else
             {
                 ++s.depth_size_rejects;
                 dsrc = nullptr;
+                rs_follow(s, true, dd);    // LR1: a real change is handed to the bridge
             }
         }
 
@@ -27150,8 +28107,10 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
         s.mvec_rej_h.store((unsigned)md.Height, std::memory_order_relaxed);
         s.mvec_rej_fmt.store((unsigned)md.Format, std::memory_order_relaxed);
         ++s.mvec_size_rejects;
+        rs_follow(s, false, md);   // LR1 (LR97): a real change is handed to the bridge
         return;
     }
+    rs_accepted(s, false);         // LR1
 
     // R88: from the atomic mirror. produced is written under cs, which this
     // function no longer holds; a 64-bit read without one is a torn value
@@ -27667,6 +28626,23 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                     }
                     gb_note((double)(tv[2] - tv[0]) * k, nr, sr, post_sr, (double)(tv[4] - tv[3]) * k,
                             (double)(tv[4] - tv[0]) * k, have_sr);
+                    // NB1: NR alone (start of the passes to mark 5) and the frame
+                    // generation stage (marks 6-7), each only when its marks were written.
+                    if (s.gb_x_was != 0u && s.gb_read != nullptr)
+                    {
+                        const UINT64 *gv = nullptr;
+                        D3D12_RANGE gr{40, 64};
+                        if (SUCCEEDED(s.gb_read->Map(0, &gr, (void **)&gv)) && gv != nullptr)
+                        {
+                            // NB3: only marks this list resolved are read; the
+                            // sample carries the scale the list was recorded at.
+                            const mgpu::nb::sample sm = mgpu::nb::read(s.gb_x_was, tv[2], tv[3], tv[4],
+                                                                       gv[5], gv[6], gv[7], k);
+                            nb_note(sm, s.nb_scale_was);
+                            D3D12_RANGE none{0, 0};
+                            s.gb_read->Unmap(0, &none);
+                        }
+                    }
                 }
                 if (sane)
                 {
@@ -27979,15 +28955,19 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
             // Checked against OUR arm-time values, not against the seal's own
             // fields, so a producer and a consumer that disagree report a
             // mismatch instead of quietly agreeing with themselves.
+            // LR1 (LR97): a frame sealed before the bridge followed a change was
+            // built for the old geometry - not a mismatch, and its lane flags
+            // were cleared on purpose (so no flag disagreement either).
+            const bool lr_old = mgpu::live_resize::sealed_before_switch(f, s.rs_from_f);
             if (s.depth_mode != 0)
             {
-                if (got.depth_mode != (unsigned)s.depth_mode ||
+                if (!lr_old && (got.depth_mode != (unsigned)s.depth_mode ||
                     got.depth_offset != s.depth_off ||
                     got.depth_bytes != s.depth_bytes ||
                     got.depth_width != s.depth_w ||
                     got.depth_height != s.depth_h ||
                     got.depth_format != s.depth_format ||
-                    got.depth_pitch != (unsigned)s.depth_fp.Footprint.RowPitch)
+                    got.depth_pitch != (unsigned)s.depth_fp.Footprint.RowPitch))
                 {
                     ++s.depth_contract;
                     snprintf(line, sizeof line,
@@ -28011,7 +28991,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 // The seal crossed the adapter; depth_slot_valid did not. They
                 // describe the same fact by two different routes, so a
                 // disagreement is a real finding rather than a tie to break.
-                if ((got.depth_valid != 0u) != (s.depth_slot_valid[slot] != 0u))
+                if (!lr_old && (got.depth_valid != 0u) != (s.depth_slot_valid[slot] != 0u))
                     ++s.depth_flag_disagree;
 
                 // Periodic, because Frames=0 runs print no summary and a
@@ -28062,13 +29042,13 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
             // seal's own fields, for the reason the depth block above gives.
             if (s.mvec_mode == 3)
             {
-                if (got.mvec_mode != (unsigned)s.mvec_mode ||
+                if (!lr_old && (got.mvec_mode != (unsigned)s.mvec_mode ||
                     got.mvec_offset != s.mvec_off ||
                     got.mvec_bytes != s.mvec_bytes2 ||
                     got.mvec_width != s.mvec_w ||
                     got.mvec_height != s.mvec_h ||
                     got.mvec_format != s.mvec_format ||
-                    got.mvec_pitch != (unsigned)s.mvec_fp2.Footprint.RowPitch)
+                    got.mvec_pitch != (unsigned)s.mvec_fp2.Footprint.RowPitch))
                 {
                     ++s.mvec_contract;
                     snprintf(line, sizeof line,
@@ -28093,7 +29073,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 // fact by two routes, so a disagreement is a finding.
                 // FIX5: compared against the frame tag the copy decision now
                 // uses, so this counts real disagreements and should read 0.
-                if ((got.mvec_valid != 0u) !=
+                if (!lr_old && (got.mvec_valid != 0u) !=
                     (s.mvec_slot_frame[slot].load(std::memory_order_acquire) == f))
                     ++s.mvec_flag_disagree;
 
@@ -28228,7 +29208,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         if (s.sf_bus_last_ms != 0ull && now_bus > s.sf_bus_last_ms &&
                             f > s.sf_bus_last_f)
                             bus_mb_s = (double)(f - s.sf_bus_last_f) *
-                                       (double)s.slot_bytes /
+                                       (double)rs_stage_bytes(s) /   // LR1: the bytes in use, not the slot's room
                                        ((double)(now_bus - s.sf_bus_last_ms) / 1000.0) /
                                        (1024.0 * 1024.0);
                         s.sf_bus_last_f  = f;
@@ -28447,6 +29427,68 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         if (now_copies != s.mvec_copies_last_report)
                             s.mvec_stall_said = false;
 
+                        // RC1: a whole report window (300 frames) with at least
+                        // 30 refusals and at most a handful of copies is a
+                        // resolution change, not a passing glitch. It clears if
+                        // copies come back without refusals (resolution restored).
+                        //
+                        // LR1 (LR97): most such changes are now FOLLOWED live
+                        // (rs_poll) and never reach this line. RC1 is raised only
+                        // for one that cannot be: held (too big for the room, not
+                        // the picture's shape, the rebuild failed, LiveResize=0),
+                        // or still refused after three windows (a shape that never
+                        // settles). It also tells size from format now - the old
+                        // line said "resolution" when only the format had changed.
+                        {
+                            const unsigned long long wr = now_rej - s.mvec_rejects_last_report;
+                            const unsigned long long wc = now_copies - s.mvec_copies_last_report;
+                            if (wr >= 30ull && wc <= wr / 10ull && rw != 0u && rh != 0u)
+                            {
+                                ++s.rc1_windows;
+                                const int held = s.rs_mv_held.load(std::memory_order_acquire);
+                                if (held != 0 || s.rc1_windows >= 3u)
+                                {
+                                    const unsigned rf = s.mvec_rej_fmt.load(std::memory_order_relaxed);
+                                    const bool size_moved = rw != s.mvec_w || rh != s.mvec_h;
+                                    g_rc_kind.store(size_moved ? 1 : 2);
+                                    g_rc_w.store(rw); g_rc_h.store(rh);
+                                    g_rc_aw.store(s.mvec_w); g_rc_ah.store(s.mvec_h);
+                                    if (!g_rc_on.exchange(true))
+                                    {
+                                        const char *why =
+                                            held == mgpu::live_resize::held_too_big ? "it does not fit the room set aside at start (ResizeRoom)"
+                                          : held == mgpu::live_resize::held_shape   ? "it is not the picture's shape"
+                                          : held == mgpu::live_resize::held_failed  ? "the rebuild for it failed"
+                                          : held == mgpu::live_resize::held_off     ? "LiveResize=0"
+                                          : held == mgpu::live_resize::held_format  ? "the neural card cannot take that format"
+                                          : "it never settled on one size";
+                                        char rc[700];
+                                        if (size_moved)
+                                            snprintf(rc, sizeof rc,
+                                                "[MGPU][RC1] THE GAME CHANGED RESOLUTION AFTER THE STREAM STARTED and the bridge "
+                                                "cannot follow it (%s): motion vectors are %ux%u fmt %u in the bridge, the game "
+                                                "now renders %ux%u fmt %u. Frame generation has no motion vectors from here on - "
+                                                "RESTART THE GAME to get it back. Also shown in the panel's Frame Generation section.",
+                                                why, s.mvec_w, s.mvec_h, s.mvec_format, rw, rh, rf);
+                                        else
+                                            snprintf(rc, sizeof rc,
+                                                "[MGPU][RC1] THE GAME CHANGED ITS MOTION-VECTOR FORMAT AFTER THE STREAM STARTED "
+                                                "(same size %ux%u, format %u -> %u) and the bridge cannot follow it (%s). Frame "
+                                                "generation has no motion vectors from here on - RESTART THE GAME to get it back. "
+                                                "Also shown in the panel's Frame Generation section.",
+                                                rw, rh, s.mvec_format, rf, why);
+                                        mgpu::diag::warn(rc);
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                s.rc1_windows = 0;
+                                if (wr == 0ull && wc >= 30ull && !s.rs_broken && g_rc_on.exchange(false))
+                                    mgpu::diag::info("[MGPU][RC1] motion vectors arrive at the size and format the bridge "
+                                                     "expects again (the game went back) - frame generation has them again.");
+                            }
+                        }
                         s.mvec_copies_last_report  = now_copies;
                         s.mvec_rejects_last_report = now_rej;
                     }
@@ -28670,6 +29712,7 @@ static void ll_timer_close()
 static void ll_latch(stream_state &s, unsigned long long f)
 {
     if (s.nfence == nullptr || s.cq == nullptr) return;
+    if (s.rs_hold) return;   // LR1 (LR97): nothing ahead while a change waits for GPU 1 to be idle
     const unsigned long long arrived = (unsigned long long)s.nfence->GetCompletedValue();
 
     // FIX6: the newest arrival, whatever its parity - the copy goes into the
@@ -28752,6 +29795,371 @@ static DWORD ll_wait_and_latch(stream_state &s, std::unique_lock<std::mutex> &lk
     return wr;
 }
 
+// ---- LR1 (LR97): FOLLOW A VECTOR / DEPTH CHANGE WHILE THE GAME RUNS ----
+//
+// The game thread (rs_follow) posts a change once the same new shape has been
+// refused for live_resize::NEED_FRAMES frames and it fits the region's room.
+// Applied HERE, from stream_poll, with cs held and before anything of this
+// poll is submitted - the same safe point the SR rebuild (V27) uses:
+//
+//  1. GPU 1 must be idle at a poll's start. Never waited for: while a change
+//     is pending (rs_hold) the consumer issues no copy ahead of the frame it
+//     evaluates (no f+1 speculation, no late latch), so the copy queue is
+//     empty within a poll or two. Given up after 3 s.
+//  2. GPU 0: with cs AND mvec_cs held the game thread can neither copy nor
+//     seal. The request is read again (the game may have gone back), the
+//     staging copy queue is waited for (bounded, StageCopy=1 only) and its
+//     lists re-recorded for the new byte counts.
+//  3. The lane's geometry changes; every slot's lane flag is cleared, so a
+//     frame sealed before this point goes without that lane once (never with
+//     bytes it would misread); rs_from_f is the first frame with the new shape.
+//  4. GPU 1: the lane's texture pair is made again at the new shape, and what
+//     was sized or created from it is let go so it comes back by itself on
+//     first use (AMD frame generation and its depth resample, NVIDIA frame
+//     generation's feature, the R257/R244/R258 readbacks), SR is rebuilt
+//     through its own staged path (V27, right after this), NR starts a fresh
+//     history. Neural rendering's own feature is sized from the picture only
+//     (DLSSNR.Width/Height) and is NOT touched.
+// A change that cannot be followed is HELD (live_resize.hpp) and RC1 tells the
+// player to restart, as before.
+
+// GPU 0's staging copy queue has finished everything submitted so far. A fence
+// of our own, signalled on that queue and waited at most `ms` - under cs, so
+// the game thread submits nothing meanwhile. On a timeout or a removed device
+// the fence and its event are KEPT (SF1 rule 3: the queue may still signal it).
+// LR98: the format is a single-plane one the device knows (a planar depth-
+// stencil format reports PlaneCount 2 and cannot be one copy destination).
+static bool rs_one_plane(ID3D12Device *dev, unsigned fmt)
+{
+    if (dev == nullptr) return true;   // no GPU 1 textures to make: nothing to check
+    D3D12_FEATURE_DATA_FORMAT_INFO fi{};
+    fi.Format = (DXGI_FORMAT)fmt;
+    if (FAILED(dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &fi, sizeof fi))) return false;
+    return fi.PlaneCount == 1u;
+}
+
+static bool rs_g0_idle(stream_state &s, DWORD ms)
+{
+    if (s.stage_on == 0u || s.g0cq == nullptr) return true;
+    if (s.gdev == nullptr) return false;
+    ID3D12Fence *f = nullptr;
+    if (FAILED(s.gdev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))) || f == nullptr) return false;
+    if (FAILED(s.g0cq->Signal(f, 1))) { f->Release(); return false; }
+    UINT64 v = f->GetCompletedValue();
+    if (v < 1)
+    {
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (ev == nullptr) return false;   // f kept: the queue will signal it
+        if (FAILED(f->SetEventOnCompletion(1, ev))) { CloseHandle(ev); return false; }
+        (void)WaitForSingleObject(ev, ms);
+        v = f->GetCompletedValue();
+        if (v < 1 || v == UINT64_MAX) return false;   // ev and f kept
+        CloseHandle(ev);
+    }
+    if (v == UINT64_MAX || FAILED(s.gdev->GetDeviceRemovedReason())) return false;   // removed: kept
+    f->Release();
+    return true;
+}
+
+// A held shape (too big, not the picture's shape, the rebuild failed, off),
+// said once per shape. Release logs too: it is what tells the player why a
+// restart is still needed.
+static void rs_say_held(stream_state &s)
+{
+    for (int lane = 0; lane < 2; ++lane)
+    {
+        const bool dl = lane == 1;
+        const int why = (dl ? s.rs_d_held : s.rs_mv_held).load(std::memory_order_acquire);
+        if (why == 0) continue;
+        const unsigned w = (dl ? s.rs_d_hw : s.rs_mv_hw).load(std::memory_order_relaxed);
+        const unsigned h = (dl ? s.rs_d_hh : s.rs_mv_hh).load(std::memory_order_relaxed);
+        const unsigned f = (dl ? s.rs_d_hf : s.rs_mv_hf).load(std::memory_order_relaxed);
+        const unsigned long long key = ((unsigned long long)why << 60) ^ ((unsigned long long)w << 36) ^
+                                       ((unsigned long long)h << 16) ^ (unsigned long long)f;
+        unsigned long long &said = dl ? s.rs_d_held_key : s.rs_mv_held_key;
+        if (said == key) continue;
+        said = key;
+        char reason[300];
+        switch (why)
+        {
+        case mgpu::live_resize::held_too_big:
+            snprintf(reason, sizeof reason, "it is larger than the room the bridge set aside at start (%llu bytes; "
+                     "ResizeRoom=0, or bigger than the picture) - restart the game to run at it",
+                     (unsigned long long)(dl ? s.depth_cap : s.mvec_cap));
+            break;
+        case mgpu::live_resize::held_shape:
+            snprintf(reason, sizeof reason, "it does not have the picture's shape (%ux%u), so it is not a render "
+                     "size - left alone", s.width, s.height);
+            break;
+        case mgpu::live_resize::held_failed:
+            snprintf(reason, sizeof reason, "the bridge could not rebuild for it (see the LR1 error above) - "
+                     "restart the game");
+            break;
+        case mgpu::live_resize::held_format:
+            snprintf(reason, sizeof reason, dl
+                     ? "it is a different kind of depth buffer (another format - most likely another resource, "
+                       "e.g. while ReShade rebuilds its effects) and depth only follows a change of size"
+                     : "the neural card cannot take that format as motion vectors (not one of RG16F, RGBA16F, "
+                       "RG32F, RGBA32F, or a multi-plane format)");
+            break;
+        default:
+            snprintf(reason, sizeof reason, "LiveResize=0 in mgpu.ini - restart the game");
+            break;
+        }
+        char line[700];
+        snprintf(line, sizeof line,
+                 "[MGPU][LR1] the game's %s %s now %ux%u format %u (the bridge has %ux%u format %u) - NOT followed: "
+                 "%s. Until then this lane is left out.",
+                 dl ? "depth" : "motion vectors", dl ? "is" : "are", w, h, f,
+                 dl ? s.depth_w : s.mvec_w, dl ? s.depth_h : s.mvec_h, dl ? s.depth_format : s.mvec_format,
+                 reason);
+        mgpu::diag::warn(line);
+    }
+}
+
+// Returns false when the stream went away (the caller returns at once).
+static bool rs_poll(stream_state &s, std::unique_lock<std::mutex> &lk)
+{
+    namespace lr = mgpu::live_resize;
+    (void)lk;   // held throughout; documented for the reader - nothing here unlocks it
+    rs_say_held(s);
+    if (!s.rs_hold)
+    {
+        if (!s.rs_pending.load(std::memory_order_acquire)) { s.rs_tries = 0; return true; }
+        if (GetTickCount64() < s.rs_retry_ms) return true;   // a busy try: wait a little, play on
+        s.rs_hold = true;                  // from here the consumer issues nothing ahead
+        s.rs_hold_ms = GetTickCount64();
+    }
+
+    // Give up: both followers hold their shapes as failed, the requests go.
+    // mk: mvec_cs, held by the caller of this lambda or not.
+    auto give_up = [&](const char *why, bool mk_held) {
+        std::unique_lock<std::mutex> m(s.mvec_cs, std::defer_lock);
+        if (!mk_held) m.lock();
+        if (s.rs_req_mv.on) { lr::hold(s.rs_mv_fol, s.rs_req_mv.sh, lr::held_failed);
+                              s.rs_mv_hw.store(s.rs_req_mv.sh.w); s.rs_mv_hh.store(s.rs_req_mv.sh.h);
+                              s.rs_mv_hf.store(s.rs_req_mv.sh.fmt); s.rs_mv_held.store(lr::held_failed); }
+        if (s.rs_req_d.on)  { lr::hold(s.rs_d_fol, s.rs_req_d.sh, lr::held_failed);
+                              s.rs_d_hw.store(s.rs_req_d.sh.w); s.rs_d_hh.store(s.rs_req_d.sh.h);
+                              s.rs_d_hf.store(s.rs_req_d.sh.fmt); s.rs_d_held.store(lr::held_failed); }
+        s.rs_req_mv.on = false; s.rs_req_d.on = false;
+        s.rs_pending.store(false, std::memory_order_release);
+        s.rs_hold = false; s.rs_tries = 0;
+        char l[400];
+        snprintf(l, sizeof l, "[MGPU][LR1] a change of the game's vectors / depth could not be followed: %s. "
+                 "Nothing was changed; restart the game for the new size.", why);
+        mgpu::diag::error(l);
+    };
+    // A try that found a queue busy: play on for 2 s with the copies ahead
+    // back on, then try again. Three tries, then give up.
+    auto busy = [&](const char *why, bool mk_held) {
+        if (++s.rs_tries >= 3u) { give_up(why, mk_held); return; }
+        s.rs_hold = false;
+        s.rs_retry_ms = GetTickCount64() + 2000ull;
+        char l[300];
+        snprintf(l, sizeof l, "[MGPU][LR1] a vector / depth change waits: %s - trying again in 2 s (try %u of 3).",
+                 why, s.rs_tries);
+        mgpu::diag::warn(l);
+    };
+
+    // ---- 1: still asked for, and GPU 1 idle at this poll's start? ----
+    {
+        std::lock_guard<std::mutex> m(s.mvec_cs);
+        if (!s.rs_req_mv.on && !s.rs_req_d.on)
+        {
+            // Withdrawn: the game went back to the shape the lane has.
+            s.rs_pending.store(false, std::memory_order_release);
+            s.rs_hold = false;
+            return true;
+        }
+    }
+    const bool cq_idle = s.cq == nullptr || s.cqf == nullptr || s.cqf->GetCompletedValue() >= s.cqf_value;
+    const bool nq_idle = s.nf == nullptr || s.nf->GetCompletedValue() >= s.nf_value;
+    if (!cq_idle || !nq_idle)
+    {
+        if (GetTickCount64() - s.rs_hold_ms < 3000ull) return true;   // next poll
+        busy("the neural card's queues did not go idle within 3 s", false);
+        return true;
+    }
+
+    LARGE_INTEGER t0{}, t1{}, fq{};
+    QueryPerformanceCounter(&t0);
+
+    // ---- 2 + 3: GPU 0, with cs and mvec_cs held ----
+    std::unique_lock<std::mutex> mk(s.mvec_cs);
+    const stream_state::rs_req_t rm = s.rs_req_mv, rd = s.rs_req_d;   // final
+    if (!rm.on && !rd.on)
+    {
+        s.rs_pending.store(false, std::memory_order_release);
+        s.rs_hold = false;
+        return true;
+    }
+    // LR98: before anything changes, the neural card itself must take each new
+    // format as ONE plane, made the way the lane's textures are. The game side
+    // already refuses these (live_resize::format_ok); this is the second lock
+    // on the door that removed the neural card's device on 2026-11-26.
+    {
+        const char *bad = nullptr;
+        if (rm.on && !rs_one_plane(s.ndev_b, rm.sh.fmt)) bad = "the neural card cannot make the new motion-vector format as one texture";
+        if (rd.on && !rs_one_plane(s.ndev_b, rd.sh.fmt)) bad = "the neural card cannot make the new depth format as one texture";
+        if (rd.on && rd.sh.fmt != s.depth_format) bad = "depth changed format (only a change of size is followed)";
+        if (bad != nullptr) { give_up(bad, true); return true; }
+    }
+    if (!rs_g0_idle(s, 1000))
+    {
+        busy("the render card's staging copies did not finish within 1 s", true);
+        return true;
+    }
+    const lr::shape om{ s.mvec_w, s.mvec_h, s.mvec_format };
+    const lr::shape od{ s.depth_w, s.depth_h, s.depth_format };
+    if (rm.on)
+    {
+        s.mvec_w = rm.sh.w; s.mvec_h = rm.sh.h; s.mvec_format = rm.sh.fmt;
+        s.mvec_fp2 = rm.fp; s.mvec_fp2.Offset = 0; s.mvec_bytes2 = rm.bytes;
+    }
+    if (rd.on)
+    {
+        s.depth_w = rd.sh.w; s.depth_h = rd.sh.h; s.depth_format = rd.sh.fmt;
+        s.depth_fp = rd.fp; s.depth_fp.Offset = 0; s.depth_bytes = rd.bytes;
+    }
+    // StageCopy=1: the prerecorded slot copies carry byte counts - record them
+    // again (the queue is idle, so its allocator may be reset).
+    bool stage_ok = true;
+    if (s.stage_on != 0u && s.g0ca != nullptr && s.gstage != nullptr)
+    {
+        HRESULT h = s.g0ca->Reset();
+        for (unsigned k = 0; k < stream_state::RING && SUCCEEDED(h); ++k)
+        {
+            if (s.g0cl[k] == nullptr) { h = E_POINTER; break; }
+            h = s.g0cl[k]->Reset(s.g0ca, nullptr);
+            if (SUCCEEDED(h)) { rs_stage_record(s, s.g0cl[k], k); h = s.g0cl[k]->Close(); }
+        }
+        if (FAILED(h))
+        {
+            // The lists cannot be trusted now: the game's queue copies straight
+            // to the shared heap from the next frame (the StageCopy=0 path),
+            // which needs nothing re-recorded. The lists are not executed again.
+            stage_ok = false;
+            s.stage_on = 0u;
+            char l[300];
+            snprintf(l, sizeof l, "[MGPU][LR1] the staging copies could not be recorded again (hr=0x%08X) - "
+                     "StageCopy is off for the rest of this session (the game's queue copies straight to "
+                     "the shared heap, as with StageCopy=0).", (unsigned)h);
+            mgpu::diag::error(l);
+        }
+    }
+    for (unsigned q = 0; q < stream_state::RING; ++q)
+    {
+        if (rm.on)
+        {
+            s.mvec_slot_valid[q].store(0u, std::memory_order_relaxed);
+            s.mvec_slot_frame[q].store(0ull, std::memory_order_relaxed);
+        }
+        if (rd.on) s.depth_slot_valid[q] = 0u;
+    }
+    s.rs_from_f = s.produced + 1ull;
+    if (rm.on) { lr::accepted(s.rs_mv_fol); s.rs_mv_held.store(0); }
+    if (rd.on) { lr::accepted(s.rs_d_fol);  s.rs_d_held.store(0); }
+    s.rs_req_mv.on = false; s.rs_req_d.on = false;
+    s.rs_pending.store(false, std::memory_order_release);
+    mk.unlock();
+
+    // ---- 4: GPU 1 (idle: see step 1; only this thread submits to it) ----
+    s.half_frame[0] = s.half_frame[1] = 0ull;   // the halves hold frames of the old shape
+    s.cq_depth_ok[0] = s.cq_depth_ok[1] = 0u;
+    s.cq_mvec_ok[0] = s.cq_mvec_ok[1] = 0u;
+    s.ll_pending = 0;
+    ID3D12Device *ndev = s.ndev_b;
+    bool tex_ok = true;
+    if (ndev != nullptr)
+    {
+        // Made exactly as stream_nr_create makes them (same state, same flags),
+        // and only where they existed: a lane with no textures yet (the neural
+        // stage not up) is made at the new shape when it comes up.
+        for (unsigned i = 0; i < 2u; ++i)
+        {
+            if (rm.on && s.tex_mvec_r[i] != nullptr)
+            {
+                s.tex_mvec_r[i]->Release(); s.tex_mvec_r[i] = nullptr;
+                if (FAILED(make_tex(ndev, s.mvec_w, s.mvec_h, (DXGI_FORMAT)s.mvec_format, D3D12_RESOURCE_FLAG_NONE,
+                                    D3D12_RESOURCE_STATE_COPY_DEST, &s.tex_mvec_r[i])))
+                { s.tex_mvec_r[i] = nullptr; tex_ok = false; }
+            }
+            if (rd.on && s.tex_depth[i] != nullptr)
+            {
+                s.tex_depth[i]->Release(); s.tex_depth[i] = nullptr;
+                if (FAILED(make_tex(ndev, s.depth_w, s.depth_h, (DXGI_FORMAT)s.depth_format, D3D12_RESOURCE_FLAG_NONE,
+                                    D3D12_RESOURCE_STATE_COPY_DEST, &s.tex_depth[i])))
+                { s.tex_depth[i] = nullptr; tex_ok = false; }
+            }
+        }
+    }
+    // What was sized from the lanes comes back by itself on first use.
+    const bool had_amd = s.fsr_ctx != nullptr || s.fsrb_ctx != nullptr || s.sfm_ctx != nullptr || s.fd_on;
+    if (had_amd)
+    {
+        fsr_destroy(s);                       // contexts A/B/M and the FD1 depth resample
+        s.fsr_a_prev = false; s.sfm_prev = false;
+        s.ac.b_ok_fid = 0;                    // context B primes again
+    }
+    const bool had_dg = g_dg.handle != nullptr;
+    if (had_dg)
+    {
+        if (g_dg.release != nullptr) (void)g_dg.release(g_dg.handle);
+        g_dg.handle = nullptr;
+        g_dg.up = false; g_dg.tried = false; g_dg.last_fid = 0; g_dg.cur_mfc = 0;
+    }
+    if (g_dg.stage == 1 || g_dg.stage == 2) dgp_stop("the game changed its motion vectors or depth (LR1)");
+    if (s.vp_rb != nullptr) { s.vp_rb->Release(); s.vp_rb = nullptr; }
+    if (s.dp_rb != nullptr) { s.dp_rb->Release(); s.dp_rb = nullptr; }
+    s.vp_pending = false; s.dp_pending = false; s.cp_stage = 0; s.fwc_pending = false;
+    const bool sr_too = s.sr_on != 0u && s.sr_handle != nullptr;
+    if (sr_too) s.sr_rebuild_req = 1u;        // V27, right after this: R follows the render extent
+    if (rm.on && s.rs_scale_px && s.mvec_w != 0u && s.mvec_h != 0u)
+    {
+        s.mvec_scale_x = (float)s.rs_px_gx * ((float)s.width / (float)s.mvec_w);
+        s.mvec_scale_y = (float)s.rs_px_gy * ((float)s.height / (float)s.mvec_h);
+        s.mvec_dirty = true;
+    }
+    s.nr_first = true; s.fov_first = true; s.sr_first = true;   // fresh histories, as NO1 / HL3 do
+    ++s.rs_count;
+    s.rc1_windows = 0;
+    if (tex_ok) { if (!s.rs_broken) g_rc_on.store(false); }
+    else
+    {
+        s.rs_broken = true;
+        g_rc_kind.store(1);
+        g_rc_on.store(true);
+        mgpu::diag::error("[MGPU][LR1] the neural card could not make the textures for the new shape (out of video "
+                          "memory?) - that lane is left out for the rest of this session. Restart the game.");
+    }
+    s.rs_hold = false; s.rs_tries = 0;
+
+    QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&fq);
+    char mvl[160] = "unchanged", dl[160] = "unchanged";
+    if (rm.on)
+        snprintf(mvl, sizeof mvl, "%ux%u fmt %u -> %ux%u fmt %u (%llu of %llu bytes)", om.w, om.h, om.fmt,
+                 s.mvec_w, s.mvec_h, s.mvec_format, (unsigned long long)s.mvec_bytes2, (unsigned long long)s.mvec_cap);
+    if (rd.on)
+        snprintf(dl, sizeof dl, "%ux%u fmt %u -> %ux%u fmt %u (%llu of %llu bytes)", od.w, od.h, od.fmt,
+                 s.depth_w, s.depth_h, s.depth_format, (unsigned long long)s.depth_bytes, (unsigned long long)s.depth_cap);
+    char line[1100];
+    snprintf(line, sizeof line,
+             "[MGPU][LR1] FOLLOWED a change in play (#%u, %.1f ms): motion vectors %s | depth %s. Frames from "
+             "f=%llu carry it; the few sealed before go without that lane once. Rebuilt: the textures%s%s%s%s; "
+             "neural rendering keeps its feature and starts a fresh history.%s",
+             s.rs_count,
+             fq.QuadPart ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart : 0.0,
+             mvl, dl, s.rs_from_f,
+             had_amd ? ", AMD frame generation (made again on its next frame)" : "",
+             had_dg ? ", NVIDIA frame generation (made again on its next frame)" : "",
+             sr_too ? ", Super Resolution (next step, [C2-SR])" : "",
+             stage_ok ? "" : " - StageCopy turned off",
+             (rm.on && s.rs_scale_px) ? " The learned 'px' vector scale follows the new size." : "");
+    mgpu::diag::info(line);
+    return true;
+}
+
 void stream_poll()
 {
     {   // SL1: write panel settings that have stood still for 400 ms
@@ -28769,6 +30177,7 @@ void stream_poll()
             if (w == nullptr && g_dcomp_rooted) w = g_game_hwnd;
             if (w == nullptr) { std::lock_guard<std::mutex> g(st().cs); w = st().hwnd; }
             if (w == nullptr) w = g_game_hwnd;
+            mgpu::cpuprof::scope cp_hd(mgpu::cpuprof::HDR_POLL);   // CP1
             mgpu::hdr::poll_display(w);
         }
     }
@@ -28922,6 +30331,12 @@ void stream_poll()
             }
         }
     }
+
+    // ---- LR1 (LR97): a vector / depth change posted by the game thread ----
+    //
+    // Before V27 on purpose: the same safe moment, and a change that moves the
+    // render extent asks V27 below to rebuild SR in this same poll.
+    if (!rs_poll(s, lk)) return;
 
     // ---- V27: COMMIT A STAGED SR REBUILD ----
     //
@@ -29485,9 +30900,13 @@ void stream_poll()
             // copy was a full-frame upload competing for GPU 1's link for
             // nothing. With LateLatch on, the latch chooses the next frame
             // instead, so no f+1 speculation at all.
-            const bool spec_ok = s.cq_gated && s.ll_on == 0u && poll_backlog <= 1ull;
+            // LR1 (LR97): while a vector / depth change waits for GPU 1 to be
+            // idle (rs_hold), nothing is copied ahead of the frame evaluated
+            // now - its copy is finished when the evaluate is, so the next poll
+            // starts idle. A few frames without the overlap, once per change.
+            const bool spec_ok = s.cq_gated && s.ll_on == 0u && poll_backlog <= 1ull && !s.rs_hold;
             if (s.cq_gated && s.ll_on == 0u && !spec_ok && s.cq_issued < f + 1) ++s.cq_spec_suppressed;
-            const unsigned long long want = (spec_ok || completed > f) ? (f + 1) : f;
+            const unsigned long long want = (!s.rs_hold && (spec_ok || completed > f)) ? (f + 1) : f;
             // FIX6: copy f itself if no half holds it, then (when wanted) f+1
             // into the OTHER half. Frames between are never evaluated
             // (newest-only), so they are not copied - upstream walked every
@@ -29545,6 +30964,7 @@ void stream_poll()
         }
         const bool hl3 = hl3_frame(s, fr_hud);   // HL3: game's own frame, no NR / generation
         const bool nr_on = s.neural && !hl3;
+        const long long cp_nr_t0 = mgpu::cpuprof::on() ? mgpu::cpuprof::qpc() : 0;   // CP1: NR record
         HRESULT h = s.na->Reset();
         if (SUCCEEDED(h)) h = s.nl->Reset(s.na, nullptr);
         int gt_slot = -1;   // GT1
@@ -29553,7 +30973,7 @@ void stream_poll()
             gt_slot = mgpu::gputime::begin(s.ndev_b, s.nq, s.nl);
             g_gt_nrq.store(s.nq, std::memory_order_relaxed);   // DR8
             s.ac_ts_mask = 0; s.ac_ts_resolved = false;   // AC3: a fresh list carries no AMD marks yet
-            s.gb_sr_marked = false; s.gb_u_marked = 0;      // GB1 / GB4
+            s.gb_sr_marked = false; s.gb_u_marked = 0; s.gb_x_marked = 0; s.nb_rec_scale = -1;   // GB1 / GB4 / NB1 / NB3
             if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
 
             s.nl->CopyBufferRegion(s.nseal, (UINT64)slot * SEAL_STRIDE,
@@ -30280,6 +31700,7 @@ void stream_poll()
                     const bool dr_live = g_dr_on.load(std::memory_order_relaxed) != 0 && dp > 0 &&
                                          (s.fg_on == 4u || s.fg_on == 3u);
                     if (!dr_live) dp = (int)s.sr_scale_pct * 10;
+                    s.nb_rec_scale = dp;   // NB3: the scale this list's NR runs at, carried to its timing sample
                     if (s.sr_scale_pct != 0u && (dr_live || g_dr_alloc.load(std::memory_order_relaxed) > (int)s.sr_scale_pct))
                     {
                         dw = (UINT)(((unsigned long long)s.width  * (unsigned)dp) / 1000ull) & ~7u;
@@ -30393,6 +31814,7 @@ void stream_poll()
                 else if (s.fov_base_h != 0u) { s.fov_base_h = 0u; s.fov_base_reset = true; }
 
                 bool final_pass_ok = false;
+                bool tc_nr_reset = false;   // TC1: NR reset its own history this frame
                 for (unsigned pi = 0; nr_on && pi < s.passes; ++pi)   // NO1
                 {
                     ID3D12Resource *src = (pi == 0)
@@ -30597,6 +32019,7 @@ void stream_poll()
                     if (pi == 0u && mgpu::nr16::take_reset()) rst = 1u;   // R208: history from the other format is not reused
                     if (pi == 0u && s.fov_base_reset) { rst = 1u; s.fov_base_reset = false; }   // FV2: base extent changed
                     s.nr_params->Set("DLSSNR.Reset", rst);
+                    if (pi == 0u && rst != 0u) tc_nr_reset = true;   // TC1
 
                     const NVSDK_NGX_Result er =
                         s.nr_eval(s.nl, s.nr_handle[pi], s.nr_params, nullptr);
@@ -30629,6 +32052,9 @@ void stream_poll()
                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
                 s.nr_first = false;
+                // NB1: NR's own time, apart from the rebuild, Color Strength and the rest.
+                if (nr_on && s.gb_heap != nullptr)
+                { s.nl->EndQuery(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, 5); s.gb_x_marked |= 1u; }
                 // ---- NO1: neural stage OFF - the game's own frame goes through ----
                 //
                 // It used to skip this whole block, so nothing new reached the
@@ -30988,6 +32414,40 @@ void stream_poll()
                 if (final_pass_ok && !s.profile && s.nr_final != nullptr)
                     (void)cs_apply(s, s.nl, s.nr_final, ii);
 
+                // TC1: temporal stabilisation (TemporalStab, off by default -
+                // then one relaxed load). Here, on the REAL frame's list, after
+                // NR and Color Strength and before frame generation, the HUD and
+                // the present read nr_final - so generated frames never reach
+                // its history. Same vector and depth rules as FG1 below.
+                {
+                    const bool tc_run = final_pass_ok && !s.profile && s.present_mode == 0 && s.nr_final != nullptr;
+                    mgpu::tstab::frame_in ti;
+                    if (tc_run && mgpu::tstab::mode() != 0)
+                    {
+                        const bool tc_mv = s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr && s.mvec_bytes2 != 0 && fr_mvec;
+                        const bool tc_dp = s.depth_mode != 0 && s.tex_depth[ii] != nullptr && fr_depth;
+                        const float sgn = s.fg_invert ? -1.0f : 1.0f;
+                        ti.dev = s.ndev_b; ti.cl = s.nl; ti.q = s.nq;
+                        ti.fence = s.nf; ti.fence_value = s.nf_value + 1ull;   // the Signal after this list
+                        ti.parity = ii;
+                        ti.out = s.nr_final;
+                        if (tc_mv)
+                        {
+                            ti.mv = s.tex_mvec_r[ii]; ti.mv_fmt = (DXGI_FORMAT)s.mvec_format;
+                            ti.mv_w = s.mvec_w; ti.mv_h = s.mvec_h;
+                            ti.mv_sx = sgn * s.mvec_scale_x * mv_el; ti.mv_sy = sgn * s.mvec_scale_y * mv_el;
+                        }
+                        ti.mv_el = mv_el;
+                        if (tc_dp)
+                        {
+                            ti.depth = s.tex_depth[ii]; ti.d_w = s.depth_w; ti.d_h = s.depth_h;
+                            ti.d_inverted = s.depth_inverted;
+                        }
+                        ti.nr_reset = tc_nr_reset;
+                    }
+                    mgpu::tstab::frame(tc_run, ti);
+                }
+
                 if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
 
                 if (!s.profile)
@@ -31026,11 +32486,17 @@ void stream_poll()
                 bool ui_done = false;   // HL1
                 if (s.fg_on != 0u && !s.fg_failed && final_pass_ok && !s.profile &&
                     s.present_mode == 0 && !hl3)
+                {
+                    // NB1: the frame generation stage, whichever generator - for
+                    // NVIDIA this is its own evaluate(s) plus the composition.
+                    if (s.gb_heap != nullptr) { s.nl->EndQuery(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, 6); s.gb_x_marked |= 2u; }
                     ui_done = fg_record(s, s.nl, ii,
                               s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
                                   s.mvec_bytes2 != 0 && fr_mvec,
                               s.depth_mode != 0 && s.tex_depth[ii] != nullptr && fr_depth,
                               mv_el, f, fr_hud);
+                    if (s.gb_heap != nullptr) { s.nl->EndQuery(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, 7); s.gb_x_marked |= 4u; }
+                }
                 else if (s.fg_on != 0u)
                 {
                     // FIX7: an evaluate the generator did not see (final pass
@@ -31105,8 +32571,20 @@ void stream_poll()
                 s.nl->ResolveQueryData(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, s.gb_read, 0);
             if (s.ts_ok && run_nr && s.gb_heap != nullptr && s.gb_u_marked == 7u)   // GB4: only when all three were written
                 s.nl->ResolveQueryData(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2, 3, s.gb_read, 16);
+            if (s.ts_ok && run_nr && s.gb_heap != nullptr && s.gb_x_marked != 0u)
+            {
+                // NB3: only the marks this list wrote are resolved - an NR-only
+                // list resolves 5, an FG-only list 6-7, both 5-7.
+                mgpu::nb::range rg[2];
+                const unsigned nrg = mgpu::nb::resolve_plan(s.gb_x_marked, rg);
+                for (unsigned i = 0; i < nrg; ++i)
+                    s.nl->ResolveQueryData(s.gb_heap, D3D12_QUERY_TYPE_TIMESTAMP, rg[i].first, rg[i].count,
+                                           s.gb_read, rg[i].offset);
+            }
             s.gb_sr_was = s.gb_sr_marked;
             s.gb_u_was = s.gb_u_marked;
+            s.gb_x_was = (s.ts_ok && run_nr) ? s.gb_x_marked : 0u;
+            s.nb_scale_was = s.nb_rec_scale;   // NB3
 
             mgpu::gputime::end(s.nl, gt_slot);   // GT1
             h = s.nl->Close();
@@ -31129,19 +32607,35 @@ void stream_poll()
             else if (s.copy_queue && s.cqf != nullptr && s.cqf_value != 0 &&
                      s.cqf_value <= (UINT64)completed_raw)
                 qwh = s.nq->Wait(s.cqf, s.cqf_value);
-            if (FAILED(qwh))
+            if (mgpu::gpusafe::gated_submit((int)qwh) == mgpu::gpusafe::submit::drop_frame)
             {
+                // SF1 (rule 1): the list reads what the copy queue writes; without
+                // the Wait it would run unordered against it. It is NOT submitted:
+                // the frame is dropped (nr_lost) and the allocator, never handed to
+                // the GPU, is safe to reset for the next frame.
                 static std::atomic<bool> said{false};
                 if (!said.exchange(true, std::memory_order_relaxed))
                 {
-                    char wl[200];
-                    snprintf(wl, sizeof wl, "[MGPU][SAFE1] NR queue Wait on the copy fence FAILED (0x%08X) at f=%llu. "
-                             "Said once.", (unsigned)qwh, f);
+                    const HRESULT why = (s.ndev_b != nullptr) ? s.ndev_b->GetDeviceRemovedReason() : S_OK;
+                    char wl[300];
+                    snprintf(wl, sizeof wl, "[MGPU][GS1] NR queue Wait on the copy fence FAILED (0x%08X) at f=%llu "
+                             "(device removed reason 0x%08X): the frame's NR list is NOT submitted - dropped and "
+                             "counted. Said once.", (unsigned)qwh, f, (unsigned)why);
                     mgpu::diag::error(wl);
                 }
+                h = qwh;
+                mgpu::gputime::cancel(gt_slot); gt_slot = -1;   // GT4: never executed
+                s.ac_ts_mask = 0; s.ac_ts_resolved = false;     // AC3: nothing to read back
             }
+            if (SUCCEEDED(h))   // SF1
+            {
             ID3D12CommandList *const ls[1] = { s.nl };
             s.nq->ExecuteCommandLists(1, ls);
+            if (cp_nr_t0 != 0)   // CP1
+            {
+                mgpu::cpuprof::add(mgpu::cpuprof::NR_RECORD, mgpu::cpuprof::qpc() - cp_nr_t0);
+                mgpu::cpuprof::tick();
+            }
             ++s.nf_value;
             h = s.nq->Signal(s.nf, s.nf_value);
             mgpu::gputime::submitted(gt_slot, SUCCEEDED(h) ? s.nf : nullptr, s.nf_value);   // GT1
@@ -31192,6 +32686,23 @@ void stream_poll()
                 if (!s.armed) return;
                 if (wr != WAIT_OBJECT_0 || fence_device_removed(s.nf)) h = E_FAIL;
             }
+            else if (mgpu::gpusafe::on_signal((int)h) == mgpu::gpusafe::after_signal::hold)
+            {
+                // SF1 (rule 2): the list was submitted but its completion can no
+                // longer be observed, so its allocator must not be reset. The
+                // REV6 check below holds the stream (the fence never reaches
+                // nf_value); teardown drains with a fresh trailing signal.
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true, std::memory_order_relaxed))
+                {
+                    char wl[260];
+                    snprintf(wl, sizeof wl, "[MGPU][GS1] NR fence Signal FAILED (0x%08X) at f=%llu: the NR stage holds "
+                             "(its command allocator is not reused while the list may still run). Said once.",
+                             (unsigned)h, f);
+                    mgpu::diag::error(wl);
+                }
+            }
+            }   // SF1: submitted
         }
         if (FAILED(h))
         {
@@ -31603,7 +33114,7 @@ void stream_poll()
                 const unsigned long long tot = s.game_frames;
                 const double pct = (tot != 0)
                     ? (100.0 * (double)s.stride_skipped / (double)tot) : 0.0;
-                const double mib = (double)s.stride_skipped * (double)s.slot_bytes
+                const double mib = (double)s.stride_skipped * (double)rs_stage_bytes(s)   // LR1: in use, not room
                                  / (1024.0 * 1024.0);
                 char bl[1200];
                 snprintf(bl, sizeof bl,
@@ -31811,6 +33322,175 @@ void stream_poll()
         lk.lock();
         if (s.armed) stream_release();   // REV1: another thread may have released it meanwhile
     }
+}
+
+// ---- XT1 (IN85): EXIT TRACE - LOG ONLY, CHANGES NOTHING ----
+//
+// No game in any field log has ever raised destroy_device for its own device
+// on exit, so the ordered teardown (T5, the IN82/IN83 GPU-safety drains) has
+// never run at a game's exit. Before choosing a different trigger, this
+// records - at every destroy event ReShade raises - what is still alive and
+// who holds it: the game's window, the game's device and the queue the add-on
+// signals on (their reference counts, read with AddRef/Release), and which
+// parts of the add-on hold a reference. Capped, so a game that churns queues
+// cannot flood the log.
+namespace
+{
+    std::atomic<int>  g_xt_lines{0};
+    std::atomic<bool> g_xt_dev_gone{false};   // after its destroy event: never touched again
+    std::atomic<bool> g_xt_q_gone{false};
+    std::atomic<unsigned long long> g_xt_last_ms{0};
+    unsigned long xt_refs(IUnknown *p)
+    {
+        if (p == nullptr) return 0;
+        const ULONG n = p->AddRef();
+        p->Release();
+        return (unsigned long)(n - 1);
+    }
+}
+
+// ---- EX1: THE GAME IS CLOSING (IN89, rule rewritten IN90) ----
+//
+// The rule and why: exit_detect.hpp. IN89 kept one flag - "a swap chain was
+// destroyed" - that nothing ever cleared, so a game replacing its swap chain
+// and later its queue would have been read as closing mid-game. Now: no game
+// chain alive (tracked by identity), its window gone, and a queue on the game's
+// device released since - all at one moment. Evaluated only at destroy events
+// (never per frame). Fires once per bridge session.
+namespace
+{
+    std::mutex g_ex_cs;
+    mgpu::exitdet::detector g_ex;
+}
+void ex_session_begin()
+{
+    std::lock_guard<std::mutex> lk(g_ex_cs);
+    g_ex.session_begin();
+}
+void ex_note_chain(void *id, void *hwnd, bool created, bool resize)
+{
+    std::lock_guard<std::mutex> lk(g_ex_cs);
+    if (created) g_ex.chain_created(id, hwnd);
+    else         g_ex.chain_destroyed(id, resize);
+}
+bool ex_check(bool game_queue_released)
+{
+    int live = 0; bool fire = false; const void *w = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_ex_cs);
+        if (game_queue_released) g_ex.game_queue_released();
+        w = g_ex.last_window();
+        const bool alive = w != nullptr && IsWindow((HWND)w);
+        fire = g_ex.evaluate(alive) == mgpu::exitdet::verdict::exit;
+        live = g_ex.live();
+    }
+    if (!fire) return false;
+    char l[320];
+    snprintf(l, sizeof l, "[MGPU][EX1] the game is closing: no game swap chain alive (%d), its window %p is gone, and a "
+             "queue on its device was released since - the add-on's ordered shutdown starts now on the bridge thread, "
+             "so the game's device can be released.", live, w);
+    mgpu::diag::info(l);
+    return true;
+}
+void release_game_device_refs()
+{
+    std::vector<IUnknown *> list;
+    int kept = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_gref_cs);
+        list = g_gref.take();
+        kept = g_gref.kept();
+    }
+    if (list.empty() && kept == 0) return;
+    // XT2 (diagnostic builds): read the game device's count now - we still hold
+    // these references, so it cannot reach zero under the read.
+    const long before = list.empty() ? -3 : mgpu::calibrator::xt2_read_guaranteed();
+    char l[360];
+    snprintf(l, sizeof l, "[MGPU][EX1] giving back %d reference(s) the add-on held on the game's device (no lock held: if "
+             "one is the last, the device is released right here)%s%s", (int)list.size(),
+             kept > 0 ? "; KEPT (GPU work not proven finished): " : "", kept > 0 ? "see GS2" : "");
+    if (before >= 0)
+    {
+        char t[90]; snprintf(t, sizeof t, " | the game's device count before: %ld", before);
+        strncat(l, t, sizeof l - strlen(l) - 1);
+    }
+    mgpu::diag::info(l);
+    for (IUnknown *p : list) p->Release();
+}
+
+void exit_trace(const char *what, void *obj_native, bool obj_is_com, void *obj_hwnd)
+{
+    if (g_xt_lines.load(std::memory_order_relaxed) >= 60) return;
+    stream_state &s = str();
+    void *gdev = (void *)s.gdev;
+    void *gq = g_tf_game_queue.load(std::memory_order_relaxed);
+    HWND gw = g_game_hwnd;
+    const bool is_dev = obj_native != nullptr && obj_native == gdev;
+    const bool is_q   = obj_native != nullptr && obj_native == gq;
+    const bool is_gw  = obj_hwnd != nullptr && (HWND)obj_hwnd == gw;
+    // Only lines that concern the game: its device, its queue, its window - or
+    // a destroy that comes after the game's window is gone (the exit itself).
+    const bool win_alive = gw != nullptr && IsWindow(gw);
+    const bool win_gone  = gw != nullptr && !win_alive;
+    const bool is_queue_event = std::strncmp(what, "destroy_command_queue", 21) == 0;
+    // Other queues: only once the game's window is gone (startup probes churn
+    // queues and would use up the cap). Other devices, swap chains, runtimes:
+    // always - they are few.
+    if (!is_dev && !is_q && !is_gw && (is_queue_event ? !win_gone : (win_alive && std::strcmp(what, "destroy_device") != 0)))
+        return;
+    if (g_xt_lines.fetch_add(1, std::memory_order_relaxed) >= 60) return;
+
+    const unsigned long long now = GetTickCount64();
+    const unsigned long long prev = g_xt_last_ms.exchange(now, std::memory_order_relaxed);
+
+    const char *who = is_dev ? "THE GAME'S DEVICE" : is_q ? "THE GAME'S QUEUE (the one the add-on signals on)"
+                    : is_gw ? "on the game's window" : "another object";
+    char obj[200];
+    if (obj_is_com) snprintf(obj, sizeof obj, "%s, refs left=%lu", who, xt_refs((IUnknown *)obj_native));
+    else            snprintf(obj, sizeof obj, "%s", who);
+
+    char dv[260] = "game device: not known yet";
+    if (gdev != nullptr && !g_xt_dev_gone.load(std::memory_order_relaxed))
+    {
+        bool td = false, tq = false; int tn = 0;
+        mgpu::gputime::holds(gdev, gq, &td, &tq, &tn);
+        int kids = 0;
+        for (IUnknown *o : { (IUnknown *)s.gxfer, (IUnknown *)s.gheap, (IUnknown *)s.gfence, (IUnknown *)s.g0cq,
+                             (IUnknown *)s.g0ca, (IUnknown *)s.g0sf, (IUnknown *)s.gstage, (IUnknown *)s.g0ts,
+                             (IUnknown *)s.g0cts, (IUnknown *)s.g0tsrb })
+            if (o != nullptr) ++kids;
+        snprintf(dv, sizeof dv, "game device %p (underneath) refs=%lu - held by the add-on: stream %s (1 GetDevice ref + %d objects built on it), "
+                 "GPU timing %s, Reflex %s",
+                 gdev, xt_refs((IUnknown *)gdev), s.armed ? "armed" : "not armed", kids,
+                 td ? "yes" : "no", reflex::held_device() == gdev ? "yes" : "no");
+        char tail[120];
+        snprintf(tail, sizeof tail, " | GPU timing holds %d queue(s)%s", tn, tq ? ", the game's among them" : "");
+        strncat(dv, tail, sizeof dv - strlen(dv) - 1);
+    }
+    else if (g_xt_dev_gone.load(std::memory_order_relaxed)) snprintf(dv, sizeof dv, "game device: destroyed (event seen)");
+
+    char wv[160] = "";
+    {   // XT2: the count on the device object the GAME holds - the one whose
+        // reaching zero makes ReShade raise destroy_device. Not read here; the
+        // last reading taken at a provably safe moment (calibrator.hpp).
+        const long n = mgpu::calibrator::game_device12_refs();
+        if (n >= 0) snprintf(wv, sizeof wv, " | the game's own device (ReShade's wrapper): %ld refs at the last safe reading", n);
+        else if (n == -3) snprintf(wv, sizeof wv, " | the game's own device: not tracked");
+    }
+
+    char qv[90] = "game queue: not known";
+    if (gq != nullptr && !g_xt_q_gone.load(std::memory_order_relaxed))
+        snprintf(qv, sizeof qv, "game queue refs=%lu", xt_refs((IUnknown *)gq));
+    else if (g_xt_q_gone.load(std::memory_order_relaxed)) snprintf(qv, sizeof qv, "game queue: destroyed (event seen)");
+
+    char l[900];
+    snprintf(l, sizeof l, "[MGPU][XT1] %s | %s | game window: %s | %s%s | %s | +%llu ms since the last XT1 line",
+             what, obj, gw == nullptr ? "not known" : !win_alive ? "GONE" : IsWindowVisible(gw) ? "alive, visible" : "alive, hidden",
+             dv, wv, qv, prev == 0 ? 0ull : now - prev);
+    mgpu::diag::info(l);
+
+    if (is_dev) g_xt_dev_gone.store(true, std::memory_order_relaxed);
+    if (is_q)   g_xt_q_gone.store(true, std::memory_order_relaxed);
 }
 
 }

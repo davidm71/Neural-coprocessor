@@ -6,6 +6,7 @@
 #include "diag.hpp"
 #include "sl_tags.hpp"
 #include "d3dc.hpp"
+#include "pinthread.hpp"   // FW2
 
 #include <windows.h>
 #include <d3dcompiler.h>
@@ -136,7 +137,12 @@ void hist_now(long long &x, long long &y)
 // ===========================================================================
 // the hook thread
 // ===========================================================================
-std::thread *g_thread = nullptr;     // a pointer: no joinable static at unload (guarded by g_hook_mx)
+// FW2 (IN51 review): the hook thread is a pinned thread (pinthread.hpp). It
+// holds a reference on this add-on from before it starts until its last
+// instruction, so no path - a lost WM_QUIT, an unload while it is parked -
+// can leave it running code that Windows has unmapped. There is no thread
+// object to join or detach; g_running says whether it is alive.
+std::atomic<bool> g_running{false};
 std::atomic<DWORD> g_tid{0};
 // RV1: the hook handle is shared by the hook thread (sets it, removes it on
 // exit), stop_hook's fallback and emergency_unhook (remove it), and status()
@@ -196,6 +202,8 @@ void hook_main()
         DispatchMessageW(&msg);
     }
     unhook_once();
+    g_tid.store(0);
+    g_running.store(false);   // FW2: last write; the pin is dropped after we return
 }
 
 std::mutex g_hook_mx;   // REV: ensure_hook (present thread, panel) vs stop_hook (panel, teardown)
@@ -203,8 +211,15 @@ std::mutex g_hook_mx;   // REV: ensure_hook (present thread, panel) vs stop_hook
 void ensure_hook()
 {
     std::lock_guard<std::mutex> hl(g_hook_mx);
-    if (g_thread != nullptr) return;
-    g_thread = new std::thread(hook_main);
+    if (g_running.load()) return;
+    g_tid.store(0);
+    g_running.store(true);
+    if (!mgpu::start_pinned_thread(&hook_main))
+    {
+        g_running.store(false);
+        mgpu::diag::warn("[MGPU][FW1] the mouse hook thread could not be started - Frame Warp has no mouse input.");
+        return;
+    }
     for (int i = 0; i < 500 && g_tid.load() == 0; ++i) Sleep(1);
     mgpu::diag::info("[MGPU][FW1] Frame Warp mouse hook running (reads mouse movement only while the game "
                      "is in front; input is never changed).");
@@ -212,27 +227,29 @@ void ensure_hook()
 
 void stop_hook()
 {
+    // Never called under the loader lock (DllMain uses emergency_unhook).
     std::lock_guard<std::mutex> hl(g_hook_mx);
-    if (g_thread == nullptr) return;
+    if (!g_running.load()) return;
     // REV: the thread stores its id before anything else; give it time to.
-    // Without an id WM_QUIT cannot be posted and join() would block forever.
     DWORD tid = g_tid.load();
-    for (int i = 0; i < 2000 && tid == 0; ++i) { Sleep(1); tid = g_tid.load(); }
+    for (int i = 0; i < 2000 && tid == 0 && g_running.load(); ++i) { Sleep(1); tid = g_tid.load(); }
     if (tid != 0 && PostThreadMessageW(tid, WM_QUIT, 0, 0))
     {
-        if (g_thread->joinable()) g_thread->join();
-        delete g_thread;
+        // FW2: wait for it to leave its loop (bounded; it exits within one
+        // message). Nothing to join - the pin keeps the add-on mapped until
+        // the thread's own last instruction.
+        for (int i = 0; i < 2000 && g_running.load(); ++i) Sleep(1);
     }
-    else
+    if (g_running.load())
     {
-        // Cannot reach it: never block. Leave it parked (it only waits for messages).
+        // Cannot reach it, or it did not leave in 2 s: remove the hook so
+        // Windows stops calling it. The parked thread keeps the add-on loaded
+        // (pinned) rather than running freed code.
         unhook_once();
-        if (g_thread->joinable()) g_thread->detach();
-        delete g_thread;
-        mgpu::diag::warn("[MGPU][FW1] the mouse hook thread could not be signalled - hook removed, thread left parked.");
+        mgpu::diag::warn("[MGPU][FW1] the mouse hook thread did not stop in 2 s - hook removed, thread left "
+                         "parked (it keeps the add-on loaded until the game exits; safe).");
+        return;   // g_running stays true: ensure_hook will not start a second one
     }
-    g_thread = nullptr;
-    g_tid.store(0);
 }
 
 // ===========================================================================
@@ -932,7 +949,7 @@ void status(char *out, unsigned n)
     if (!enabled()) { snprintf(out, n, "off"); return; }
     if (G.failed) { snprintf(out, n, "cannot run here (see log [FW1])"); return; }
     snprintf(out, n, "%s | last warp %.2f / %.2f deg",
-             (g_tid.load() == 0) ? "waiting"   // RV1: no unguarded read of g_thread
+             (g_tid.load() == 0) ? "waiting"   // RV1/FW2: thread state by atomics only
                                    : (g_hook.load() == nullptr ? "NO MOUSE HOOK (see log)"
                                       : (g_camera_live.load() ? "running" : "paused (menu or not turning yet)")),
              g_last_mdeg_x.load() / 1000.0, g_last_mdeg_y.load() / 1000.0);

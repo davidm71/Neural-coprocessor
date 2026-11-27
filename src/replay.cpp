@@ -4,10 +4,29 @@
 // Threads: the hook thread owns the low-level hooks and only pumps messages
 // (a hook thread that stops pumping delays everyone's input); the playback
 // thread sleeps between events and calls SendInput.
+//
+// LR100 - who may start and stop what:
+//   g_ctl_mx  : toggle_record, start_play and shutdown, one at a time. The
+//               panel (game thread) and the hotkey (bridge thread) can both
+//               toggle; two at once double-started the hook thread
+//               (std::terminate on assigning to a joinable std::thread).
+//   g_life_mx : the hook thread's handle and life state (thread_life.hpp).
+//               Taken by hooks() - also from the playback thread - and by
+//               shutdown, never while waiting for the thread to end.
+//   g_mx      : the path / recording data and the message (unchanged).
+//   Order: g_ctl_mx -> g_life_mx -> g_mx. Nothing waits on a thread while
+//   holding g_life_mx or g_mx.
+//   The hook thread is PINNED (pinthread.hpp): it keeps the add-on loaded
+//   until it leaves its message loop, so a FreeLibrary while it still sits in
+//   GetMessage can no longer pull the code out from under it.
 // ---------------------------------------------------------------------------
 #include "replay.hpp"
 #include "capture.hpp"
 #include "diag.hpp"
+#include "pinthread.hpp"
+#include "thread_life.hpp"
+#include "gpu1_context.hpp"   // LR104: ui_ini_read (InputHookPriority); LR106: ui_any_menu_open
+#include "replay_rules.hpp"   // LR106: when playback stops
 
 #include <windows.h>
 #include <atomic>
@@ -44,13 +63,42 @@ std::vector<ev> g_path;          // the loaded / recorded path
 double g_path_s = 0.0;
 bool g_loaded = false;           // tried to load this session
 std::vector<ev> g_rec;           // being recorded (hook thread appends)
-LONGLONG g_rec_t0 = 0;
+std::atomic<LONGLONG> g_rec_t0{0};   // LR100: read by the hook callbacks and the HUD
+// LR102: what the hooks saw while recording, and why an event was not kept -
+// a "0 events" path (Cyberpunk, LR100) could not be told apart from a hook
+// Windows never called. Reset at each start, reported at each stop.
+std::atomic<unsigned> g_seen_kb{0}, g_seen_ms{0}, g_drop_fg{0}, g_drop_inj{0}, g_drop_still{0};
+std::atomic<int> g_hk_kb_err{-1}, g_hk_ms_err{-1};   // -1 not tried, 0 installed, else GetLastError
+// LR104: how late Windows delivered each event to the hook (the event's own
+// timestamp vs now, ms) - the measure of whether the hook thread's priority
+// helps - and the priority the thread was started with.
+std::atomic<unsigned> g_lat_n{0}, g_lat_max{0};
+std::atomic<unsigned long long> g_lat_sum{0};
+std::atomic<int> g_hook_prio{0};   // InputHookPriority: 0 normal (default since LR106), 1 highest
+void note_latency(DWORD ev_time)
+{
+    const DWORD d = GetTickCount() - ev_time;   // wraps correctly in DWORD arithmetic
+    if (d > 60000u) return;                      // a bogus or synthetic timestamp
+    g_lat_n.fetch_add(1u, std::memory_order_relaxed);
+    g_lat_sum.fetch_add(d, std::memory_order_relaxed);
+    unsigned m = g_lat_max.load(std::memory_order_relaxed);
+    while (d > m && !g_lat_max.compare_exchange_weak(m, d, std::memory_order_relaxed)) {}
+}
 std::atomic<bool> g_recording{false}, g_playing{false}, g_abort{false}, g_aborted{false};
+// LR106: the mouse during playback (the hook Cyberpunk does call) - a real
+// button or wheel, and real movement summed in pixels.
+std::atomic<bool> g_abort_mouse{false};
+std::atomic<int>  g_real_move{0};
 char g_msg[300] = {};
 
+std::mutex g_ctl_mx;              // LR100: see the top of the file
+std::mutex g_life_mx;             // LR100
+HANDLE g_hook_h = nullptr;        // LR100: under g_life_mx; the pinned hook thread
+mgpu::thlife::state g_hook_life = mgpu::thlife::state::idle;   // LR100: under g_life_mx
 std::atomic<DWORD> g_hook_tid{0};
-std::thread g_hook_thread;
-HHOOK g_kb = nullptr, g_ms = nullptr;
+// LR100: atomics - the hook thread installs / removes them, emergency_unhook
+// (DllMain) removes them too; exchange() makes each removal happen once.
+std::atomic<HHOOK> g_kb{nullptr}, g_ms{nullptr};
 std::thread g_play;
 std::atomic<bool> g_play_stop{false};
 const UINT WM_HK_INSTALL = WM_APP + 41, WM_HK_REMOVE = WM_APP + 42;
@@ -165,10 +213,17 @@ LRESULT CALLBACK kb_proc(int code, WPARAM wp, LPARAM lp)
         const bool injected = (k->flags & LLKHF_INJECTED) != 0;
         const bool up = (k->flags & LLKHF_UP) != 0;
         if (g_playing.load() && !injected && !up) g_abort.store(true);   // a real key stops playback
+        if (g_recording.load())   // LR102: counted, so a stop can say what happened
+        {
+            g_seen_kb.fetch_add(1u, std::memory_order_relaxed);
+            note_latency(k->time);   // LR104
+            if (injected) g_drop_inj.fetch_add(1u, std::memory_order_relaxed);
+            else if (!own_foreground()) g_drop_fg.fetch_add(1u, std::memory_order_relaxed);
+        }
         if (g_recording.load() && !injected && own_foreground())
         {
             ev e{};
-            e.ms = qpc_ms(qpc() - g_rec_t0);
+            e.ms = qpc_ms(qpc() - g_rec_t0.load(std::memory_order_relaxed));
             e.type = E_KEY; e.up = up ? 1 : 0;
             e.code = (unsigned short)((k->scanCode & 0xFF) | ((k->flags & LLKHF_EXTENDED) ? 0x100 : 0));
             e.x = (int)k->vkCode;
@@ -182,13 +237,32 @@ LRESULT CALLBACK kb_proc(int code, WPARAM wp, LPARAM lp)
 
 LRESULT CALLBACK ms_proc(int code, WPARAM wp, LPARAM lp)
 {
+    if (code == HC_ACTION && g_playing.load())   // LR106: the mouse can stop a replay
+    {
+        const MSLLHOOKSTRUCT *m = reinterpret_cast<const MSLLHOOKSTRUCT *>(lp);
+        if ((m->flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) == 0)
+        {
+            if (wp == WM_MOUSEMOVE)
+            {
+                POINT c{};
+                GetCursorPos(&c);
+                const int dx = m->pt.x - c.x, dy = m->pt.y - c.y;
+                g_real_move.fetch_add((dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy), std::memory_order_relaxed);
+            }
+            else g_abort_mouse.store(true);   // a button or the wheel
+        }
+    }
     if (code == HC_ACTION && g_recording.load())
     {
         const MSLLHOOKSTRUCT *m = reinterpret_cast<const MSLLHOOKSTRUCT *>(lp);
+        g_seen_ms.fetch_add(1u, std::memory_order_relaxed);   // LR102
+        note_latency(m->time);   // LR104
+        if ((m->flags & LLMHF_INJECTED) != 0) g_drop_inj.fetch_add(1u, std::memory_order_relaxed);
+        else if (!own_foreground()) g_drop_fg.fetch_add(1u, std::memory_order_relaxed);
         if ((m->flags & LLMHF_INJECTED) == 0 && own_foreground())
         {
             ev e{};
-            e.ms = qpc_ms(qpc() - g_rec_t0);
+            e.ms = qpc_ms(qpc() - g_rec_t0.load(std::memory_order_relaxed));
             bool keep = true;
             switch (wp)
             {
@@ -199,6 +273,7 @@ LRESULT CALLBACK ms_proc(int code, WPARAM wp, LPARAM lp)
                 GetCursorPos(&c);
                 e.type = E_MOVE; e.x = m->pt.x - c.x; e.y = m->pt.y - c.y;
                 keep = (e.x != 0 || e.y != 0);
+                if (!keep) g_drop_still.fetch_add(1u, std::memory_order_relaxed);   // LR102: a move of 0 pixels
                 break;
             }
             case WM_LBUTTONDOWN: e.type = E_BTN; e.code = 1; break;
@@ -219,6 +294,11 @@ LRESULT CALLBACK ms_proc(int code, WPARAM wp, LPARAM lp)
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
+void unhook(std::atomic<HHOOK> &h)
+{
+    if (HHOOK x = h.exchange(nullptr)) UnhookWindowsHookEx(x);
+}
+
 void hook_main()
 {
     MSG m;
@@ -230,32 +310,75 @@ void hook_main()
             HMODULE self = nullptr;
             GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                reinterpret_cast<LPCWSTR>(&kb_proc), &self);
-            if (g_kb == nullptr) g_kb = SetWindowsHookExW(WH_KEYBOARD_LL, kb_proc, self, 0);
-            if (m.wParam != 0 && g_ms == nullptr) g_ms = SetWindowsHookExW(WH_MOUSE_LL, ms_proc, self, 0);
+            // Only this thread installs, so check-then-store is enough here.
+            // LR102: the result of each install is kept for the stop's report.
+            if (g_kb.load() == nullptr)
+            {
+                HHOOK h = SetWindowsHookExW(WH_KEYBOARD_LL, kb_proc, self, 0);
+                g_hk_kb_err.store(h != nullptr ? 0 : (int)GetLastError());
+                g_kb.store(h);
+            }
+            if (m.wParam != 0 && g_ms.load() == nullptr)
+            {
+                HHOOK h = SetWindowsHookExW(WH_MOUSE_LL, ms_proc, self, 0);
+                g_hk_ms_err.store(h != nullptr ? 0 : (int)GetLastError());
+                g_ms.store(h);
+            }
         }
         else if (m.message == WM_HK_REMOVE)
         {
-            if (g_kb) { UnhookWindowsHookEx(g_kb); g_kb = nullptr; }
-            if (g_ms) { UnhookWindowsHookEx(g_ms); g_ms = nullptr; }
+            unhook(g_kb);
+            unhook(g_ms);
         }
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
-    if (g_kb) { UnhookWindowsHookEx(g_kb); g_kb = nullptr; }
-    if (g_ms) { UnhookWindowsHookEx(g_ms); g_ms = nullptr; }
+    unhook(g_kb);
+    unhook(g_ms);
 }
 
-void ensure_hook_thread()
-{
-    if (g_hook_thread.joinable()) return;
-    g_hook_thread = std::thread([] { MSG m; PeekMessageW(&m, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
-                                     g_hook_tid.store(GetCurrentThreadId()); hook_main(); });
-    for (int i = 0; i < 500 && g_hook_tid.load() == 0; ++i) Sleep(1);
-}
-
+// LR100: one place starts the hook thread and one place stops it, both under
+// g_life_mx. hooks(false, ...) with no thread no longer starts one just to
+// tell it "remove"; while shutdown is stopping it, requests are dropped.
 void hooks(bool on, bool mouse)
 {
-    ensure_hook_thread();
+    // LR104: read before g_life_mx (the ini mirror has its own lock; never nest it).
+    const int prio = on ? (mgpu::gpu1::ui_ini_read("InputHookPriority", 0) != 0 ? 1 : 0) : 0;   // LR106: default normal
+    std::lock_guard<std::mutex> lk(g_life_mx);
+    const mgpu::thlife::step st = mgpu::thlife::use(g_hook_life, g_hook_h != nullptr, on);
+    if (st == mgpu::thlife::step::refuse || st == mgpu::thlife::step::skip) return;
+    if (st == mgpu::thlife::step::start)
+    {
+        g_hook_prio.store(prio);   // LR104
+        g_hook_tid.store(0);
+        g_hook_h = mgpu::start_pinned_thread_h([] {
+            MSG m;
+            PeekMessageW(&m, nullptr, WM_USER, WM_USER, PM_NOREMOVE);   // the queue exists before the id is published
+            // LR103: as the hotkey and Frame Warp hook threads (RV1). Windows
+            // gives a low-level hook only a short time to answer and drops it
+            // otherwise; at normal priority, under a game that keeps every
+            // core busy, this thread got NO calls in 24.6 s (Cyberpunk, LR102:
+            // "hooks installed, called 0 + 0 times"). It does almost nothing
+            // per call, so the priority costs the game nothing.
+            // LR104: switchable (InputHookPriority). LR106: normal by default -
+            // the A/B on 2026-11-26 gave the same delivery delay either way
+            // (RoboCop, HIGHEST: avg 0.1 ms, max 16; Cyberpunk, normal: avg 0.0,
+            // max 16), so the higher priority bought nothing measurable.
+            if (g_hook_prio.load() != 0) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            g_hook_tid.store(GetCurrentThreadId());
+            hook_main();
+        });
+        if (g_hook_h == nullptr)
+        {
+            mgpu::diag::warn("[MGPU][BM2] input path: the hook thread could not be started - recording / replay "
+                             "input is not watched this time.");
+            return;
+        }
+        g_hook_life = mgpu::thlife::started();
+        // Waits for the new thread only (it never takes g_life_mx).
+        for (int i = 0; i < 500 && g_hook_tid.load() == 0; ++i) Sleep(1);
+    }
+    // Safe to post to this id: g_hook_h is open, so the id cannot be reused.
     const DWORD tid = g_hook_tid.load();
     if (tid) PostThreadMessageW(tid, on ? WM_HK_INSTALL : WM_HK_REMOVE, mouse ? 1 : 0, 0);
 }
@@ -329,12 +452,27 @@ void play_main(std::vector<ev> path)
     const LONGLONG t0 = qpc();
     bool kdown[512] = {}, bdown[6] = {};
     bool stopped_by_user = false;
+    mgpu::replay_rules::stop_why why = mgpu::replay_rules::stop_why::none;
+    const unsigned esc_sc = MapVirtualKeyW(VK_ESCAPE, MAPVK_VK_TO_VSC) & 0x1FF;   // 0x01
     for (const ev &e : path)
     {
         for (;;)
         {
             if (g_play_stop.load()) goto done;
-            if (g_abort.load() || !own_foreground()) { stopped_by_user = true; goto done; }
+            {
+                // LR106: replay_rules - the overlay, Esc read without a hook,
+                // the mouse, a real key, another window in front.
+                mgpu::replay_rules::inputs in;
+                in.key_hook = g_abort.load();
+                in.mouse_button = g_abort_mouse.load();
+                in.real_move_px = g_real_move.load(std::memory_order_relaxed);
+                in.esc_down = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+                in.replay_holds_esc = kdown[esc_sc];
+                in.overlay_open = mgpu::gpu1::ui_any_menu_open();
+                in.foreground = own_foreground();
+                why = mgpu::replay_rules::should_stop(in);
+                if (why != mgpu::replay_rules::stop_why::none) { stopped_by_user = true; goto done; }
+            }
             const double left = e.ms - qpc_ms(qpc() - t0);
             if (left <= 0.0) break;
             if (left > 1.5 && timer)
@@ -372,9 +510,12 @@ done:
     if (stopped_by_user)
     {
         g_aborted.store(true);
-        set_msg("Input replay stopped: a key was pressed or another window came to the front.");
-        mgpu::diag::warn("[MGPU][BM2] input replay stopped early (a real key, or the game lost the foreground). "
-                         "All keys and buttons released.");
+        char m1[200], m2[300];
+        snprintf(m1, sizeof m1, "Input replay stopped: %s.", mgpu::replay_rules::stop_text(why));
+        set_msg(m1);
+        snprintf(m2, sizeof m2, "[MGPU][BM2] input replay stopped early: %s. All keys and buttons released.",
+                 mgpu::replay_rules::stop_text(why));
+        mgpu::diag::warn(m2);
     }
     hooks(false, false);
     g_playing.store(false);
@@ -390,6 +531,11 @@ void join_play()
 
 void toggle_record()
 {
+    // LR100: the panel (game thread) and the hotkey (bridge thread) both land
+    // here. try_lock: a second press while one is being handled is dropped,
+    // and the game thread never waits on the bridge's file save.
+    std::unique_lock<std::mutex> cl(g_ctl_mx, std::try_to_lock);
+    if (!cl.owns_lock()) return;
     if (g_playing.load()) return;
     if (!g_recording.load())
     {
@@ -398,7 +544,10 @@ void toggle_record()
             g_rec.clear();
             g_rec.reserve(200000);
         }
-        g_rec_t0 = qpc();
+        g_seen_kb.store(0u); g_seen_ms.store(0u); g_drop_fg.store(0u); g_drop_inj.store(0u); g_drop_still.store(0u);   // LR102
+        g_hk_kb_err.store(-1); g_hk_ms_err.store(-1);
+        g_lat_n.store(0u); g_lat_max.store(0u); g_lat_sum.store(0ull);   // LR104
+        g_rec_t0.store(qpc(), std::memory_order_relaxed);   // published by the g_recording store below
         g_recording.store(true);
         hooks(true, true);
         int acc[3] = {};
@@ -412,16 +561,47 @@ void toggle_record()
     }
     g_recording.store(false);
     hooks(false, false);
-    const double end_ms = qpc_ms(qpc() - g_rec_t0);
+    const double end_ms = qpc_ms(qpc() - g_rec_t0.load(std::memory_order_relaxed));
     std::vector<ev> v;
     { std::lock_guard<std::mutex> lk(g_mx); v.swap(g_rec); }
+    const size_t raw = v.size();
     trim(v, end_ms);
     const double secs = end_ms / 1000.0;
     char l[300];
+    // LR102: what the hooks saw. "installed" / "FAILED (error n)" / "not tried"
+    // (the hook thread never got the request).
+    auto hk = [](int e, char *b, size_t n) {
+        if (e == 0) snprintf(b, n, "installed");
+        else if (e < 0) snprintf(b, n, "not tried");
+        else snprintf(b, n, "FAILED (error %d)", e);
+    };
+    char kbs[40], mss[40], rep[600];
+    hk(g_hk_kb_err.load(), kbs, sizeof kbs);
+    hk(g_hk_ms_err.load(), mss, sizeof mss);
+    const unsigned ln = g_lat_n.load();
+    snprintf(rep, sizeof rep,
+             "[MGPU][BM2] recording report: keyboard hook %s, mouse hook %s | Windows called them %u (keys) + %u (mouse) "
+             "times | not kept: %u another window in front, %u injected, %u mouse moves of 0 pixels | %zu kept, %zu after trim "
+             "| delivery delay avg %.1f ms, max %u ms, hook thread priority %s (InputHookPriority).",
+             kbs, mss, g_seen_kb.load(), g_seen_ms.load(), g_drop_fg.load(), g_drop_inj.load(), g_drop_still.load(),
+             raw, v.size(), ln ? (double)g_lat_sum.load() / (double)ln : 0.0, g_lat_max.load(),
+             g_hook_prio.load() != 0 ? "HIGHEST" : "normal");
+    mgpu::diag::info(rep);
     if (secs < 2.0)
     {
         snprintf(l, sizeof l, "Input path too short (%.1f s) - not saved.", secs);
         set_msg(l);
+        return;
+    }
+    if (v.empty())
+    {
+        // LR102: an empty path was saved and replaced the previous one (two
+        // in Cyberpunk, LR100). Nothing to replay - keep what was there.
+        snprintf(l, sizeof l, "Nothing was recorded (%.1f s, 0 events) - NOT saved; the previous path is kept. "
+                              "See the [BM2] recording report line in the log.", secs);
+        set_msg(l);
+        char d[400]; snprintf(d, sizeof d, "[MGPU][BM2] %s", l);
+        mgpu::diag::warn(d);
         return;
     }
     const bool ok = save_path(v, secs);
@@ -450,6 +630,7 @@ bool has_path(double *seconds, unsigned *events)
 
 bool start_play()
 {
+    std::lock_guard<std::mutex> cl(g_ctl_mx);   // LR100: g_play is assigned below
     if (g_recording.load() || g_playing.load()) return false;
     if (!has_path()) return false;
     join_play();
@@ -457,9 +638,21 @@ bool start_play()
     { std::lock_guard<std::mutex> lk(g_mx); v = g_path; }
     g_abort.store(false);
     g_aborted.store(false);
+    g_abort_mouse.store(false);   // LR106
+    g_real_move.store(0);
     g_playing.store(true);
-    hooks(true, false);    // keyboard only: a real key stops playback
-    g_play = std::thread(play_main, std::move(v));
+    hooks(true, true);     // LR106: keyboard AND mouse - either, used for real, stops playback
+    try
+    {
+        g_play = std::thread(play_main, std::move(v));
+    }
+    catch (...)
+    {
+        // LR100: no playback thread - undo what was set up for it.
+        g_playing.store(false);
+        hooks(false, false);
+        return false;
+    }
     return true;
 }
 
@@ -475,28 +668,56 @@ bool aborted() { return g_aborted.load(); }
 void emergency_unhook()
 {
     // REV: DllMain live unload - no joins under the loader lock; just make
-    // sure Windows stops calling into this image.
-    if (g_kb) { UnhookWindowsHookEx(g_kb); g_kb = nullptr; }
-    if (g_ms) { UnhookWindowsHookEx(g_ms); g_ms = nullptr; }
+    // sure Windows stops calling into this image. LR100: exchange, so a hook
+    // is removed once even if the hook thread is removing it too. (The hook
+    // thread is pinned, so it is already gone when this runs on unload.)
+    unhook(g_kb);
+    unhook(g_ms);
 }
 
 void shutdown()
 {
+    std::lock_guard<std::mutex> cl(g_ctl_mx);   // LR100: no toggle / start while stopping
     g_recording.store(false);
     join_play();
-    if (g_hook_thread.joinable())
+    // LR100: take the thread out under the lock (state: stopping), wait for it
+    // with the lock released. Bounded: WM_QUIT is re-posted every 100 ms in
+    // case the first was lost (a full queue), for up to 5 s.
+    HANDLE h = nullptr;
     {
-        if (g_hook_tid.load()) PostThreadMessageW(g_hook_tid.load(), WM_QUIT, 0, 0);
-        g_hook_thread.join();
-        g_hook_tid.store(0);   // REV4: the next ensure_hook_thread must wait for the new thread's id
+        std::lock_guard<std::mutex> lk(g_life_mx);
+        h = g_hook_h;
+        g_hook_h = nullptr;
+        if (!mgpu::thlife::stop_take(g_hook_life, h != nullptr)) { mgpu::thlife::stop_done(g_hook_life, true); return; }
     }
+    bool ended = false;
+    for (int i = 0; i < 50 && !ended; ++i)
+    {
+        if (const DWORD t = g_hook_tid.load()) PostThreadMessageW(t, WM_QUIT, 0, 0);
+        ended = WaitForSingleObject(h, 100) == WAIT_OBJECT_0;
+    }
+    std::lock_guard<std::mutex> lk(g_life_mx);
+    if (ended)
+    {
+        CloseHandle(h);
+        g_hook_tid.store(0);   // REV4: the next start must wait for the new thread's id
+        mgpu::thlife::stop_done(g_hook_life, true);
+        return;
+    }
+    // Never seen; kept safe: the thread is pinned (the add-on stays loaded
+    // under it), its handle stays open (its id is never reused), and no second
+    // hook thread is started this session (state stays stopping).
+    unhook(g_kb);
+    unhook(g_ms);
+    mgpu::diag::warn("[MGPU][BM2] input path: the hook thread did not stop within 5 s - left running (it keeps "
+                     "the add-on loaded); recording / replay input is off until the game restarts.");
 }
 
 void hud_line(char *out, unsigned n)
 {
     if (out == nullptr || n == 0) return;
     out[0] = '\0';
-    if (g_recording.load()) snprintf(out, n, "PATH REC %.0f S", qpc_ms(qpc() - g_rec_t0) / 1000.0);
+    if (g_recording.load()) snprintf(out, n, "PATH REC %.0f S", qpc_ms(qpc() - g_rec_t0.load(std::memory_order_relaxed)) / 1000.0);
     else if (g_playing.load()) snprintf(out, n, "INPUT REPLAY");
 }
 

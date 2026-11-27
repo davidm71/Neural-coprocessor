@@ -24,6 +24,7 @@ add_library(mgpu_bridge SHARED
     src/adapter_selection.cpp
     src/worker.cpp
     src/gpu1_context.cpp
+    src/archspoof.cpp
     # P9.1: the lateral acquisition probe. Self-contained - it holds every
     # ReShade event callback the probe needs and nothing else, so
     # gpu1_context.cpp keeps its rule of holding no ReShade types and is
@@ -69,6 +70,11 @@ add_library(mgpu_bridge SHARED
     # 0.3.1 backport (R208). Optional FP16 input to DLSS-NR, OFF unless
     # NRInput16=4. Holds no gpu1_context type.
     src/nr16.cpp
+    # TC1: temporal stabilisation of the NR output, OFF unless TemporalStab=1/2.
+    # Holds no gpu1_context type.
+    src/tstab.cpp
+    # CP1: CPU cost of the per-frame paths, OFF unless CpuProfile=1.
+    src/cpuprof.cpp
     # HK1: hotkeys by polling (no RegisterHotKey), rebindable in the panel.
     src/hotkeys.cpp
     # SS1/VR1/BM1: screenshots, video recording (Media Foundation, loaded at
@@ -190,6 +196,8 @@ endif()
 target_link_libraries(mgpu_bridge PRIVATE
     dxgi
     d3d12
+    # DL1: SHA-256 and file version of nvngx_dlssnr.dll
+    version
     # V49/V51: the ghost mode. DirectComposition, and D3D11 solely to name an
     # adapter to it - nothing is ever drawn with the D3D11 device. Both are
     # also declared with #pragma comment(lib, ...) inside gpu1_context.cpp, so
@@ -245,4 +253,38 @@ if(MGPU_BUILD_TESTS)
     add_executable(mgpu_fsr_chain_test tests/fsr_chain_test.cpp)
     target_include_directories(mgpu_fsr_chain_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     add_test(NAME mgpu_fsr_chain_test COMMAND mgpu_fsr_chain_test)
+    # NB3: NR / FG-stage timestamp ranges, sample-to-scale attribution and the NR time budget.
+    add_executable(mgpu_nb_logic_test tests/nb_logic_test.cpp)
+    target_include_directories(mgpu_nb_logic_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME mgpu_nb_logic_test COMMAND mgpu_nb_logic_test)
+    # SF1: failed queue waits / signals, shutdown timeouts, device removal
+    add_executable(mgpu_gpu_safety_test tests/gpu_safety_test.cpp)
+    target_include_directories(mgpu_gpu_safety_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME mgpu_gpu_safety_test COMMAND mgpu_gpu_safety_test)
+    # EX1 (IN90): the game-closing rule and the device-reference ledger.
+    add_executable(mgpu_exit_detect_test tests/exit_detect_test.cpp)
+    target_include_directories(mgpu_exit_detect_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME mgpu_exit_detect_test COMMAND mgpu_exit_detect_test)
+    # LR1 (LR97): following a vector / depth size or format change in play.
+    add_executable(mgpu_live_resize_test tests/live_resize_test.cpp)
+    target_include_directories(mgpu_live_resize_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME mgpu_live_resize_test COMMAND mgpu_live_resize_test)
+    # LR100: worker-thread start / stop rules and concurrent stress models.
+    find_package(Threads REQUIRED)
+    add_executable(mgpu_thread_life_test tests/thread_life_test.cpp)
+    target_include_directories(mgpu_thread_life_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(mgpu_thread_life_test PRIVATE Threads::Threads)
+    add_test(NAME mgpu_thread_life_test COMMAND mgpu_thread_life_test)
+    # LR106: when input replay stops (overlay, Esc without a hook, mouse).
+    add_executable(mgpu_replay_rules_test tests/replay_rules_test.cpp)
+    target_include_directories(mgpu_replay_rules_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME mgpu_replay_rules_test COMMAND mgpu_replay_rules_test)
+    set_tests_properties(mgpu_thread_life_test PROPERTIES TIMEOUT 60)   # a deadlock fails, never stalls
+    # SF2: the real teardown drain on a real D3D12 device (WARP). Windows only.
+    if(WIN32)
+        add_executable(mgpu_d3d12_drain_itest tests/d3d12_drain_itest.cpp)
+        target_include_directories(mgpu_d3d12_drain_itest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(mgpu_d3d12_drain_itest PRIVATE d3d12 dxgi)
+        add_test(NAME mgpu_d3d12_drain_itest COMMAND mgpu_d3d12_drain_itest)
+    endif()
 endif()

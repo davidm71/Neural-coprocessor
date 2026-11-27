@@ -9,3 +9,4 @@ build/
 # the workspace rather than /tmp: MSYS path translation on Windows runners
 # makes /tmp unreliable for curl/tar arguments.
 _dl/
+/dist/

@@ -305,8 +305,15 @@ void poll_display(HWND wnd)
     if (wnd == nullptr) return;
     HMONITOR mon = MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST);
     if (mon == nullptr) return;
-    IDXGIFactory1 *f = nullptr;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f))) || f == nullptr) return;
+    // AU5: the factory is kept between polls (bridge thread only) and made
+    // again only when Windows says it is out of date (a display, adapter or
+    // mode change - IsCurrent). A new factory every 2 s went through ReShade's
+    // CreateDXGIFactory1 hook ("Redirecting CreateDXGIFactory1" in the log)
+    // on the bridge thread, in the middle of the frame loop.
+    static IDXGIFactory1 *s_f = nullptr;
+    if (s_f != nullptr && !s_f->IsCurrent()) { s_f->Release(); s_f = nullptr; }
+    if (s_f == nullptr && (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&s_f))) || s_f == nullptr)) { s_f = nullptr; return; }
+    IDXGIFactory1 *f = s_f;
     int hdr_on = 0, nits = 0;
     bool found = false;
     IDXGIAdapter1 *a = nullptr;
@@ -331,7 +338,6 @@ void poll_display(HWND wnd)
         }
         a->Release();
     }
-    f->Release();
     if (!found) return;
     const int was = g_disp_hdr.exchange(hdr_on);
     g_disp_peak.store(nits);

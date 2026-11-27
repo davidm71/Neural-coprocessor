@@ -51,6 +51,17 @@ namespace mgpu::gpu1
     // (DcompOverlay off, BridgeShowIdle=0). The idle loop paces itself then,
     // because a hidden window's Present does not wait for vsync.
     bool bridge_window_hidden();
+
+// SU1 (IN95): the bridge's start-up stage, for the line in ReShade's OSD on the
+// game while the picture is still hidden. Stages only move forward.
+enum { SU_ARMING = 1, SU_WAITING = 2, SU_LOADING = 3, SU_UPSCALING = 4 };
+void su_set_stage(int stage);
+// "MGPU:  Starting Atomic Bridge  -  <stage>" - false once the picture is up,
+// before anything started, or with StartupHud=0.
+bool startup_hud_text(char *out, size_t n);
+// RC3 (IN91): the picture is hidden because the game runs at a size the
+// stream was not started at (RC2). The present loop paces itself as for HW1.
+bool picture_hidden_for_resize();
     // TR1: the tray icon's status and its "status window" menu item.
     // tray_status returns 0 waiting, 1 arming, 2 running, 3 error.
     int  tray_status(char *text, size_t n);
@@ -651,6 +662,7 @@ void ui_bs_apply(int gen, int cap, int mult);
 void ui_bs_end();
 int  ui_bs_dr_start(int pct);  // BM6: a sweep step starts dynamic resolution at pct, controller history cleared; returns % set
 int  ui_bs_hold_nr(int pct);   // BM5: hold dynamic resolution at pct during a sweep (0 = let go); returns % held, 0 = none
+void ui_bs_budget(int ms);     // NB2: the NR time budget for one sweep step (-1 = back to the setting)
 bool ui_bs_active();
 // The neural card's NVML figures since the last reset (sweep only): power % of
 // its limit, driver-busy %, SM clock MHz, max temperature. False = no samples.
@@ -694,6 +706,14 @@ void bw_set_panel(bool up);
 void sc_cover_mouse(int x, int y, unsigned btn, int wheel);
 bool sc_cover_mouse_get(float *u, float *v, unsigned *btn, int *wheel);   // false: no message yet / panel not up
 void ui_driver_notice(char *out, unsigned n);   // DRV1: empty when the driver is fine
+int  ui_dr_budget();   void ui_set_dr_budget(int ms);   // NB1: NR time budget per real frame (0 = off)
+float ui_nb_nr_ms();   float ui_nb_fg_ms();             // NB1: measured NR / FG stage ms per real frame (-1 = none)
+void ui_nb_totals(unsigned long long *nr_us, unsigned long long *nr_n,   // NB3: running totals for a sweep step
+                  unsigned long long *fg_us, unsigned long long *fg_n);
+int  ui_bridge_state();   // PA1: 0 waiting, 1 starting, 2 running, 3 failed/off (never blocks)
+bool ui_res_changed();                          // RC1: the game changed resolution mid-stream
+int  ui_res_change_kind();                      // LR1 (LR97): 1 = size, 2 = motion-vector format only
+void rc2_poll();                                // RC2: every game Present - hide our picture while the size differs
 unsigned ui_driver_version();                    // DRV1: 61742 = 617.42, 0 unknown
 void sc_unzoom_now();   // SC9: undo the console zoom (unload path)
 // PF1: detailed log (repeating diagnostic lines) on/off. Live.
@@ -835,6 +855,10 @@ void ui_set_sr_request(int quality, int preset, int scale);
 // and calls stream_request() itself, because that is BRIDGE THREAD ONLY.
 void ui_panel_drawn();
 bool ui_panel_is_open();
+// LR106: ReShade's own menu open somewhere (set by dllmain's overlay event),
+// and "the overlay is up" = that or the MGPU panel - input replay stops on it.
+void ui_rs_menu(bool open);
+bool ui_any_menu_open();
 void ui_request_arm();
 bool ui_take_arm_request();
 
@@ -851,6 +875,7 @@ bool ui_take_arm_request();
 // half-written mgpu.ini launches with every key at its default and no way to
 // tell (P7.2).
 bool ui_ini_write(const char *key, int value);
+bool ui_ini_write_now(const char *key, int value);   // HK12: written at once (hotkeys)
 
 // The FILE's current value for a key, cached after the first read so the panel
 // can call it while drawing. NOT the running session's value: after a write
@@ -1060,4 +1085,23 @@ void stream_poll();
 // the cycling clear colour - T5's liveness proof - keeps running as it always
 // has.
 bool stream_present_gate(unsigned long timeout_ms);
+
+// XT1 (IN85, log only): one line per destroy event that concerns the game -
+// what is still alive at that moment and which parts of the add-on hold it.
+// obj_is_com: obj_native is a COM object (device, queue, swap chain) whose
+// reference count may be read; obj_hwnd: its window, if it has one.
+void exit_trace(const char *what, void *obj_native, bool obj_is_com, void *obj_hwnd);
+
+// EX1 (IN90; rule in exit_detect.hpp). A new bridge session: the closing latch
+// starts over.
+void ex_session_begin();
+// A GAME swap chain (not the bridge's) created / destroyed (resize: kept).
+void ex_note_chain(void *id, void *hwnd, bool created, bool resize);
+// At a destroy event: true once when the game is closing - the caller then
+// signals the bridge thread's ordered shutdown. game_queue_released: the event
+// is a queue on the game's device going.
+bool ex_check(bool game_queue_released);
+// The bridge thread, end of its ordered teardown, no lock held: give back the
+// references the add-on held on the game's device (stream and P1.5 probe).
+void release_game_device_refs();
 }

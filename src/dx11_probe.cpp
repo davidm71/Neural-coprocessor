@@ -10,6 +10,7 @@
 
 #include "dx11_probe.hpp"
 #include "diag.hpp"
+#include "gpu_safety_d3d12.hpp"   // LR100
 #include "mgpu_ini_parser.hpp"
 
 namespace mgpu::dx11probe
@@ -362,15 +363,17 @@ void shutdown()
     if (g_queue != nullptr && g_done != nullptr && g_in_flight)
     {
         // One bounded wait at teardown only, off every game frame.
-        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (ev != nullptr)
+        // LR100: the shared drain - its event is closed only when the copy
+        // finished or the device is gone (the old code closed it after a
+        // timeout too, while still registered). If the copy cannot be
+        // confirmed finished, the D3D12 objects it uses are left allocated.
+        const mgpu::gpusafe::drain_r dr = mgpu::gpusafe::drain_fence(g_done, g_done_value, 2000, 0, g_dev12);
+        if (!dr.drained && !dr.removed)
         {
-            if (g_done->GetCompletedValue() < g_done_value)
-            {
-                g_done->SetEventOnCompletion(g_done_value, ev);
-                WaitForSingleObject(ev, 2000);
-            }
-            CloseHandle(ev);
+            mgpu::diag::warn("[MGPU][DX11] probe shutdown: the last readback copy did not finish within 2 s - its "
+                             "D3D12 objects are left allocated rather than released while in use (LR100).");
+            g_readback = nullptr; g_done = nullptr; g_fence12 = nullptr; g_shared12 = nullptr;
+            g_list = nullptr; g_alloc = nullptr; g_queue = nullptr; g_dev12 = nullptr;
         }
         g_in_flight = false;
     }

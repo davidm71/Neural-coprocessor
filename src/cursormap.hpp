@@ -32,6 +32,8 @@ namespace cursormap
 bool install(HWND game);
 void uninstall();
 bool installed();
+HCURSOR picture_cursor();
+void forward_setcursor(LPARAM lp);   // MC10   // MC7: the pointer the picture window should show (null = none)
 
 // Bridge thread, ~10x a second. `shown`: the enlarged picture is on screen
 // and the game has the foreground. Confines the pointer to the game window
@@ -51,6 +53,11 @@ struct sprite
     const uint32_t *pixels = nullptr;    // valid until the next call
 };
 bool snapshot(sprite &out);
+
+// PO2: the MGPU panel is up. The game's pointer is not drawn on the picture
+// from this moment (no 500 ms MC8 grace): its position is frozen while the
+// game's input is blocked, so it would sit still beside the panel's pointer.
+void panel_up(bool up);
 
 } // namespace cursormap
 } // namespace mgpu

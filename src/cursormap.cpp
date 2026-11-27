@@ -2,9 +2,14 @@
 // cursormap.cpp - MC1. See cursormap.hpp.
 // ---------------------------------------------------------------------------
 #include "cursormap.hpp"
+#include <cstdlib>   // MC6: std::abs
 #include "diag.hpp"
+#include <cwchar>
+#include <intrin.h>
+#include <tlhelp32.h>
 
 #include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -22,6 +27,10 @@ typedef int     (WINAPI *pfn_show_cursor)(BOOL);
 std::atomic<HWND>    g_game{nullptr};
 std::atomic<bool>    g_installed{false};
 std::atomic<bool>    g_map_on{false};      // picture shown: hide the real pointer
+std::atomic<bool>    g_panel_up{false};    // PO2: the MGPU panel is up - draw nothing
+std::atomic<bool>    g_po_restore{false};  // PO3: put the pointer back before the next clip
+std::atomic<long>    g_po_x{0}, g_po_y{0}; // PO3: where it was when the panel opened
+std::atomic<unsigned long long> g_po_down_ms{0};   // PO3 (IN87): when the panel went down
 std::atomic<HCURSOR> g_want{nullptr};      // the pointer the game asked for
 std::atomic<int>     g_count{0};           // the game's ShowCursor display count
 bool                 g_have_show = false;
@@ -33,8 +42,20 @@ HCURSOR              g_blank     = nullptr;
 bool                 g_clipped   = false;  // bridge thread only
 RECT                 g_clip{};
 
+std::atomic<unsigned> g_n_set{0}, g_n_set_null{0}, g_n_show{0};
+std::atomic<unsigned> g_n_other{0};   // MC7: calls from a module other than the exe
+bool game_wants_pointer();           // MC7   // MC4: what the game does with its pointer
+
 HCURSOR WINAPI hk_set_cursor(HCURSOR h)
 {
+    g_n_set.fetch_add(1, std::memory_order_relaxed);
+    {
+        HMODULE from = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)_ReturnAddress(), &from) && from != GetModuleHandleW(nullptr))
+            g_n_other.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (h == nullptr) g_n_set_null.fetch_add(1, std::memory_order_relaxed);
     const HCURSOR prev = g_want.exchange(h);
     const HCURSOR actual = (h != nullptr && g_map_on.load(std::memory_order_relaxed) && g_blank != nullptr)
                          ? g_blank : h;
@@ -47,6 +68,13 @@ HCURSOR WINAPI hk_set_cursor(HCURSOR h)
 
 int WINAPI hk_show_cursor(BOOL show)
 {
+    g_n_show.fetch_add(1, std::memory_order_relaxed);
+    {
+        HMODULE from = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)_ReturnAddress(), &from) && from != GetModuleHandleW(nullptr))
+            g_n_other.fetch_add(1, std::memory_order_relaxed);
+    }
     const int c = g_real_show(show);
     g_count.store(c, std::memory_order_relaxed);
     return c;
@@ -84,6 +112,7 @@ void **patch_import(HMODULE mod, const char *name, void *repl, void **orig)
                     match = (void *)(uintptr_t)ft->u1.Function == by_value;
                 if (!match) continue;
                 void **slot = (void **)&ft->u1.Function;
+                if (*slot == repl) { *orig = repl; return slot; }   // RV2: already ours - no write, no VirtualProtect
                 DWORD old = 0;
                 if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old)) return nullptr;
                 *orig = *slot;
@@ -111,8 +140,7 @@ void restore(void **slot, void *ours, void *orig)
 
 bool visible_now()
 {
-    if (g_want.load(std::memory_order_relaxed) == nullptr) return false;
-    return !g_have_show || g_count.load(std::memory_order_relaxed) >= 0;
+    return game_wants_pointer();   // MC8
 }
 
 // Ask the game to set its pointer again, so a change of g_map_on takes effect
@@ -193,12 +221,172 @@ bool convert(HCURSOR c)
     return ok;
 }
 
+
+// MC7. REPORTED 2026-11-18 (Rise of the Tomb Raider, IN39): no pointer at all,
+// while the MGPU panel's pointer works. The picture window sits on top and
+// takes the mouse (forwarding it to the game), so the pointer Windows shows is
+// the PICTURE window's - and its WM_SETCURSOR answered "no pointer" (MC1 draws
+// one instead). The game's own ShowCursor/SetCursor therefore never reached the
+// screen, and MC1 only drew when its view of the game said "visible" - a view
+// built from the exe's imports alone, which Rise bypasses after loading a save.
+// Now: the game's pointer calls are caught in EVERY module of the process (not
+// ours, not ReShade's, not the mgpu folder), and the picture window shows the
+// game's own pointer whenever the game wants one and nothing is mapped.
+std::vector<void **> g_more_slots;          // extra import slots patched (restored on uninstall)
+unsigned long long g_next_scan = 0;
+unsigned long long g_scan_t0 = 0;           // RV2: when scanning began (2 s apart for a minute, then 30 s)
+// RV2: tick() runs on the bridge thread AND (tick(false)) from the tray path;
+// install/uninstall from others. One lock for the shared state they touch
+// (g_more_slots, the clip, the statics in tick). Never taken by the hooks.
+std::mutex g_mx;
+
+
+// MC10. What the game's WINDOW THREAD itself shows. REPORTED 2026-11-18 (Rise,
+// IN42): neither the game's ShowCursor calls (the loading thread hid it, -1,
+// and nothing ever showed it again) nor Windows' flag (that one reports the
+// thread under the pointer - ours, since the picture is on top) told the
+// truth. Windows keeps a pointer state PER THREAD: display count and current
+// shape. The game's window thread's own state is what Windows would show over
+// the game without the bridge. So read it ON that thread: a WH_GETMESSAGE hook
+// on it (in-process, our DLL is already loaded) samples its display count
+// (ShowCursor(TRUE) then ShowCursor(FALSE): net zero) and GetCursor() - the
+// shape its WM_SETCURSOR handling set - at most every 30 ms.
+HHOOK                g_gm_hook = nullptr;
+std::atomic<int>     g_gt_count{0};
+std::atomic<HCURSOR> g_gt_cursor{nullptr};
+std::atomic<bool>    g_gt_known{false};
+std::atomic<unsigned long long> g_gt_at{0};
+
+LRESULT CALLBACK gm_proc(int code, WPARAM wp, LPARAM lp)
+{
+    const unsigned long long now = GetTickCount64();
+    if (code >= 0 && now - g_gt_at.load(std::memory_order_relaxed) >= 30ull)
+    {
+        g_gt_at.store(now, std::memory_order_relaxed);
+        // Our own module's imports are not hooked: these are Windows' real calls.
+        ShowCursor(TRUE);
+        const int c = ShowCursor(FALSE);
+        g_gt_count.store(c, std::memory_order_relaxed);
+        g_gt_cursor.store(GetCursor(), std::memory_order_relaxed);
+        g_gt_known.store(true, std::memory_order_relaxed);
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+void gm_install(HWND game)
+{
+    if (g_gm_hook != nullptr || game == nullptr) return;
+    const DWORD tid = GetWindowThreadProcessId(game, nullptr);
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&gm_proc, &self);
+    g_gm_hook = SetWindowsHookExW(WH_GETMESSAGE, &gm_proc, self, tid);
+    char l[200];
+    snprintf(l, sizeof l, "[MGPU][MC10] reading the pointer state on the game's window thread %lu: %s.",
+             (unsigned long)tid, g_gm_hook ? "on" : "FAILED - falling back to the earlier signals");
+    mgpu::diag::info(l);
+}
+
+bool mc7_skip(HMODULE m)
+{
+    if (m == nullptr || m == GetModuleHandleW(nullptr)) return true;    // the exe: done by install
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&mc7_skip, &self);
+    if (m == self) return true;
+    if (GetProcAddress(m, "ReShadeRegisterAddon") != nullptr) return true;   // ReShade itself
+    wchar_t p[MAX_PATH * 2] = {};
+    if (GetModuleFileNameW(m, p, MAX_PATH * 2) == 0) return true;
+    for (wchar_t *c = p; *c; ++c) if (*c >= L'A' && *c <= L'Z') *c = (wchar_t)(*c + 32);
+    if (std::wcsstr(p, L"\\mgpu\\") != nullptr) return true;
+    if (std::wcsstr(p, L"\\windows\\") != nullptr) return true;          // Windows' own DLLs
+    return false;
+}
+
+void mc7_scan()
+{
+    if (g_real_set == nullptr) return;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32W me{}; me.dwSize = sizeof me;
+    unsigned added = 0;
+    if (Module32FirstW(snap, &me))
+        do
+        {
+            if (mc7_skip(me.hModule)) continue;
+            void *o = nullptr;
+            if (void **sl = patch_import(me.hModule, "SetCursor", (void *)&hk_set_cursor, &o))
+            {
+                if (o == (void *)&hk_set_cursor) continue;   // already ours (MC8: no re-patching every 2 s)
+                g_more_slots.push_back(sl); ++added;
+            }
+            o = nullptr;
+            if (g_real_show != nullptr)
+                if (void **sl = patch_import(me.hModule, "ShowCursor", (void *)&hk_show_cursor, &o))
+                    if (o != (void *)&hk_show_cursor) { g_more_slots.push_back(sl); ++added; }
+        } while (Module32NextW(snap, &me));
+    CloseHandle(snap);
+    if (added != 0)
+    {
+        char l[160];
+        snprintf(l, sizeof l, "[MGPU][MC7] pointer calls now also caught in other game modules: %u more import slot(s).", added);
+        mgpu::diag::info(l);
+    }
+}
+
+bool game_wants_pointer()
+{
+    // MC8. IN40's log (Rise, windowed): after a save loads the game re-shows
+    // its pointer with NO ShowCursor call in any of its modules (MC4: 0 calls,
+    // count stuck at -1), yet Windows' own "pointer showing" flag followed the
+    // pause menu exactly (FW1: 577 frames visible while it was open, 3 before).
+    // That flag is the display count - our blank / null SHAPE does not change
+    // it - so it is the game's real wish. The tracked count is the fallback.
+    //
+    // MC9. IN41 (that flag alone) showed NO pointer even in the main menu: in
+    // the main menu the flag reads hidden (IN40: 3 frames) while the game's
+    // own count says shown; in the pause menu it is the other way round. Each
+    // signal covers one menu, and in gameplay both say hidden - so either one
+    // saying "shown" means shown.
+    if (g_gt_known.load(std::memory_order_relaxed))   // MC10: the game's window thread, when known
+        return g_gt_count.load(std::memory_order_relaxed) >= 0 && g_gt_cursor.load(std::memory_order_relaxed) != nullptr;
+    const bool by_count = !g_have_show || g_count.load(std::memory_order_relaxed) >= 0;
+    CURSORINFO ci{};
+    ci.cbSize = sizeof ci;
+    const bool by_flag = GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) != 0;
+    return by_count || by_flag;
+}
+
+HCURSOR game_cursor()
+{
+    if (g_gt_known.load(std::memory_order_relaxed))   // MC10
+        if (HCURSOR t = g_gt_cursor.load(std::memory_order_relaxed)) if (t != g_blank) return t;
+    HCURSOR c = g_want.load(std::memory_order_relaxed);
+    if (c != nullptr && c != g_blank) return c;
+    HWND g = g_game.load();
+    if (g != nullptr) if (HCURSOR k = (HCURSOR)GetClassLongPtrW(g, GCLP_HCURSOR)) return k;
+    return LoadCursorW(nullptr, IDC_ARROW);
+}
+
 } // namespace
 
 bool install(HWND game)
 {
-    if (g_installed.load()) return true;
+    std::lock_guard<std::mutex> lk(g_mx);   // RV2
     if (game == nullptr) return false;
+    if (g_installed.load())
+    {
+        // RV2: a game that made a new window (resolution or mode change on some
+        // engines) - follow it, and move the window-thread hook (MC10) with it.
+        if (g_game.load() != game)
+        {
+            g_game.store(game);
+            if (g_gm_hook != nullptr) { UnhookWindowsHookEx(g_gm_hook); g_gm_hook = nullptr; }
+            g_gt_known.store(false);
+            gm_install(game);
+        }
+        return true;
+    }
     g_game.store(game);
     HMODULE exe = GetModuleHandleW(nullptr);
     void *orig = nullptr;
@@ -226,6 +414,10 @@ bool install(HWND game)
     if (GetCursorInfo(&ci)) { g_want.store((ci.flags & CURSOR_SHOWING) ? ci.hCursor : nullptr); }
 
     g_installed.store(true);
+    mc7_scan();   // MC7
+    gm_install(game);   // MC10
+    g_scan_t0 = GetTickCount64();
+    g_next_scan = g_scan_t0 + 2000ull;
     char l[300];
     snprintf(l, sizeof l, "[MGPU][MC1] pointer mapping ready (SetCursor%s hooked in the game's exe). In menus "
              "the pointer is kept inside the game window and drawn on the enlarged picture.",
@@ -236,11 +428,19 @@ bool install(HWND game)
 
 void uninstall()
 {
+    std::lock_guard<std::mutex> lk(g_mx);   // RV2
     if (!g_installed.exchange(false)) return;
     g_map_on.store(false);
     restore(g_slot_set, (void *)&hk_set_cursor, (void *)g_real_set);
     restore(g_slot_show, (void *)&hk_show_cursor, (void *)g_real_show);
     g_slot_set = g_slot_show = nullptr;
+    for (void **sl : g_more_slots)   // MC7
+    {
+        restore(sl, (void *)&hk_set_cursor, (void *)g_real_set);
+        restore(sl, (void *)&hk_show_cursor, (void *)g_real_show);
+    }
+    g_more_slots.clear();
+    if (g_gm_hook != nullptr) { UnhookWindowsHookEx(g_gm_hook); g_gm_hook = nullptr; g_gt_known.store(false); }   // MC10
     if (g_clipped)
     {
         RECT cur{};
@@ -252,11 +452,86 @@ void uninstall()
 
 bool installed() { return g_installed.load(std::memory_order_relaxed); }
 
+// MC10: the picture window got WM_SETCURSOR - pass it on to the game's window,
+// so the game sets its pointer on ITS thread exactly as without the bridge.
+void forward_setcursor(LPARAM lp)
+{
+    HWND g = g_game.load();
+    if (g != nullptr) PostMessageW(g, WM_SETCURSOR, (WPARAM)g, lp);
+}
+
+// MC7: what the picture window should show under the pointer. Null = nothing
+// (MC1 is drawing it on the picture, or the game has its pointer hidden).
+HCURSOR picture_cursor()
+{
+    if (!g_installed.load(std::memory_order_relaxed)) return nullptr;
+    if (g_map_on.load(std::memory_order_relaxed)) return nullptr;
+    return game_wants_pointer() ? game_cursor() : nullptr;
+}
+
 void tick(bool shown)
 {
     if (!g_installed.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lk(g_mx);   // RV2
+    if (!g_installed.load(std::memory_order_relaxed)) return;
+    {
+        // MC7: late modules. RV2: a module walk is 1-3 ms on the bridge's
+        // present thread - every 2 s for the first minute (start-up loads),
+        // then every 30 s, instead of every 2 s for the whole session.
+        const unsigned long long now = GetTickCount64();
+        if (now >= g_next_scan)
+        {
+            g_next_scan = now + ((now - g_scan_t0) < 60000ull ? 2000ull : 30000ull);
+            mc7_scan();
+        }
+    }
     HWND game = g_game.load();
-    const bool on = shown;
+    // MC6. REPORTED 2026-11-18 (Rise of the Tomb Raider, IN38): still no
+    // pointer in the pause menu. When the game's window already fills its
+    // monitor - the picture on top is the same size and in the same place -
+    // Windows' own pointer is already where it belongs on the picture, so
+    // there is nothing to map: leave the real pointer alone (no blank shape,
+    // nothing drawn) and the game shows and hides it exactly as without the
+    // bridge. Mapping is only for a game window SMALLER than the picture.
+    bool one_to_one = false;
+    if (game != nullptr)
+    {
+        RECT rc{};
+        POINT o{0, 0};
+        MONITORINFO mi{};
+        mi.cbSize = sizeof mi;
+        if (GetClientRect(game, &rc) && ClientToScreen(game, &o) &&
+            GetMonitorInfoW(MonitorFromWindow(game, MONITOR_DEFAULTTONEAREST), &mi))
+        {
+            OffsetRect(&rc, o.x, o.y);
+            one_to_one = std::abs(rc.left - mi.rcMonitor.left) <= 2 && std::abs(rc.top - mi.rcMonitor.top) <= 2 &&
+                         std::abs(rc.right - mi.rcMonitor.right) <= 2 && std::abs(rc.bottom - mi.rcMonitor.bottom) <= 2;
+        }
+    }
+    {
+        static int s_said = -1;
+        if (shown && s_said != (int)one_to_one)
+        {
+            s_said = (int)one_to_one;
+            mgpu::diag::info(one_to_one
+                ? "[MGPU][MC6] the game's window fills its monitor: Windows' own pointer is used as is (no mapping)."
+                : "[MGPU][MC6] the game's window is smaller than the picture: its pointer is mapped onto the picture.");
+        }
+    }
+    bool on = shown && !one_to_one;
+    {
+        // MC8: a "not shown" has to last 500 ms before the mapping stops -
+        // in IN39's windowed run it flapped every few hundred ms and the
+        // pointer was dropped each time.
+        static unsigned long long off_since = 0;
+        const unsigned long long now = GetTickCount64();
+        if (on) off_since = 0;
+        else if (g_map_on.load() && !one_to_one && !g_panel_up.load())   // PO2: no grace for the panel
+        {
+            if (off_since == 0) off_since = now;
+            if (now - off_since < 500ull) on = true;
+        }
+    }
     if (g_map_on.exchange(on) != on)
     {
         nudge(game);
@@ -275,7 +550,40 @@ void tick(bool shown)
     // "Chrome_WidgetWin_1" seconds after the panel closed). In gameplay the
     // game captures the mouse itself, so the clip changes nothing there. It
     // is released whenever the picture steps aside (alt-tab, other window).
-    const bool want_clip = on && game != nullptr;
+    // MC4. REPORTED 2026-11-18 (Rise of the Tomb Raider): menus react to the
+    // mouse but no pointer is seen. Every 30 s while the picture is up, say
+    // what the game did with its pointer, so it is clear whether it shows a
+    // Windows pointer (SetCursor/ShowCursor - MC1 draws it) or hides it and
+    // draws its own inside the frame.
+    {
+        static unsigned long long s_next = 0;
+        const unsigned long long now = GetTickCount64();
+        if (on && now >= s_next)
+        {
+            const bool first = (s_next == 0);
+            s_next = now + 30000ull;
+            if (!first)
+            {
+                CURSORINFO ci{}; ci.cbSize = sizeof ci;
+                GetCursorInfo(&ci);
+                char l[420];
+                snprintf(l, sizeof l, "[MGPU][MC4] last 30 s: game SetCursor calls %u (null %u), ShowCursor calls %u (from other modules %u), "
+                         "display count %d (%s), pointer asked for %s | game window thread: count %d, shape %s | Windows pointer now %s. %s",
+                         g_n_set.exchange(0), g_n_set_null.exchange(0), g_n_show.exchange(0), g_n_other.exchange(0),
+                         g_count.load(), g_have_show ? "hooked" : "not imported",
+                         g_want.load() != nullptr ? "yes" : "none",
+                         g_gt_known.load() ? g_gt_count.load() : 99,
+                         !g_gt_known.load() ? "unknown" : (g_gt_cursor.load() ? "set" : "none"),
+                         (ci.flags & CURSOR_SHOWING) ? "showing" : "hidden",
+                         !game_wants_pointer() ? "The game has its pointer hidden."
+                         : g_map_on.load() ? "MC1 is drawing it on the picture."
+                                           : "The picture window shows the game's own pointer (MC7).");
+                mgpu::diag::info(l);
+            }
+        }
+    }
+
+    const bool want_clip = shown && game != nullptr;   // MC6: confine whenever the picture is up
     if (want_clip)
     {
         RECT rc{};
@@ -283,6 +591,28 @@ void tick(bool shown)
         if (GetClientRect(game, &rc) && ClientToScreen(game, &o))
         {
             OffsetRect(&rc, o.x, o.y);
+            // PO3. REPORTED 2026-11-22 (RoboCop, IN71): closing the panel with
+            // Esc made the game's menu shake for a second. The pointer had
+            // roamed the 4K picture while the panel was up; the clip below then
+            // snapped it to the game window's edge and the game saw one big jump.
+            // Put it back where it was when the panel opened, before clipping.
+            if (!g_panel_up.load(std::memory_order_relaxed) && g_po_restore.exchange(false))
+            {
+                const POINT p{ g_po_x.load(), g_po_y.load() };
+                POINT now{};
+                if (!GetPhysicalCursorPos(&now)) (void)GetCursorPos(&now);
+                const bool in = PtInRect(&rc, p) != FALSE;
+                if (in) SetCursorPos(p.x, p.y);
+                // PO3 (IN87): one line per panel close - RoboCop's menu shook
+                // again on IN86 and the restore left no trace in the log.
+                char l[300];
+                snprintf(l, sizeof l, "[MGPU][PO3] panel closed: the pointer was at (%ld,%ld); %s (%ld,%ld) | game window "
+                         "(%ld,%ld)-(%ld,%ld) | %ld ms after the panel went down",
+                         now.x, now.y, in ? "put back where it was when the panel opened:" : "NOT put back - where it was "
+                         "when the panel opened is outside the game window:", p.x, p.y, rc.left, rc.top, rc.right, rc.bottom,
+                         (long)(GetTickCount64() - g_po_down_ms.load(std::memory_order_relaxed)));
+                mgpu::diag::info(l);
+            }
             RECT cur{};
             if (!GetClipCursor(&cur) || std::memcmp(&cur, &rc, sizeof rc) != 0)
             {
@@ -301,13 +631,34 @@ void tick(bool shown)
     }
 }
 
+void panel_up(bool up)
+{
+    // PO3: remember where the pointer was when the panel opened (inside the
+    // game's window - it was confined there). Taken before ReShade starts
+    // blocking, from the physical position (not the hooked GetCursorPos).
+    if (up && !g_panel_up.load(std::memory_order_relaxed))
+    {
+        POINT p{};
+        if (GetPhysicalCursorPos(&p) || GetCursorPos(&p))
+        {
+            g_po_x.store(p.x, std::memory_order_relaxed);
+            g_po_y.store(p.y, std::memory_order_relaxed);
+            g_po_restore.store(true, std::memory_order_relaxed);
+        }
+    }
+    if (!up && g_panel_up.load(std::memory_order_relaxed))
+        g_po_down_ms.store(GetTickCount64(), std::memory_order_relaxed);
+    g_panel_up.store(up, std::memory_order_relaxed);
+}
+
 bool snapshot(sprite &out)
 {
     out = sprite{};
     if (!g_installed.load(std::memory_order_relaxed) || !g_map_on.load(std::memory_order_relaxed)) return false;
+    if (g_panel_up.load(std::memory_order_relaxed)) return false;   // PO2
     if (!visible_now()) return false;
     HWND game = g_game.load();
-    const HCURSOR c = g_want.load(std::memory_order_relaxed);
+    const HCURSOR c = game_cursor();   // MC10: the window thread's own shape when known
     if (c == nullptr || c == g_blank || game == nullptr) return false;
     if (c != g_px_of)
     {

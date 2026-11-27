@@ -17,6 +17,7 @@
 #include <cmath>
 
 #include "scaler.hpp"
+#include "pinthread.hpp"   // TL2
 #include "diag.hpp"
 #include "cursormap.hpp"
 
@@ -328,7 +329,8 @@ void start_bg_compile(ID3D12Device *dev, pfn_compile cmp)
     g_bg_busy.fetch_add(1);
     try
     {
-        std::thread([dev, rs, cmp, gen, want_nis]()
+        // TL2: pinned - the build cannot outlive the add-on
+        if (!mgpu::start_pinned_thread([dev, rs, cmp, gen, want_nis]()
         {
             const D3D_SHADER_MACRO easu[] = { { "SC_EASU", "1" }, { nullptr, nullptr } };
             const D3D_SHADER_MACRO rcas[] = { { "SC_EASU", "0" }, { nullptr, nullptr } };
@@ -345,7 +347,9 @@ void start_bg_compile(ID3D12Device *dev, pfn_compile cmp)
             bool kept = false;
             {
                 std::lock_guard<std::mutex> lk(g_s.mx);
-                if (gen == g_bg_gen.load() && g_s.built && g_s.dev == dev)
+                // SC2: and the same root signature - a PSO is only valid with
+                // the signature it was compiled against.
+                if (gen == g_bg_gen.load() && g_s.built && g_s.dev == dev && g_s.rs == rs)
                 {
                     g_s.pso_easu = pe; g_s.pso_rcas = pr; g_s.pso_nis = pn; kept = true;
                 }
@@ -360,7 +364,7 @@ void start_bg_compile(ID3D12Device *dev, pfn_compile cmp)
             mgpu::diag::info(l);
             rs->Release(); dev->Release();
             g_bg_busy.fetch_sub(1);
-        }).detach();
+        })) throw 1;   // TL2: not started - the catch below undoes the references
     }
     catch (...)
     {
@@ -498,7 +502,8 @@ void build_nis_half(ID3D12Device *dev)
     g_bg_busy.fetch_add(1);
     try
     {
-        std::thread([dev, rs, cmp, gen, half16]()
+        // TL2: pinned - the build cannot outlive the add-on
+        if (!mgpu::start_pinned_thread([dev, rs, cmp, gen, half16]()
         {
             char bw[8], bh[8], tg[8];
             snprintf(bw, sizeof bw, "%u", NIS_BW); snprintf(bh, sizeof bh, "%u", NIS_BH); snprintf(tg, sizeof tg, "%u", NIS_TG);
@@ -511,7 +516,7 @@ void build_nis_half(ID3D12Device *dev)
             bool kept = false;
             {
                 std::lock_guard<std::mutex> lk(g_s.mx);
-                if (gen == g_bg_gen.load() && g_s.built && g_s.dev == dev)
+                if (gen == g_bg_gen.load() && g_s.built && g_s.dev == dev && g_s.rs == rs)   // SC2
                 {
                     g_s.pso_nis_h = p; kept = true;
                     g_half_st.store(p == nullptr ? 1 : half16 ? 3 : 2);
@@ -526,7 +531,7 @@ void build_nis_half(ID3D12Device *dev)
             mgpu::diag::info(l);
             rs->Release(); dev->Release();
             g_bg_busy.fetch_sub(1);
-        }).detach();
+        })) throw 1;   // TL2: not started - the catch below undoes the references
     }
     catch (...)
     {
@@ -1036,11 +1041,16 @@ void draw_cursor(ID3D12Device *dev, ID3D12GraphicsCommandList *cl, ID3D12Resourc
 
 void release()
 {
-    // NH1c: a half compile in flight takes the scaler lock when it finishes;
-    // let it finish (bounded) before tearing down, outside the lock.
-    for (int i = 0; i < 1000 && g_bg_busy.load() != 0; ++i) Sleep(10);
+    // SC2 (IN51 review): the generation moves FIRST, so a compile finishing
+    // while we wait already discards its result instead of installing it into
+    // a scaler that is about to go. Then wait (bounded, outside the lock) for
+    // compiles in flight. One that outlasts the wait is harmless: it holds its
+    // own device and root-signature references, the thread is pinned, and the
+    // generation check below makes it discard.
     g_bg_gen.fetch_add(1);
+    for (int i = 0; i < 1000 && g_bg_busy.load() != 0; ++i) Sleep(10);
     std::lock_guard<std::mutex> lk(g_s.mx);
+    g_bg_gen.fetch_add(1);   // SC2: a compile started during the wait is stale too
     relt(g_s.tmp); relt(g_s.out); relt(g_s.coef_s); relt(g_s.coef_u); relt(g_s.coef_up);
     relt(g_s.pso_easu); relt(g_s.pso_rcas); relt(g_s.pso_nis); relt(g_s.pso_bil); relt(g_s.pso_nis_h);
     {   // MAS1

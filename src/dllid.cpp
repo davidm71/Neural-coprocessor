@@ -1,4 +1,5 @@
 // MGPU Bridge - ID1. See dllid.hpp.
+#include "pinthread.hpp"   // TL2
 #include "dllid.hpp"
 
 #include <wintrust.h>
@@ -121,7 +122,8 @@ void check(int slot, HMODULE m)
     snprintf(j->ver, sizeof j->ver, "%s", ver);
     j->kind = k;
     j->ok = ok;
-    std::thread([j]() {
+    // TL2: pinned - the signature check cannot outlive the add-on
+    if (!mgpu::start_pinned_thread([j]() {
         char sig[320];
         signer(j->path, sig, sizeof sig);
         char p8[MAX_PATH * 2] = {};
@@ -133,6 +135,6 @@ void check(int slot, HMODULE m)
         if (j->ok && strstr(sig, "NOT VALID") == nullptr) mgpu::diag::info(line);
         else mgpu::diag::warn(line);
         delete j;
-    }).detach();
+    })) delete j;
 }
 }   // namespace mgpu::dllid

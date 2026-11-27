@@ -354,7 +354,7 @@ void find_exe(const std::wstring &d, int depth, std::wstring &best, long long &b
 }
 
 // ------------------------------------------------------------------ checks
-struct gpu_info { int nvidia = 0; std::wstring names; };
+struct gpu_info { int nvidia = 0; int rtx50 = 0; std::wstring names; };   // RQ1: rtx50
 gpu_info gpus()
 {
     gpu_info r;
@@ -369,6 +369,9 @@ gpu_info gpus()
             if (!r.names.empty()) r.names += L", ";
             r.names += d.Description;
             if (d.VendorId == 0x10DE) ++r.nvidia;
+            // RQ1: an RTX 50-series (Blackwell) card - the generation NVIDIA documents for neural rendering
+            if (d.VendorId == 0x10DE && (wcsstr(d.Description, L"RTX 50") != nullptr || wcsstr(d.Description, L"Blackwell") != nullptr ||
+                                         wcsstr(d.Description, L"RTX 40") != nullptr)) ++r.rtx50;   // RQ3: an RTX 4090 ran it (field report #2)
         }
         a->Release();
     }
@@ -521,6 +524,11 @@ std::wstring check(const std::wstring &t)
     const gpu_info g = gpus();
     if (g.nvidia >= 2) say(o, L"[OK]", L"Graphics cards: " + g.names);
     else say(o, L"[!] ", L"Graphics cards: " + g.names + L" - the bridge needs two NVIDIA cards.");
+    if (g.nvidia >= 1 && g.rtx50 == 0)   // RQ1
+        say(o, L"[!] ", L"No RTX 50- or 40-series card found. NVIDIA documents DLSS Neural Rendering for RTX 50-series cards; "
+                        L"an RTX 4090 has been reported working. On a card that cannot run it, the driver refuses it "
+                        L"(\"FeatureNotSupported\", 0xBAD00001) and the bridge shows the picture without neural rendering. "
+                        L"Use an RTX 50-series card as the second (bridge) card.");
     // IN3: the recommended layout - the game's card headless, the monitor on the second card.
     {
         const auto mons = monitors();
@@ -1095,6 +1103,21 @@ void install(const std::wstring &t, const settings *cfg = nullptr)
             log += L"  ReShade.ini: added reshade-shaders\\Shaders to EffectSearchPaths\r\n";
         }
         else log += L"  ReShade.ini already there and already looks in reshade-shaders\\Shaders.\r\n";
+    }
+    // RS3. ReShade's built-in "Effect Runtime Sync" add-on only acts when
+    // [ADDON] SyncEffectRuntimes=1; with the bridge's picture window it then
+    // loops game <-> bridge until the game crashes. Set it to 0 (the add-on
+    // itself stays available). The bridge add-on also does this at start-up.
+    if (exists(rini))
+    {
+        wchar_t sv[16] = {};
+        GetPrivateProfileStringW(L"ADDON", L"SyncEffectRuntimes", L"", sv, 16, rini.c_str());
+        if (sv[0] != L'0')
+        {
+            if (WritePrivateProfileStringW(L"ADDON", L"SyncEffectRuntimes", L"0", rini.c_str()))
+                log += L"  ReShade.ini: SyncEffectRuntimes=0 (ReShade's runtime sync loops with the bridge)\r\n";
+            else { log += L"  ReShade.ini: could NOT set SyncEffectRuntimes=0\r\n"; ok = false; }
+        }
     }
     make_dirs(join(t, L"mgpu"));
     const bool settings_ok = cfg != nullptr && cfg->apply && apply_settings(t, *cfg, log);   // IN2

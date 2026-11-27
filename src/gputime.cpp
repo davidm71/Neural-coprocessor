@@ -568,5 +568,19 @@ void forget(ID3D12CommandQueue *q)
     reset_accounting();
 }
 
+// XT1 (IN85, log only): does the timing code hold `dev` / `q` (both AddRef'd
+// while registered), and how many queues does it hold in all.
+void holds(const void *dev, const void *q, bool *has_dev, bool *has_q, int *queues)
+{
+    std::lock_guard<std::mutex> lk(g_mx);
+    bool d = false, qq = false; int n = 0;
+    for (int i = 0; i < N_DEV; ++i) if (dev != nullptr && g_d[i].dev == dev) d = true;
+    for (int i = 0; i < N_Q; ++i)
+        if (g_q[i].q != nullptr) { ++n; if (q != nullptr && g_q[i].q == q) qq = true; }
+    if (has_dev) *has_dev = d;
+    if (has_q) *has_q = qq;
+    if (queues) *queues = n;
+}
+
 } // namespace gputime
 } // namespace mgpu
